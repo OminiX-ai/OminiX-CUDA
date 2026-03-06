@@ -1673,6 +1673,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_ACC:
             ggml_cann_acc(ctx, dst);
             break;
+        case GGML_OP_SET:
+            ggml_cann_set(ctx, dst);
+            break;
         case GGML_OP_MUL:
             ggml_cann_binary_op<aclnn_mul>(ctx, dst);
             break;
@@ -2446,6 +2449,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_ACC:
         case GGML_OP_GROUP_NORM:
             return true;
+        case GGML_OP_SET:
+            {
+                const ggml_type t = op->type;
+                return (t == GGML_TYPE_F32 || t == GGML_TYPE_I32) &&
+                    t == op->src[0]->type &&
+                    t == op->src[1]->type;
+            }
         case GGML_OP_PAD:
             // TODO: add circular padding support for cann, see https://github.com/ggml-org/llama.cpp/pull/16985
             return ggml_get_op_params_i32(op, 8) == 0;

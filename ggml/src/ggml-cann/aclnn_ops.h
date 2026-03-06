@@ -296,6 +296,18 @@ void ggml_cann_group_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 void ggml_cann_acc(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
+ * @brief   Sets a sub-region of a tensor using the CANN backend.
+ *
+ * @details This function implements GGML_OP_SET: it copies src1 into a
+ *          sub-region of src0 (or dst if inplace) at a given byte offset,
+ *          with custom strides.
+ *
+ * @param ctx The CANN context used for operations.
+ * @param dst The destination tensor. dst->op is `GGML_OP_SET`.
+ */
+void ggml_cann_set(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
+/**
  * @brief   Computes the sum of elements along the last dimension of a ggml tensor
  *          using the CANN backend.
  *

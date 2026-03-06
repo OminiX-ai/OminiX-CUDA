@@ -195,13 +195,48 @@ void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
     GGML_ASSERT(ggml_can_repeat(src, dst));
 
-    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
-    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+    int64_t repeats[GGML_MAX_DIMS];
+    int     repeat_dim   = -1;
+    int     n_repeat_dims = 0;
 
-    int64_t repeatsArray[] = { dst->ne[3] / src->ne[3], dst->ne[2] / src->ne[2], dst->ne[1] / src->ne[1],
-                               dst->ne[0] / src->ne[0] };
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        repeats[i] = dst->ne[i] / src->ne[i];
+        if (repeats[i] > 1) {
+            repeat_dim = i;
+            n_repeat_dims++;
+        }
+    }
 
-    aclnn_repeat(ctx, acl_src.get(), acl_dst.get(), repeatsArray);
+    // Workaround for CANN aclnnRepeat kernel bug (MTE write out-of-range)
+    // on certain tensor shapes: use InplaceCopy with views instead.
+    // Only apply when repeating along a single dimension.
+    if (n_repeat_dims == 1) {
+        int64_t R = repeats[repeat_dim];
+
+        // If not inplace (src != dst), we build dst by copying src R times
+        acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+
+        for (int64_t r = 0; r < R; r++) {
+            size_t offset = r * src->ne[repeat_dim] * dst->nb[repeat_dim];
+            acl_tensor_ptr acl_dst_view = ggml_cann_create_tensor(
+                dst, src->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, offset);
+
+            GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst_view.get(), acl_src.get());
+        }
+    } else if (n_repeat_dims == 0) {
+        // Identity repeat, just copy
+        size_t cpy_size = ggml_nbytes(dst);
+        ACL_CHECK(aclrtMemcpyAsync(dst->data, cpy_size, src->data, cpy_size,
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    } else {
+        // Multi-dimension repeat: fall back to aclnnRepeat
+        acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+
+        // aclnnRepeat expects repeats in reverse order: [ne3, ne2, ne1, ne0]
+        int64_t repeatsArray[] = { repeats[3], repeats[2], repeats[1], repeats[0] };
+        aclnn_repeat(ctx, acl_src.get(), acl_dst.get(), repeatsArray);
+    }
 }
 
 void aclnn_add(ggml_backend_cann_context & ctx, aclTensor * acl_src0, aclTensor * acl_src1, aclTensor * acl_dst) {
@@ -609,6 +644,32 @@ void ggml_cann_acc(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdd, acl_dst.get(), acl_src1.get(), alpha.get());
     }
+}
+
+void ggml_cann_set(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * src1 = dst->src[1];
+
+    size_t nb1     = ((int32_t *) dst->op_params)[0];
+    size_t nb2     = ((int32_t *) dst->op_params)[1];
+    size_t nb3     = ((int32_t *) dst->op_params)[2];
+    size_t offset  = ((int32_t *) dst->op_params)[3];
+    bool   inplace = (bool) ((int32_t *) dst->op_params)[4];
+
+    // If not inplace, copy entire src0 -> dst first
+    if (!inplace) {
+        size_t cpy_size = ggml_nbytes(dst);
+        ACL_CHECK(
+            aclrtMemcpyAsync(dst->data, cpy_size, src0->data, cpy_size, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    }
+
+    // Copy src1 into the dst sub-region at offset with given strides
+    size_t param_nb[] = { ggml_element_size(dst), nb1, nb2, nb3 };
+    acl_tensor_ptr acl_src1     = ggml_cann_create_tensor(src1);
+    acl_tensor_ptr acl_dst_view = ggml_cann_create_tensor(
+        dst, src1->ne, param_nb, GGML_MAX_DIMS, ACL_FORMAT_ND, offset);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst_view.get(), acl_src1.get());
 }
 
 /**
