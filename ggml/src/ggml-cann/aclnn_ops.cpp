@@ -1943,11 +1943,12 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // src
     ggml_tensor * src1 = dst->src[1];  // index
 
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
 
     switch (src0->type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
             if (src0->type == dst->type) {
                 aclnn_index_select_4d(ctx, src0->data, src0->ne, src0->nb, dst->data, dst->ne, dst->nb, src1,
                                       dst->type);
@@ -2120,7 +2121,9 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    if (weight_to_nz && is_matmul_weight(weight)) {
+    // FRACTAL_NZ format is only supported for F16 weights; F32 and BF16 use ND format
+    bool use_nz = weight_to_nz && is_matmul_weight(weight) && weight->type == GGML_TYPE_F16;
+    if (use_nz) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
     } else {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
@@ -2301,6 +2304,7 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             ggml_cann_mat_mul_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
@@ -3665,6 +3669,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             ggml_cann_mul_mat_id_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
