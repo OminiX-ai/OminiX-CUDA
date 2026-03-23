@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+# Increase max tensor name length for Qwen3-TTS encoder
+add_compile_definitions(GGML_MAX_NAME=128)
+
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
 
