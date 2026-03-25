@@ -252,6 +252,28 @@ ggml_tensor *build_conv1d(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
   return cur;
 }
 
+// F32 variant of conv1d: uses GGML_TYPE_F32 im2col to avoid f16 precision loss.
+// ggml_conv_1d hardcodes GGML_TYPE_F16 for im2col output; this version overrides that.
+ggml_tensor *build_conv1d_f32(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
+                               ggml_tensor *b, int s, int p, int d) {
+  if (p < 0) {
+    p = (w->ne[0] - 1) / 2;
+  }
+  // Replicate ggml_conv_1d logic but with GGML_TYPE_F32 im2col
+  ggml_tensor *im2col = ggml_im2col(ctx0, w, cur, s, 0, p, 0, d, 0, false, GGML_TYPE_F32);
+  ggml_tensor *result = ggml_mul_mat(ctx0,
+      ggml_reshape_2d(ctx0, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+      ggml_reshape_2d(ctx0, w, w->ne[0] * w->ne[1], w->ne[2]));
+  result = ggml_reshape_3d(ctx0, result, im2col->ne[1], w->ne[2], im2col->ne[2]);
+  if (b) {
+    if (result->ne[0] != b->ne[0]) {
+      b = ggml_reshape_2d(ctx0, b, 1, b->ne[0]);
+    }
+    result = ggml_add(ctx0, result, b);
+  }
+  return result;
+}
+
 ggml_tensor *build_conv1d_grouped(ggml_context *ctx0, ggml_tensor *cur,
                                   ggml_tensor *w, ggml_tensor *b, int groups,
                                   int s, int p, int d) {

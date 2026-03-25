@@ -190,7 +190,7 @@ ggml_tensor *SpeechTokenizerEncoderModel::build_causal_conv1d(
     if (pad_left > 0 || pad_right > 0) {
         x = ggml_pad_ext(ctx0, x, pad_left, pad_right, 0, 0, 0, 0, 0, 0);
     }
-    return build_conv1d(ctx0, x, w, b, stride, 0, dilation);
+    return build_conv1d_f32(ctx0, x, w, b, stride, 0, dilation);
 }
 
 // ============================================================================

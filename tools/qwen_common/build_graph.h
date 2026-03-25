@@ -38,6 +38,8 @@ ggml_tensor *build_attn(ggml_context *ctx0, ggml_tensor *wo, ggml_tensor *wo_b,
 
 ggml_tensor *build_mish(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *one);
 
+ggml_tensor *build_conv1d_f32(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
+                               ggml_tensor *b, int s = 1, int p = -1, int d = 1);
 ggml_tensor *build_conv1d(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
                           ggml_tensor *b, int s = 1, int p = 0, int d = 1);
 
