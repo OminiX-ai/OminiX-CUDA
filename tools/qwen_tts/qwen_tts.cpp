@@ -230,6 +230,9 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     tokenize_tts_text(params.ref_text, params.text,
                        ref_text_tokens, target_text_tokens);
 
+    auto prefill_end = std::chrono::high_resolution_clock::now();
+    double prefill_time = std::chrono::duration<double>(prefill_end - total_t0).count();
+
     // Step 5: Generate codec tokens with Talker LLM
     printf("\n--- Step 5: Generate codec tokens ---\n");
     t0 = std::chrono::high_resolution_clock::now();
@@ -248,10 +251,10 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     }
     t1 = std::chrono::high_resolution_clock::now();
     int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
+    double generate_time = std::chrono::duration<double>(t1 - t0).count();
     printf("  Generated %d codec frames (%.2f sec, %.1f frames/sec)\n",
-           n_gen_frames,
-           std::chrono::duration<double>(t1 - t0).count(),
-           n_gen_frames / std::chrono::duration<double>(t1 - t0).count());
+           n_gen_frames, generate_time,
+           n_gen_frames / generate_time);
 
     // Step 6: Decode codec tokens to audio
     printf("\n--- Step 6: Decode to audio ---\n");
@@ -276,10 +279,10 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         return false;
     }
     t1 = std::chrono::high_resolution_clock::now();
+    double decode_time = std::chrono::duration<double>(t1 - t0).count();
     printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
-           full_audio.size(),
-           std::chrono::duration<double>(t1 - t0).count(),
-           full_audio.size() / 24000.0 / std::chrono::duration<double>(t1 - t0).count());
+           full_audio.size(), decode_time,
+           full_audio.size() / 24000.0 / decode_time);
 
     // Step 7: Remove reference audio portion
     // full_audio = decoder([ref_codes || gen_codes])
@@ -298,11 +301,19 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_t1 - total_t0).count();
+    double target_duration = audio_out.size() / 24000.0;
     printf("\n=== Generation complete ===\n");
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
-           audio_out.size(), audio_out.size() / 24000.0f);
-    printf("  Total time: %.2f sec\n", total_time);
-    printf("  RTF: %.2fx\n", total_time / (audio_out.size() / 24000.0));
+           audio_out.size(), target_duration);
+    printf("  Timing breakdown:\n");
+    printf("    Prefill:   %.2f sec\n", prefill_time);
+    printf("    Generate:  %.2f sec\n", generate_time);
+    printf("    Decode:    %.2f sec\n", decode_time);
+    printf("    Total:     %.2f sec\n", total_time);
+    printf("  Inference RTF: %.2fx (generate+decode / audio)\n",
+           (generate_time + decode_time) / target_duration);
+    printf("  Total RTF:     %.2fx (end-to-end / audio)\n",
+           total_time / target_duration);
 
     return true;
 }
