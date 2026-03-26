@@ -203,9 +203,9 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         return false;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
+    double spk_time = std::chrono::duration<double>(t1 - t0).count();
     printf("  Speaker embedding: %zu dims (%.2f sec)\n",
-           spk_embedding.size(),
-           std::chrono::duration<double>(t1 - t0).count());
+           spk_embedding.size(), spk_time);
 
     if (params.profiling) {
         FILE *f = fopen("logs/cpp_spk_embedding.bin", "wb");
@@ -229,9 +229,9 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     }
     t1 = std::chrono::high_resolution_clock::now();
     int n_ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
+    double enc_time = std::chrono::duration<double>(t1 - t0).count();
     printf("  Ref codes: %d quantizers x %d frames (%.2f sec)\n",
-           (int)ref_codes.size(), n_ref_frames,
-           std::chrono::duration<double>(t1 - t0).count());
+           (int)ref_codes.size(), n_ref_frames, enc_time);
 
     // Debug: dump ref_codes for round-trip testing
     if (params.profiling) {
@@ -380,10 +380,13 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), target_duration);
     printf("  Timing breakdown:\n");
-    printf("    Prefill:   %.2f sec\n", prefill_time);
-    printf("    Generate:  %.2f sec\n", generate_time);
-    printf("    Decode:    %.2f sec\n", decode_time);
-    printf("    Total:     %.2f sec\n", total_time);
+    printf("    Speaker Enc: %.2f sec\n", spk_time);
+    printf("    Audio Enc:   %.2f sec\n", enc_time);
+    printf("    Tokenize:    %.2f sec\n", prefill_time - spk_time - enc_time);
+    printf("    Prefill tot: %.2f sec\n", prefill_time);
+    printf("    Generate:    %.2f sec\n", generate_time);
+    printf("    Decode:      %.2f sec\n", decode_time);
+    printf("    Total:       %.2f sec\n", total_time);
     printf("  Inference RTF: %.2fx (generate+decode / audio)\n",
            (generate_time + decode_time) / target_duration);
     printf("  Total RTF:     %.2fx (end-to-end / audio)\n",
