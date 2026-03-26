@@ -1,3 +1,43 @@
+# 统一 ggml 合并：消除 ggml-diffusion 重复代码
+
+## 变更概述
+将 `ggml-diffusion/`（SD 专属 ggml 副本）合并到统一的 `ggml/` 目标，消除约 33 万行重复代码。
+LLM（llama-cli）和 SD（sd-cli）现在共享同一个 ggml 后端，通过运行时环境变量 `GGML_CANN_ACL_GRAPH` 控制 ACL Graph 模式。
+
+## 合并策略
+- **方案**: 单一 ggml target + 运行时切换（Scheme 2）
+- **基准**: 以 ggml（LLM 侧，较新 llama.cpp）为基准，补充 SD 专属算子
+- **架构目标**: 支持未来 ASR、TTS 等模型共用同一 ggml 后端
+
+## 关键修复
+1. **量化矩阵乘法**: 恢复 BF16 计算精度（防止 FP16 累加溢出导致 NaN）
+2. **Repeat 广播**: 添加 aclnnExpand 路径（修复 Ascend 910B 上 aclnnRepeat 的 MTE bug）
+3. **ACL Graph 默认值**: 改为 off（LLM 推理不使用 Graph 模式，SD 通过 `GGML_CANN_ACL_GRAPH=1` 显式启用）
+
+## 构建命令
+```bash
+cmake -B build -DSD_CANN=ON -DUSE_ACL_GRAPH=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+```
+
+## 运行时控制
+- LLM 推理（默认）: 不设置环境变量，ACL Graph 不激活，量化 matmul 使用 FP16
+- SD 推理: `GGML_CANN_ACL_GRAPH=1` 启用 ACL Graph 模式，`GGML_CANN_QUANT_BF16=on` 启用 BF16 防止 NaN
+
+## 测试结果
+- LLM (Qwen3-8B-Q8_0): Prompt 187.9 t/s, Generation 37.5 t/s
+- SD (Qwen-Image-Q8_0, 1024x1024): 20步采样 31.79s (1.58s/it), NaN检查全部通过
+
+## 后续修复
+4. **SD 算子实现恢复**: 重新添加 im2col_3d, conv_2d, conv_3d 三个 SD 专属 CANN 算子实现（git stash pop 冲突丢失）
+5. **ggml-cann.cpp dispatch/supports_op**: 补充 IM2COL_3D, CONV_2D, CONV_3D 的计算分发和支持声明
+6. **量化矩阵乘法 BF16/FP16 条件切换**: 合并时无条件使用 ACL_BF16 导致 LLM 性能回归（每次 matmul 多 3 个 cast 操作）。通过 `GGML_CANN_QUANT_BF16` 环境变量控制：默认 FP16（LLM 快速路径），`GGML_CANN_QUANT_BF16=on` 启用 BF16（SD 防 NaN）
+
+## 删除（~33 万行）
+- `ggml-diffusion/`, `include-diffusion/`, `examples/diffusion-ominix/`, `CMakeLists copy.txt`
+
+---
+
 # CANN 后端 BF16 支持变更记录
 
 ## 问题描述

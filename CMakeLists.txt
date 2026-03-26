@@ -35,6 +35,12 @@ else()
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+# ─── OminiX 扩展模块开关 ─────────────────────────────────────
+option(BUILD_SD  "Build Stable-Diffusion module (tools/ominix_diffusion)" ON)
+# option(BUILD_ASR "Build ASR module (future, src-asr)"     OFF)
+# option(BUILD_TTS "Build TTS module (future, src-tts)"     OFF)
+# 新增模块在此处追加 option(BUILD_XXX ...)
+
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -184,6 +190,14 @@ endif()
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
+    # SD_CANN → GGML_CANN: SD 的 CANN 后端由统一 ggml-cann 提供
+    if (BUILD_SD AND SD_CANN AND NOT GGML_CANN)
+        set(GGML_CANN ON CACHE BOOL "ggml: enable CANN backend (required by SD)" FORCE)
+    endif()
+    # 当 SD+CANN 启用时，统一编译 ACL Graph 支持（运行时由 GGML_CANN_ACL_GRAPH 环境变量控制）
+    if (BUILD_SD AND (SD_CANN OR GGML_CANN))
+        set(USE_ACL_GRAPH ON CACHE BOOL "ggml: enable ACL graph for SD inference" FORCE)
+    endif()
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
@@ -286,3 +300,13 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+# ─── OminiX 扩展子模块 ───────────────────────────────────────
+# tools/ominix_diffusion：Stable-Diffusion 推理（库 + cli + server），共享统一 ggml
+if (BUILD_SD)
+    add_subdirectory(tools/ominix_diffusion)
+endif()
+
+# 扩展方法：新增模块仿照上方格式添加即可
+# if (BUILD_ASR)
+#     add_subdirectory(tools/asr)
+# endif()

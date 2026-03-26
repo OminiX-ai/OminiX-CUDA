@@ -105,8 +105,8 @@ make qwen_asr -j$(nproc)
 
 # 昇腾 NPU (CANN)
 cmake .. -DGGML_CANN=ON -DLLAMA_CURL=OFF \
-    -DCMAKE_SHARED_LINKER_FLAGS="-L${ASCEND_TOOLKIT_HOME}/runtime/lib64/stub/ -lascend_hal" \
-    -DCMAKE_EXE_LINKER_FLAGS="-L${ASCEND_TOOLKIT_HOME}/runtime/lib64/stub/ -lascend_hal"
+    # -DCMAKE_SHARED_LINKER_FLAGS="-L${ASCEND_TOOLKIT_HOME}/runtime/lib64/stub/ -lascend_hal" \
+    # -DCMAKE_EXE_LINKER_FLAGS="-L${ASCEND_TOOLKIT_HOME}/runtime/lib64/stub/ -lascend_hal"
 make qwen_asr -j$(nproc)
 ```
 
@@ -125,8 +125,8 @@ make qwen_asr -j$(nproc)
 
 # 昇腾 NPU (推荐 Q8_0 + gpu_layers=28)
 ./build/bin/qwen_asr \
-    --audio test.wav \
-    --model_dir Qwen/Qwen3-ASR-1.7B \
+    --audio ellen_ref.wav \
+    --model_dir tools/qwen_asr/gguf \
     --encoder tools/qwen_asr/gguf/qwen_asr_audio_encoder.gguf \
     --decoder tools/qwen_asr/gguf/qwen_asr_decoder_q8_0.gguf \
     --gpu_layers 28 \

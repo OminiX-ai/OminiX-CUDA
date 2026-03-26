@@ -1839,6 +1839,15 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_IM2COL:
             ggml_cann_im2col(ctx, dst);
             break;
+        case GGML_OP_IM2COL_3D:
+            ggml_cann_im2col_3d(ctx, dst);
+            break;
+        case GGML_OP_CONV_2D:
+            ggml_cann_conv_2d(ctx, dst);
+            break;
+        case GGML_OP_CONV_3D:
+            ggml_cann_conv_3d(ctx, dst);
+            break;
         case GGML_OP_POOL_2D:
             ggml_cann_pool2d(ctx, dst);
             break;
@@ -2489,6 +2498,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_DUP:
         case GGML_OP_IM2COL:
+        case GGML_OP_IM2COL_3D:
+        case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_3D:
         case GGML_OP_CONCAT:
         case GGML_OP_REPEAT:
         case GGML_OP_NONE:

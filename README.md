@@ -61,45 +61,152 @@ CANN（Compute Architecture for Neural Networks）后端是 OminiX-Ascend 的核
 
 ### 编译构建
 
+一条命令统一编译 LLM、SD、ASR 全部模块：
+
 ```bash
-# 设置环境变量
+# 设置 CANN 环境变量（根据实际安装路径调整）
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-# CMake 配置与构建
-cmake -B build \
-    -DGGML_CANN=ON \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DSOC_TYPE=ascend910b
+# 统一编译（LLM + SD + ASR）
+cmake -B build -DGGML_CANN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 ```
 
+编译产物：
+
+| 二进制文件 | 功能 |
+|-----------|------|
+| `build/bin/llama-cli` | LLM 交互式推理 |
+| `build/bin/llama-bench` | LLM 性能基准测试 |
+| `build/bin/llama-server` | LLM HTTP 服务 |
+| `build/bin/ominix-diffusion-cli` | SD 图像生成 |
+| `build/bin/ominix-diffusion-server` | SD HTTP 服务 |
+| `build/bin/qwen_asr` | 语音识别 (ASR) |
+
 ### 运行推理
 
+#### LLM 推理
+
 ```bash
-# 使用 llama-cli 进行交互式推理
-./build/bin/llama-cli -m model.gguf -ngl 99
+# 基础推理（全部层卸载到 NPU）
+./build/bin/llama-cli \
+  -m <model>.gguf \
+  -ngl 99 \
+  -p "你好，请介绍一下你自己。"
+
+# 推荐配置：Flash Attention + 算子融合
+GGML_CANN_OPERATOR_FUSION=on \
+./build/bin/llama-cli \
+  -m <model>.gguf \
+  -ngl 99 -fa 1 \
+  -p "你好，请介绍一下你自己。"
+
+# 性能基准测试
+GGML_CANN_OPERATOR_FUSION=on \
+./build/bin/llama-bench \
+  -m <model>.gguf \
+  -ngl 99 -fa 1
+
+# HTTP 服务
+./build/bin/llama-server \
+  -m <model>.gguf \
+  -ngl 99 \
+  --host 0.0.0.0 --port 8080
 ```
+
+#### SD 图像生成
+
+```bash
+# 基础生图（1024x1024）
+GGML_CANN_ACL_GRAPH=1 GGML_CANN_QUANT_BF16=on \
+./build/bin/ominix-diffusion-cli \
+  --diffusion-model <diffusion_model>.gguf \
+  --vae <vae_model>.safetensors \
+  --llm <llm_model>.gguf \
+  -p "a lovely cat" \
+  --cfg-scale 2.5 \
+  --steps 20 \
+  --sampling-method euler \
+  -H 1024 -W 1024 \
+  -o output.png
+
+# 推荐配置：启用 diffusion flash attention + VAE 直接卷积
+GGML_CANN_ACL_GRAPH=1 GGML_CANN_QUANT_BF16=on \
+./build/bin/ominix-diffusion-cli \
+  --diffusion-model <diffusion_model>.gguf \
+  --vae <vae_model>.safetensors \
+  --llm <llm_model>.gguf \
+  -p "a lovely cat" \
+  --cfg-scale 2.5 \
+  --steps 20 \
+  --sampling-method euler \
+  --diffusion-fa \
+  --flow-shift 3 \
+  --vae-conv-direct \
+  -H 1024 -W 1024 \
+  -o output.png
+```
+
+#### ASR 语音识别
+
+```bash
+./build/bin/qwen_asr \
+  --audio <audio_file>.wav \
+  --model_dir <gguf_dir> \
+  --encoder <gguf_dir>/qwen_asr_audio_encoder.gguf \
+  --decoder <gguf_dir>/qwen_asr_decoder_q8_0.gguf \
+  --gpu_layers 28 \
+  --threads 8
+```
+
+### 环境变量参考
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `GGML_CANN_ACL_GRAPH` | `off` | ACL Graph 模式。SD 推理需设为 `1` |
+| `GGML_CANN_QUANT_BF16` | `off` | 量化矩阵乘法使用 BF16。SD 推理需设为 `on` 防止 NaN |
+| `GGML_CANN_OPERATOR_FUSION` | `off` | ADD+RMS_NORM 算子融合。LLM 推理建议开启 |
+
+### 验证测试结果
+
+在 Ascend 910B2 (62GB HBM) + CANN 8.5.0 上的实测数据：
+
+| 模块 | 模型 | 关键指标 |
+|------|------|----------|
+| LLM | Qwen3-8B-Q8_0 | Prompt 245.4 t/s, Generation 42.5 t/s |
+| ASR | Qwen-ASR (Q8_0) | 9.36s 音频 → 1.2s 完成识别 |
+| SD | Qwen-Image-Q8_0 (1024x1024) | 20步采样 32.04s (1.59s/it), NaN 检查全部通过 |
+
+更多 CANN 后端优化细节请参考 [LLM_CANN_OPTIMIZATIONS.md](LLM_CANN_OPTIMIZATIONS.md)。
 
 ## 目录结构
 
 ```
 OminiX-Ascend/
-├── ggml/                  # ggml 张量计算库
-│   ├── src/ggml-cann/     #   └── CANN 后端实现（核心）
-│   └── include/           #   └── 公共头文件
-├── src/                   # llama.cpp 主源代码
-│   └── models/            #   └── 50+ 种模型架构实现
-├── include/               # llama.cpp 公共 API（llama.h）
-├── tools/                 # 应用工具
-│   ├── cli/               #   └── llama-cli 命令行推理
-│   ├── server/            #   └── llama-server REST API
-│   └── quantize/          #   └── 模型量化工具
-├── gguf-py/               # Python GGUF 文件操作库
-├── examples/              # 示例应用
-├── docs/                  # 文档
-│   └── backend/CANN.md    #   └── CANN 后端详细文档
-└── .devops/               # Docker 配置
-    └── cann.Dockerfile    #   └── CANN 构建镜像
+├── ggml/                       # 统一 ggml 后端（LLM + SD + ASR 共享）
+│   └── src/ggml-cann/          #   └── CANN 后端实现（核心）
+├── src/                        # llama 核心库
+│   └── models/                 #   └── 50+ 种模型架构实现
+├── include/                    # 公共头文件
+│   ├── llama.h                 #   └── LLM API
+│   └── stable-diffusion.h      #   └── SD API
+├── tools/                      # 应用工具
+│   ├── cli/                    #   └── llama-cli 命令行推理
+│   ├── server/                 #   └── llama-server REST API
+│   ├── quantize/               #   └── 模型量化工具
+│   ├── ominix_diffusion/       #   └── SD 推理模块
+│   │   ├── src/                #       └── libstable-diffusion 库
+│   │   ├── cli/                #       └── ominix-diffusion-cli
+│   │   └── server/             #       └── ominix-diffusion-server
+│   ├── qwen_asr/               #   └── 语音识别
+│   └── qwen_common/            #   └── ASR/TTS 共享模块
+├── examples/                   # 示例应用
+│   └── diffusion/              #   └── Dream LLM diffusion 示例
+├── gguf-py/                    # Python GGUF 文件操作库
+├── docs/                       # 文档
+│   └── backend/CANN.md         #   └── CANN 后端详细文档
+└── .devops/                    # Docker 配置
+    └── cann.Dockerfile         #   └── CANN 构建镜像
 ```
 
 ## 相关文档

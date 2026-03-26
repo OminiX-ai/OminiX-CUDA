@@ -455,6 +455,9 @@ void ggml_cann_diag_mask(ggml_backend_cann_context & ctx, ggml_tensor * dst, flo
  *            dst->op is `GGML_OP_IM2COL`.
  */
 void ggml_cann_im2col(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_im2col_3d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_conv_2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_conv_3d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
  * @brief   Computes time step embeddings using sine and cosine functions.
