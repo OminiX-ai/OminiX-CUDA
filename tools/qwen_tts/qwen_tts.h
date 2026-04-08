@@ -23,6 +23,9 @@ struct QwenTTSParams {
     std::string ref_cache;          // Pre-computed ref_codes + spk_embedding cache file
     std::string voice;              // Built-in voice id (resolved to ref_cache via voices.json)
     std::string voices_dir;         // Directory containing voices.json + *.bin caches
+    std::string xvec;               // x-vector file (xvec-only inference, mutually exclusive with ICL)
+    std::string xvec_extract;       // wav path: tool mode — extract spk_embedding into --xvec_out
+    std::string xvec_out;           // output .xvec path for --xvec_extract
     int n_threads = 8;
     int n_gpu_layers = 0;            // Number of layers to offload to GPU/NPU (0=CPU only)
     int max_new_tokens = 2048;
@@ -38,6 +41,10 @@ public:
 
     bool load(const QwenTTSParams& params);
     bool generate(const QwenTTSParams& params, std::vector<float>& audio_out);
+
+    // Tool mode: extract speaker embedding from a wav and save to .xvec file.
+    // Only requires the speaker_encoder to be loaded (not Talker / CP / decoder).
+    bool extract_xvec(const std::string &wav_path, const std::string &out_xvec_path);
 
 private:
     QwenTTSParams params_;

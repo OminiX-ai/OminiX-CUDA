@@ -2,6 +2,7 @@
 #include "audio_io.h"
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <cmath>
 #include <thread>
@@ -163,9 +164,15 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         return false;
     }
 
-    printf("\n=== Voice Clone Generation ===\n");
-    printf("  Ref audio: %s\n", params.ref_audio.c_str());
-    printf("  Ref text: %s\n", params.ref_text.c_str());
+    bool xvec_mode = !params.xvec.empty();
+
+    printf("\n=== %s Generation ===\n", xvec_mode ? "X-Vector" : "Voice Clone");
+    if (xvec_mode) {
+        printf("  X-vector: %s\n", params.xvec.c_str());
+    } else {
+        printf("  Ref audio: %s\n", params.ref_audio.c_str());
+        printf("  Ref text: %s\n", params.ref_text.c_str());
+    }
     printf("  Target text: %s\n", params.text.c_str());
     printf("  Language: %s\n", params.target_lang.c_str());
 
@@ -177,8 +184,46 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     bool used_cache = false;
     cached_ref_text_.clear();
 
+    // ----- xvec mode: load standalone speaker embedding -----
+    // Format: magic "QXVC" (4B) | version u32 | spk_dim u32 | float32[spk_dim]
+    if (xvec_mode) {
+        FILE *fx = fopen(params.xvec.c_str(), "rb");
+        if (!fx) {
+            printf("FAIL: cannot open xvec file: %s\n", params.xvec.c_str());
+            return false;
+        }
+        char magic[4] = {0};
+        uint32_t version = 0, spk_dim = 0;
+        if (fread(magic, 1, 4, fx) != 4 ||
+            fread(&version, 4, 1, fx) != 1 ||
+            fread(&spk_dim, 4, 1, fx) != 1) {
+            printf("FAIL: short read on xvec header\n");
+            fclose(fx); return false;
+        }
+        if (memcmp(magic, "QXVC", 4) != 0) {
+            printf("FAIL: bad xvec magic (got %.4s, expected QXVC)\n", magic);
+            fclose(fx); return false;
+        }
+        if (version != 1) {
+            printf("FAIL: unsupported xvec version %u (expected 1)\n", version);
+            fclose(fx); return false;
+        }
+        if (spk_dim == 0 || spk_dim > 65536) {
+            printf("FAIL: invalid xvec spk_dim %u\n", spk_dim);
+            fclose(fx); return false;
+        }
+        spk_embedding.resize(spk_dim);
+        if (fread(spk_embedding.data(), sizeof(float), spk_dim, fx) != spk_dim) {
+            printf("FAIL: short read on xvec data\n");
+            fclose(fx); return false;
+        }
+        fclose(fx);
+        printf("\n--- Loaded xvec: %s (spk_dim=%u) ---\n",
+               params.xvec.c_str(), spk_dim);
+    }
+
     // Try loading from ref_cache file
-    if (!params.ref_cache.empty()) {
+    if (!xvec_mode && !params.ref_cache.empty()) {
         FILE *fc = fopen(params.ref_cache.c_str(), "rb");
         if (fc) {
             // Load cached ref_codes + spk_embedding
@@ -215,7 +260,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     auto t0 = std::chrono::high_resolution_clock::now();
     auto t1 = t0;
 
-    if (!used_cache) {
+    if (!used_cache && !xvec_mode) {
         // Need ref_audio + ref_text for encoding
         if (params.ref_audio.empty() || params.ref_text.empty()) {
             printf("FAIL: --ref_audio and --ref_text required (no ref_cache found)\n");
@@ -333,9 +378,14 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     int n_ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
 
     // Step 4: Tokenize text
+    // In xvec mode the talker doesn't need ref_text — pass an empty string so
+    // ref_text_tokens stays empty (build_input_embeddings xvec branch ignores it).
     printf("\n--- Step 4: Tokenize text ---\n");
     std::vector<int> ref_text_tokens, target_text_tokens;
-    tokenize_tts_text(cached_ref_text_.empty() ? params.ref_text : cached_ref_text_,
+    std::string effective_ref_text = xvec_mode
+        ? std::string()
+        : (cached_ref_text_.empty() ? params.ref_text : cached_ref_text_);
+    tokenize_tts_text(effective_ref_text,
                        params.text,
                        ref_text_tokens, target_text_tokens);
 
@@ -373,7 +423,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     if (!talker_.generate(ref_text_tokens, target_text_tokens,
                            spk_embedding, ref_codes, lang,
                            codec_tokens, params.max_new_tokens,
-                           params.sampling)) {
+                           params.sampling, xvec_mode)) {
         printf("FAIL: codec generation failed\n");
         return false;
     }
@@ -451,7 +501,9 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), target_duration);
     printf("  Timing breakdown:\n");
-    if (used_cache) {
+    if (xvec_mode) {
+        printf("    X-Vector:    loaded (encoder skipped, no ICL)\n");
+    } else if (used_cache) {
         printf("    Ref Cache:   loaded (encoder skipped)\n");
     } else {
         printf("    Speaker+Enc: %.2f sec (parallel)\n", spk_time);
@@ -465,5 +517,67 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Total RTF:     %.2fx (end-to-end / audio)\n",
            total_time / target_duration);
 
+    return true;
+}
+
+// ============================================================================
+// xvec extraction tool
+//
+// Loads a wav file, runs the speaker encoder once, and writes the resulting
+// 2048-dim speaker embedding to a standalone .xvec file.
+//
+// File format:
+//   offset 0:  magic "QXVC" (4 bytes)
+//   offset 4:  version  u32   (= 1)
+//   offset 8:  spk_dim  u32
+//   offset 12: spk_emb  float32[spk_dim]
+// ============================================================================
+bool QwenTTS::extract_xvec(const std::string &wav_path,
+                            const std::string &out_xvec_path) {
+    if (!loaded_) {
+        printf("[qwen_tts] models not loaded\n");
+        return false;
+    }
+    printf("\n=== X-Vector Extraction ===\n");
+    printf("  Input wav: %s\n", wav_path.c_str());
+    printf("  Output xvec: %s\n", out_xvec_path.c_str());
+
+    std::vector<float> ref_audio;
+    if (!audio_io::load_audio(wav_path, 24000, ref_audio)) {
+        printf("FAIL: cannot load audio: %s\n", wav_path.c_str());
+        return false;
+    }
+    printf("  Loaded %zu samples (%.2f sec at 24kHz)\n",
+           ref_audio.size(), ref_audio.size() / 24000.0f);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<float> spk_embedding;
+    if (!speaker_encoder_.extract(ref_audio, 24000, spk_embedding)) {
+        printf("FAIL: speaker embedding extraction failed\n");
+        return false;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double dt = std::chrono::duration<double>(t1 - t0).count();
+    printf("  Extracted %zu-dim speaker embedding in %.2f sec\n",
+           spk_embedding.size(), dt);
+
+    FILE *f = fopen(out_xvec_path.c_str(), "wb");
+    if (!f) {
+        printf("FAIL: cannot open output file for write: %s\n",
+               out_xvec_path.c_str());
+        return false;
+    }
+    const char magic[4] = {'Q', 'X', 'V', 'C'};
+    uint32_t version = 1;
+    uint32_t spk_dim = (uint32_t)spk_embedding.size();
+    fwrite(magic, 1, 4, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&spk_dim, 4, 1, f);
+    fwrite(spk_embedding.data(), sizeof(float), spk_dim, f);
+    fclose(f);
+
+    long sz = 12 + (long)spk_dim * 4;
+    printf("  Saved xvec: %s (%ld bytes, magic=QXVC v=%u dim=%u)\n",
+           out_xvec_path.c_str(), sz, version, spk_dim);
     return true;
 }

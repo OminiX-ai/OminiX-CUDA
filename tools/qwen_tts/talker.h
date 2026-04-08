@@ -178,9 +178,13 @@ public:
                     int n_gpu_layers = 0,
                     const std::string &cp_llama_path = "");
 
-    // Generate codec tokens (ICL voice cloning mode)
-    //   ref_text_tokens: tokenized ref text content (no role prefix/suffix)
+    // Generate codec tokens.
+    //   ref_text_tokens: tokenized ref text content (no role prefix/suffix). Empty in xvec mode.
     //   target_text_tokens: tokenized target text content (no role prefix/suffix)
+    //   ref_codes: per-quantizer reference codec frames. Empty in xvec mode.
+    //   xvec_mode: true → x-vector-only synthesis (no ICL ref). Mirrors Qwen3-TTS
+    //              x_vector_only_mode: prefill is shorter (role + mixed_prefix + 1 pos)
+    //              and trailing_text uses target_text[1:] + tts_eos.
     bool generate(const std::vector<int> &ref_text_tokens,
                   const std::vector<int> &target_text_tokens,
                   const std::vector<float> &spk_embedding,
@@ -188,7 +192,8 @@ public:
                   const std::string &language,
                   std::vector<std::vector<int>> &codec_tokens,
                   int max_new_tokens = 2048,
-                  const TalkerSamplingParams &sampling = TalkerSamplingParams());
+                  const TalkerSamplingParams &sampling = TalkerSamplingParams(),
+                  bool xvec_mode = false);
 
     const TalkerConfig &get_config() const { return talker_config_; }
 
@@ -247,14 +252,17 @@ private:
     void apply_text_projection(const float *in, float *out);
     void apply_codec_head(const float *hidden, float *logits);
 
-    // Build prefill embedding sequence (non-streaming ICL mode)
+    // Build prefill embedding sequence.
+    //   xvec_mode=false: streaming ICL prefill (role + mixed_prefix + interleaved ICL)
+    //   xvec_mode=true:  x-vector-only prefill (role + mixed_prefix + 1 extra pos)
     bool build_input_embeddings(const std::vector<int> &ref_text_tokens,
                                  const std::vector<int> &target_text_tokens,
                                  const std::vector<float> &spk_embedding,
                                  const std::vector<std::vector<int>> &ref_codes,
                                  const std::string &language,
                                  std::vector<float> &embeddings,
-                                 int &seq_len);
+                                 int &seq_len,
+                                 bool xvec_mode = false);
 
     // Compute text_proj(text_emb(token_id)) into out
     void lookup_text_projected(int token_id, float *out);

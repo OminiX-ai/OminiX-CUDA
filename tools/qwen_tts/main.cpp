@@ -99,9 +99,14 @@ static void print_usage(const char* prog) {
     printf("  --ref_text <text>          Reference audio transcript\n");
     printf("  (or) --voice <id>          Use a built-in voice (see --list_voices)\n");
     printf("  (or) --ref_cache <path>    Use a pre-computed speaker cache file\n");
+    printf("  (or) --xvec <path>         Use a pre-extracted x-vector (.xvec file)\n");
+    printf("\nTool modes:\n");
+    printf("  --xvec_extract <wav>       Extract speaker embedding from wav into\n");
+    printf("                             --xvec_out <file>, then exit (no synthesis)\n");
     printf("\nOptional:\n");
     printf("  --voices_dir <path>        Directory with voices.json (default: tools/qwen_tts/data/voices)\n");
     printf("  --list_voices              List built-in voices and exit\n");
+    printf("  --xvec_out <path>          Output path for --xvec_extract (default: voice.xvec)\n");
     printf("  --tokenizer_dir <path>     Tokenizer directory (vocab.json + merges.txt)\n");
     printf("                             Default: same as model_dir\n");
     printf("  --target_lang <lang>       Target language (English/Chinese, default: English)\n");
@@ -166,6 +171,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--list_voices") {
             std::string vdir = params.voices_dir.empty() ? default_voices_dir() : params.voices_dir;
             return list_voices(vdir);
+        } else if (arg == "--xvec" && i + 1 < argc) {
+            params.xvec = argv[++i];
+        } else if (arg == "--xvec_extract" && i + 1 < argc) {
+            params.xvec_extract = argv[++i];
+        } else if (arg == "--xvec_out" && i + 1 < argc) {
+            params.xvec_out = argv[++i];
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             params.device = argv[++i];
         } else if ((arg == "-n" || arg == "--n_threads") && i + 1 < argc) {
@@ -196,6 +207,28 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ----- Tool mode: --xvec_extract -----
+    // Loads only what we need (speaker encoder), runs extract_xvec(), exits.
+    if (!params.xvec_extract.empty()) {
+        if (params.model_dir.empty()) {
+            fprintf(stderr, "Error: --model_dir is required for --xvec_extract\n");
+            return 1;
+        }
+        if (params.xvec_out.empty()) {
+            params.xvec_out = "voice.xvec";
+            fprintf(stderr, "[xvec_extract] --xvec_out not specified, using default: %s\n",
+                    params.xvec_out.c_str());
+        }
+        // Stub a target text to satisfy load() — extract path doesn't use it.
+        if (params.text.empty()) params.text = ".";
+        QwenTTS tts;
+        if (!tts.load(params)) {
+            fprintf(stderr, "Failed to load models\n");
+            return 1;
+        }
+        return tts.extract_xvec(params.xvec_extract, params.xvec_out) ? 0 : 1;
+    }
+
     // Resolve --voice → --ref_cache
     if (!params.voice.empty()) {
         std::string vdir = params.voices_dir.empty() ? default_voices_dir() : params.voices_dir;
@@ -210,11 +243,19 @@ int main(int argc, char** argv) {
                params.voice.c_str(), cache_path.c_str());
     }
 
+    bool has_xvec      = !params.xvec.empty();
     bool has_ref_cache = !params.ref_cache.empty();
     bool has_ref_audio = !params.ref_audio.empty() && !params.ref_text.empty();
+
+    // xvec is mutually exclusive with ICL inputs
+    if (has_xvec && (has_ref_cache || has_ref_audio)) {
+        fprintf(stderr, "Error: --xvec is mutually exclusive with --voice/--ref_cache/--ref_audio (xvec mode is x-vector-only, no ICL)\n");
+        return 1;
+    }
+
     if (params.model_dir.empty() || params.text.empty() ||
-        (!has_ref_cache && !has_ref_audio)) {
-        fprintf(stderr, "Error: --model_dir, --text, and one of (--voice | --ref_cache | --ref_audio + --ref_text) are required\n\n");
+        (!has_xvec && !has_ref_cache && !has_ref_audio)) {
+        fprintf(stderr, "Error: --model_dir, --text, and one of (--voice | --ref_cache | --ref_audio + --ref_text | --xvec) are required\n\n");
         print_usage(argv[0]);
         return 1;
     }

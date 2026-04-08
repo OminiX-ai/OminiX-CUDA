@@ -666,7 +666,8 @@ bool TalkerLLM::build_input_embeddings(
     const std::vector<std::vector<int>> &ref_codes,
     const std::string &language,
     std::vector<float> &embeddings,
-    int &seq_len) {
+    int &seq_len,
+    bool xvec_mode) {
 
     int dim = n_embd_;
     auto &cfg = talker_config_;
@@ -699,6 +700,81 @@ bool TalkerLLM::build_input_embeddings(
     // --- Role prefix ---
     int role_ids[] = {151644, 77091, 198};
     int role_len = 3;
+
+    // ========================================================================
+    // x-vector-only branch (Python: modeling_qwen3_tts.py:2188 else-branch)
+    //
+    // Layout:
+    //   Section 1: role prefix       (3 pos)         text only
+    //   Section 2: mixed prefix      (N-1 pos)       same as ICL (spk inserted)
+    //   Section 3: 1 extra position  (1 pos)         text_proj(target_text[0]) + codec_bos
+    //
+    // trailing_text_hidden = text_proj(target_text[1:]) + tts_eos
+    //   length = (target_text_len - 1) + 1 = target_text_len
+    // ========================================================================
+    if (xvec_mode) {
+        if (target_text_tokens.empty()) {
+            printf("[talker] xvec mode: target_text_tokens is empty\n");
+            return false;
+        }
+        int target_text_len_x = (int)target_text_tokens.size();
+
+        // Build trailing_text_: target_text[1:] + tts_eos
+        int trailing_n = target_text_len_x;  // (n-1) + 1
+        trailing_text_.assign((size_t)trailing_n * dim, 0.0f);
+        for (int i = 1; i < target_text_len_x; i++) {
+            lookup_text_projected(target_text_tokens[i],
+                                   trailing_text_.data() + (size_t)(i - 1) * dim);
+        }
+        memcpy(trailing_text_.data() + (size_t)(target_text_len_x - 1) * dim,
+               tts_eos_embed_.data(), dim * sizeof(float));
+        trailing_text_len_ = trailing_n;
+
+        // Total prefill = role + (N-1) + 1
+        seq_len = role_len + (N - 1) + 1;
+        embeddings.assign((size_t)seq_len * dim, 0.0f);
+
+        int pos = 0;
+        std::vector<float> tmp_codec(dim);
+
+        // Section 1: role prefix
+        for (int i = 0; i < role_len; i++) {
+            lookup_text_projected(role_ids[i],
+                                   embeddings.data() + (size_t)pos * dim);
+            pos++;
+        }
+
+        // Section 2: mixed prefix (text=tts_pad×(N-2)|tts_bos, codec=codec_prefix[:-1] with spk)
+        for (int i = 0; i < N - 1; i++) {
+            float *dst = embeddings.data() + (size_t)pos * dim;
+            const float *text_src = (i < N - 2) ? tts_pad_embed_.data()
+                                                 : tts_bos_embed_.data();
+            memcpy(dst, text_src, dim * sizeof(float));
+
+            if (i == spk_idx) {
+                for (int j = 0; j < dim; j++) dst[j] += spk_embedding[j];
+            } else {
+                lookup_codec_embedding(codec_prefix_ids[i], tmp_codec.data());
+                for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
+            }
+            pos++;
+        }
+
+        // Section 3: 1 extra position
+        //   text_proj(target_text[0])  +  codec_bos  (= codec_prefix_ids[N-1])
+        {
+            float *dst = embeddings.data() + (size_t)pos * dim;
+            lookup_text_projected(target_text_tokens[0], dst);
+            lookup_codec_embedding(codec_prefix_ids[N - 1], tmp_codec.data());
+            for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
+            pos++;
+        }
+
+        printf("[talker] built input embeddings (xvec): seq_len=%d "
+               "(role=%d mixed_prefix=%d xtra=1, target_text=%d trailing=%d)\n",
+               seq_len, role_len, N - 1, target_text_len_x, trailing_text_len_);
+        return true;
+    }
 
     // --- Build ICL text embeddings: text_proj(ref_text ++ target_text) + tts_eos ---
     int ref_text_len = (int)ref_text_tokens.size();
@@ -1295,7 +1371,8 @@ bool TalkerLLM::generate(
     const std::string &language,
     std::vector<std::vector<int>> &codec_tokens,
     int max_new_tokens,
-    const TalkerSamplingParams &sampling) {
+    const TalkerSamplingParams &sampling,
+    bool xvec_mode) {
 
     if (!llama_ctx_) {
         printf("[talker] llama.cpp backbone not loaded\n");
@@ -1318,7 +1395,8 @@ bool TalkerLLM::generate(
     int prefill_len = 0;
     if (!build_input_embeddings(ref_text_tokens, target_text_tokens,
                                  spk_embedding, ref_codes,
-                                 language, prefill_embs, prefill_len)) {
+                                 language, prefill_embs, prefill_len,
+                                 xvec_mode)) {
         return false;
     }
 
