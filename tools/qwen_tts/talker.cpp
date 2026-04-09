@@ -1,5 +1,8 @@
 #include "talker.h"
 #include "ggml.h"
+#ifdef OMINIX_HAS_CANN
+#include "ggml-cann.h"
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -500,6 +503,19 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     if (!cp_llama_path.empty()) {
         printf("[talker] loading CP llama.cpp backend from %s\n",
                cp_llama_path.c_str());
+
+#ifdef OMINIX_HAS_CANN
+        // The CP rollout produces 15 distinct ACL graph shapes per frame
+        // (1× 2-token prefill at pos 0+1, then 14× single-token decodes
+        // at pos 2..15). The default ggml-cann graph LRU cache holds only
+        // 12 entries, which would force a recapture of 3 shapes per frame
+        // and erase the speedup. Bump the cache via env var so all 15
+        // captured graphs survive between frames. The env var is read by
+        // the ggml-cann context constructor below.
+        if (!getenv("GGML_CANN_GRAPH_CACHE_CAPACITY")) {
+            setenv("GGML_CANN_GRAPH_CACHE_CAPACITY", "32", 0);
+        }
+#endif
 
         llama_model_params cp_model_params = llama_model_default_params();
         cp_model_params.n_gpu_layers = n_gpu_layers;
@@ -1203,6 +1219,20 @@ bool TalkerLLM::predict_code_groups(
         // NPU path: CP transformer via llama.cpp
         // input_proj and lm_heads remain on CPU (negligible compute)
         // ============================================================
+        //
+        // Force ACL graph mode ON for the duration of this function. The
+        // cp_llama context is the only sub-model in the qwen_tts pipeline
+        // whose shape pattern actually benefits from CANN graph capture:
+        // each frame issues the same 15 unique shapes (1× 2-token prefill
+        // at pos 0+1, then 14× single-token decodes at pos 2..15), and
+        // those shapes repeat verbatim across all 50+ generation frames,
+        // so cache hit rate after frame 0 is ~100%. The talker context
+        // (different KV size every step → cache thrash) and the codec
+        // decoder context (GatherV3 crash under capture, see Apr-2026
+        // diagnostic) intentionally stay in eager mode.
+#ifdef OMINIX_HAS_CANN
+        ggml_backend_cann_set_thread_acl_graph_override(true, true);
+#endif
         llama_memory_clear(llama_get_memory(cp_llama_ctx_), true);
 
         std::vector<float> projected(cp_hidden);
@@ -1273,6 +1303,9 @@ bool TalkerLLM::predict_code_groups(
             }
         }
 
+#ifdef OMINIX_HAS_CANN
+        ggml_backend_cann_set_thread_acl_graph_override(false, false);
+#endif
         return true;
     }
 
