@@ -1405,7 +1405,8 @@ bool TalkerLLM::generate(
     std::vector<std::vector<int>> &codec_tokens,
     int max_new_tokens,
     const TalkerSamplingParams &sampling,
-    bool xvec_mode) {
+    bool xvec_mode,
+    FrameCallback frame_callback) {
 
     if (!llama_ctx_) {
         printf("[talker] llama.cpp backbone not loaded\n");
@@ -1542,6 +1543,14 @@ bool TalkerLLM::generate(
 
             auto cp_t1 = std::chrono::high_resolution_clock::now();
             total_cp_ms += std::chrono::duration<double, std::milli>(cp_t1 - cp_t0).count();
+
+            // Streaming hook: notify caller that a new frame is ready.
+            // Fired only for real codec frames (special tokens skip CP and
+            // shouldn't enter the audio stream).
+            if (frame_callback) {
+                int frame_idx = (int)codec_tokens[0].size() - 1;
+                frame_callback(frame_idx, codec_tokens);
+            }
 
             // Compute next embedding (sum of all 16 group embeddings)
             auto emb_t0 = std::chrono::high_resolution_clock::now();

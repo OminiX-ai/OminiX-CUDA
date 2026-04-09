@@ -5,6 +5,7 @@
 #include "speech_tokenizer_encoder.h"
 #include "speech_tokenizer_decoder.h"
 #include "talker.h"
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,20 @@ struct QwenTTSParams {
     bool profiling = false;
     // Sampling parameters (matching Python defaults)
     TalkerSamplingParams sampling;
+
+    // Streaming output: when stream_chunk_frames > 0 and stream_callback is
+    // set, the talker generation runs in streaming mode. Each time
+    // stream_chunk_frames new codec frames have been produced, the codec
+    // decoder is invoked on those frames in isolation (no cross-chunk
+    // warmup, same as the Top1 fix) and stream_callback is called with the
+    // resulting PCM samples. The final partial chunk (if any) is flushed at
+    // the end with is_final=true. The full audio is also accumulated into
+    // the audio_out vector returned by generate(), so callers that don't
+    // care about latency can ignore the callback entirely.
+    using StreamCallback = std::function<void(
+        const float *samples, size_t n_samples, bool is_final)>;
+    int stream_chunk_frames = 0;
+    StreamCallback stream_callback;
 };
 
 class QwenTTS {

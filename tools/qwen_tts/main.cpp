@@ -128,6 +128,9 @@ static void print_usage(const char* prog) {
     printf("  --greedy                   Disable sampling (use greedy decoding)\n");
     printf("  --seed <int>               Random seed for sampling (default: 42)\n");
     printf("  -p, --profiling            Enable profiling\n");
+    printf("  --stream <chunk_frames>    Streaming mode: emit audio in chunks of\n");
+    printf("                             N codec frames (~40ms per frame). Suggested\n");
+    printf("                             N=8 (~320ms chunks). 0=off (default).\n");
     printf("  -h, --help                 Show this help\n");
     printf("\nExample:\n");
     printf("  %s -m gguf/ --tokenizer_dir /path/to/Qwen3-TTS/ \\\n", prog);
@@ -200,6 +203,8 @@ int main(int argc, char** argv) {
             set_sampling_seed(std::atoi(argv[++i]));
         } else if (arg == "-p" || arg == "--profiling") {
             params.profiling = true;
+        } else if (arg == "--stream" && i + 1 < argc) {
+            params.stream_chunk_frames = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -272,15 +277,59 @@ int main(int argc, char** argv) {
         QwenTTSParams warmup_params = params;
         warmup_params.max_new_tokens = 5;  // minimal generation
         warmup_params.profiling = false;
+        warmup_params.stream_chunk_frames = 0;  // never stream the warmup
+        warmup_params.stream_callback = nullptr;
         std::vector<float> warmup_audio;
         tts.generate(warmup_params, warmup_audio);
         printf("=== Warmup complete ===\n\n");
     }
 
+    // If --stream is set, install a chunk callback that just measures
+    // first-byte and per-chunk latency. The audio is still accumulated
+    // into audio_out (by the streaming path inside QwenTTS::generate) and
+    // saved as a single wav file at the end.
+    auto wall_start = std::chrono::high_resolution_clock::now();
+    int  stream_chunks_seen   = 0;
+    bool stream_first_emitted = false;
+    double stream_first_byte_ms = 0;
+    if (params.stream_chunk_frames > 0) {
+        params.stream_callback = [&](const float * /*samples*/,
+                                      size_t n_samples,
+                                      bool   is_final) {
+            if (!stream_first_emitted && n_samples > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                stream_first_byte_ms = std::chrono::duration<double, std::milli>(
+                                          now - wall_start).count();
+                stream_first_emitted = true;
+                printf("[stream] first audio chunk: %.0f ms after generate() "
+                       "(%.2f sec of audio)\n",
+                       stream_first_byte_ms, n_samples / 24000.0);
+            }
+            if (n_samples > 0) {
+                stream_chunks_seen++;
+                printf("[stream] chunk %d: %zu samples (%.2f sec)%s\n",
+                       stream_chunks_seen, n_samples, n_samples / 24000.0,
+                       is_final ? " [final]" : "");
+            } else if (is_final) {
+                printf("[stream] end-of-stream marker\n");
+            }
+        };
+    }
+
+    wall_start = std::chrono::high_resolution_clock::now();
     std::vector<float> audio_out;
     if (!tts.generate(params, audio_out)) {
         fprintf(stderr, "Failed to generate audio\n");
         return 1;
+    }
+    if (params.stream_chunk_frames > 0 && stream_first_emitted) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(
+                              now - wall_start).count();
+        printf("[stream] first-byte=%.0f ms, total=%.0f ms, %d chunks, "
+               "%.2fx speedup over wait-for-full\n",
+               stream_first_byte_ms, total_ms, stream_chunks_seen,
+               total_ms / stream_first_byte_ms);
     }
 
     // Save output audio

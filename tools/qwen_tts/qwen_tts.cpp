@@ -409,8 +409,28 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                ref_text_tokens.size(), target_text_tokens.size());
     }
 
-    // Step 5: Generate codec tokens with Talker LLM
+    // Step 5+6: Generate codec tokens with Talker LLM (and stream-decode if
+    // a chunk callback is registered).
+    //
+    // In non-streaming mode (the default) the talker generates all codec
+    // frames first, then the decoder runs once on the full sequence.
+    //
+    // In streaming mode (params.stream_chunk_frames > 0) the talker fires
+    // a per-frame callback every step. Once `chunk_frames` new frames have
+    // accumulated, we slice them out, decode that slice in isolation (same
+    // "drop ref / no warmup" behavior as the non-streaming path — the
+    // codec decoder's sliding-window attention zero-pads missing left
+    // context, which is exactly how xvec_only_mode ships in production),
+    // and invoke params.stream_callback with the resulting PCM. The
+    // generation thread blocks until the user callback returns, so audio
+    // emission is synchronous and ordered. Any frames left in the buffer
+    // when the talker reaches EOS are flushed in a final chunk with
+    // is_final=true. The full audio is also accumulated into audio_out so
+    // callers that ignore the callback still get the same result.
     printf("\n--- Step 5: Generate codec tokens ---\n");
+    if (params.stream_chunk_frames > 0 && params.stream_callback) {
+        printf("  [streaming] chunk_frames=%d\n", params.stream_chunk_frames);
+    }
     t0 = std::chrono::high_resolution_clock::now();
 
     // Convert language string to lowercase for matching
@@ -418,11 +438,98 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     for (auto &c : lang) c = tolower(c);
 
     std::vector<std::vector<int>> codec_tokens;
+
+    // Streaming state shared with the per-frame callback below.
+    bool streaming = (params.stream_chunk_frames > 0 && params.stream_callback);
+    int  decoded_until = 0;            // frames already emitted (exclusive)
+    int  chunk_frames  = streaming ? params.stream_chunk_frames : 0;
+    double stream_decode_time = 0;
+    int    stream_chunks_emitted = 0;
+    audio_out.clear();
+
+    // Per-chunk decode with a left-context warmup window so the codec
+    // decoder's pre-transformer sliding-window attention (window=72) and
+    // causal conv stacks see realistic context across chunk boundaries.
+    // Without warmup, frame 0 of each chunk would attend to nothing, and
+    // adjacent chunks produced sample discontinuities (~25x larger jumps
+    // than baseline at chunk boundaries → audible clicks).
+    //
+    // Strategy: feed the decoder [max(0, from - kStreamWarmup), to)
+    // codec frames. After decode, drop the leading
+    // (from - warmup_start) * decode_upsample_rate audio samples and
+    // keep only the (to - from) frames that this chunk owns.
+    //
+    // Cost: the first chunk decodes its native frames; subsequent chunks
+    // decode (chunk_frames + warmup) frames each but only emit chunk_frames
+    // worth of audio. Net decoder work scales linearly with sequence
+    // length (still single-shot under CANN_MAX_FRAMES=99 for typical
+    // chunk sizes) and is the price of correct cross-chunk continuity.
+    constexpr int kStreamWarmup = 72;  // matches OVERLAP_FRAMES inside the decoder
+    int upsample_per_frame = 1920;     // 24kHz * 0.08s; matches DecoderConfig.decode_upsample_rate
+    auto emit_chunk = [&](int from, int to, bool is_final) {
+        if (to <= from) {
+            if (is_final && params.stream_callback) {
+                params.stream_callback(nullptr, 0, true);
+            }
+            return true;
+        }
+        int warmup_start = std::max(0, from - kStreamWarmup);
+        std::vector<std::vector<int>> chunk_codes(codec_tokens.size());
+        for (size_t q = 0; q < codec_tokens.size(); q++) {
+            chunk_codes[q].assign(codec_tokens[q].begin() + warmup_start,
+                                   codec_tokens[q].begin() + to);
+        }
+        std::vector<float> chunk_audio;
+        auto dec_t0 = std::chrono::high_resolution_clock::now();
+        if (!tokenizer_decoder_.decode(chunk_codes, chunk_audio)) {
+            printf("FAIL: streaming decode failed at frames [%d,%d)\n", from, to);
+            return false;
+        }
+        auto dec_t1 = std::chrono::high_resolution_clock::now();
+        stream_decode_time += std::chrono::duration<double>(dec_t1 - dec_t0).count();
+        stream_chunks_emitted++;
+        // Drop the warmup region's audio — we already emitted those samples
+        // in a previous chunk and we only keep this chunk's "new" frames.
+        int warmup_samples = (from - warmup_start) * upsample_per_frame;
+        if (warmup_samples > (int) chunk_audio.size()) {
+            warmup_samples = (int) chunk_audio.size();
+        }
+        const float *kept_begin = chunk_audio.data() + warmup_samples;
+        size_t       kept_count = chunk_audio.size() - warmup_samples;
+        audio_out.insert(audio_out.end(), kept_begin, kept_begin + kept_count);
+        if (params.stream_callback) {
+            params.stream_callback(kept_begin, kept_count, is_final);
+        }
+        return true;
+    };
+
+    bool stream_failed = false;
+    TalkerLLM::FrameCallback frame_cb = nullptr;
+    if (streaming) {
+        frame_cb = [&](int frame_idx,
+                       const std::vector<std::vector<int>> &cur_tokens) {
+            (void) cur_tokens;  // we read codec_tokens directly via capture
+            if (stream_failed) return;
+            int n_now = frame_idx + 1;
+            while (n_now - decoded_until >= chunk_frames) {
+                int next = decoded_until + chunk_frames;
+                if (!emit_chunk(decoded_until, next, /*is_final=*/false)) {
+                    stream_failed = true;
+                    return;
+                }
+                decoded_until = next;
+            }
+        };
+    }
+
     if (!talker_.generate(ref_text_tokens, target_text_tokens,
                            spk_embedding, ref_codes, lang,
                            codec_tokens, params.max_new_tokens,
-                           params.sampling, xvec_mode)) {
+                           params.sampling, xvec_mode, frame_cb)) {
         printf("FAIL: codec generation failed\n");
+        return false;
+    }
+    if (stream_failed) {
         return false;
     }
     t1 = std::chrono::high_resolution_clock::now();
@@ -449,25 +556,42 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     // Step 6: Decode codec tokens to audio
     //
-    // Decode only the generated codec tokens — never concatenate ref_codes.
-    // The codec decoder's pre-transformer uses sliding-window attention
-    // (window=72) and the conv stacks are causal, so frame 0's left context
-    // is naturally zero-padded. The Python xvec_only_mode path does exactly
-    // this and ships in production. Old behavior decoded [ref || gen] and
-    // then cut audio proportionally — that wasted ~70% of decoder compute
-    // on samples that were immediately discarded.
+    // In non-streaming mode this is a single decoder run. In streaming
+    // mode the bulk of the audio has already been emitted from
+    // emit_chunk() above, but we still need to flush the trailing partial
+    // chunk (if n_gen_frames isn't a multiple of chunk_frames).
     printf("\n--- Step 6: Decode to audio ---\n");
     t0 = std::chrono::high_resolution_clock::now();
 
-    if (!tokenizer_decoder_.decode(codec_tokens, audio_out)) {
-        printf("FAIL: audio decoding failed\n");
-        return false;
+    double decode_time = 0;
+    if (streaming) {
+        // Flush remaining frames as the final chunk.
+        if (decoded_until < n_gen_frames) {
+            if (!emit_chunk(decoded_until, n_gen_frames, /*is_final=*/true)) {
+                return false;
+            }
+            decoded_until = n_gen_frames;
+        } else if (params.stream_callback) {
+            // n_gen_frames was an exact multiple of chunk_frames; we still
+            // owe the user a final marker.
+            params.stream_callback(nullptr, 0, true);
+        }
+        decode_time = stream_decode_time;
+        printf("  Decoded %zu samples in %d streaming chunk(s) "
+               "(%.2f sec, ratio %.1fx)\n",
+               audio_out.size(), stream_chunks_emitted, decode_time,
+               audio_out.size() / 24000.0 / std::max(decode_time, 1e-6));
+    } else {
+        if (!tokenizer_decoder_.decode(codec_tokens, audio_out)) {
+            printf("FAIL: audio decoding failed\n");
+            return false;
+        }
+        t1 = std::chrono::high_resolution_clock::now();
+        decode_time = std::chrono::duration<double>(t1 - t0).count();
+        printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
+               audio_out.size(), decode_time,
+               audio_out.size() / 24000.0 / decode_time);
     }
-    t1 = std::chrono::high_resolution_clock::now();
-    double decode_time = std::chrono::duration<double>(t1 - t0).count();
-    printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
-           audio_out.size(), decode_time,
-           audio_out.size() / 24000.0 / decode_time);
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_t1 - total_t0).count();

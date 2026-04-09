@@ -7,6 +7,7 @@
 #include "model_loader.h"
 #include "infer_session.hpp"
 #include "llama.h"
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -178,6 +179,16 @@ public:
                     int n_gpu_layers = 0,
                     const std::string &cp_llama_path = "");
 
+    // Per-frame callback hook for streaming generation. Called immediately
+    // after each newly produced codec frame is appended to codec_tokens.
+    //   frame_idx: 0-based index of the frame just appended
+    //   codec_tokens: current accumulated tokens (size = frame_idx + 1)
+    // The callback runs synchronously inside the generation loop, so it
+    // should be lightweight (e.g. enqueue onto a chunk buffer).
+    using FrameCallback = std::function<void(
+        int frame_idx,
+        const std::vector<std::vector<int>> &codec_tokens)>;
+
     // Generate codec tokens.
     //   ref_text_tokens: tokenized ref text content (no role prefix/suffix). Empty in xvec mode.
     //   target_text_tokens: tokenized target text content (no role prefix/suffix)
@@ -185,6 +196,7 @@ public:
     //   xvec_mode: true → x-vector-only synthesis (no ICL ref). Mirrors Qwen3-TTS
     //              x_vector_only_mode: prefill is shorter (role + mixed_prefix + 1 pos)
     //              and trailing_text uses target_text[1:] + tts_eos.
+    //   frame_callback: optional, see FrameCallback above
     bool generate(const std::vector<int> &ref_text_tokens,
                   const std::vector<int> &target_text_tokens,
                   const std::vector<float> &spk_embedding,
@@ -193,7 +205,8 @@ public:
                   std::vector<std::vector<int>> &codec_tokens,
                   int max_new_tokens = 2048,
                   const TalkerSamplingParams &sampling = TalkerSamplingParams(),
-                  bool xvec_mode = false);
+                  bool xvec_mode = false,
+                  FrameCallback frame_callback = nullptr);
 
     const TalkerConfig &get_config() const { return talker_config_; }
 
