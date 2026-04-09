@@ -375,8 +375,6 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     }  // end if (!used_cache)
 
-    int n_ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
-
     // Step 4: Tokenize text
     // In xvec mode the talker doesn't need ref_text — pass an empty string so
     // ref_text_tokens stays empty (build_input_embeddings xvec branch ignores it).
@@ -450,49 +448,26 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
            n_gen_frames / generate_time);
 
     // Step 6: Decode codec tokens to audio
+    //
+    // Decode only the generated codec tokens — never concatenate ref_codes.
+    // The codec decoder's pre-transformer uses sliding-window attention
+    // (window=72) and the conv stacks are causal, so frame 0's left context
+    // is naturally zero-padded. The Python xvec_only_mode path does exactly
+    // this and ships in production. Old behavior decoded [ref || gen] and
+    // then cut audio proportionally — that wasted ~70% of decoder compute
+    // on samples that were immediately discarded.
     printf("\n--- Step 6: Decode to audio ---\n");
     t0 = std::chrono::high_resolution_clock::now();
 
-    // Concatenate ref_codes + generated codec_tokens for ICL-mode decoding
-    // (decoder expects the full sequence including reference)
-    std::vector<std::vector<int>> full_codes(codec_tokens.size());
-    for (size_t q = 0; q < full_codes.size(); q++) {
-        full_codes[q].reserve(n_ref_frames + n_gen_frames);
-        if (q < ref_codes.size()) {
-            full_codes[q].insert(full_codes[q].end(),
-                                  ref_codes[q].begin(), ref_codes[q].end());
-        }
-        full_codes[q].insert(full_codes[q].end(),
-                              codec_tokens[q].begin(), codec_tokens[q].end());
-    }
-
-    std::vector<float> full_audio;
-    if (!tokenizer_decoder_.decode(full_codes, full_audio)) {
+    if (!tokenizer_decoder_.decode(codec_tokens, audio_out)) {
         printf("FAIL: audio decoding failed\n");
         return false;
     }
     t1 = std::chrono::high_resolution_clock::now();
     double decode_time = std::chrono::duration<double>(t1 - t0).count();
     printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
-           full_audio.size(), decode_time,
-           full_audio.size() / 24000.0 / decode_time);
-
-    // Step 7: Remove reference audio portion
-    // full_audio = decoder([ref_codes || gen_codes])
-    // Only ref_codes correspond to the original ref audio; gen_codes are target-text only.
-    // Cut proportionally: cut = n_ref_frames / total_frames * audio_length
-    // (matches Python: cut = int(ref_len / total_len * wav.shape[0]))
-    int total_frames = n_ref_frames + n_gen_frames;
-    int cut = (int)((long long)n_ref_frames * (long long)full_audio.size() / std::max(total_frames, 1));
-    printf("  Cutting first %d samples (%.2f sec) -- ref audio portion\n",
-           cut, cut / 24000.0f);
-    if (cut > 0 && cut < (int)full_audio.size()) {
-        audio_out.assign(full_audio.begin() + cut, full_audio.end());
-    } else {
-        audio_out = std::move(full_audio);
-    }
-
-
+           audio_out.size(), decode_time,
+           audio_out.size() / 24000.0 / decode_time);
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_t1 - total_t0).count();
