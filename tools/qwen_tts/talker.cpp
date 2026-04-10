@@ -717,6 +717,15 @@ bool TalkerLLM::build_input_embeddings(
     int role_ids[] = {151644, 77091, 198};
     int role_len = 3;
 
+    // Cache role prefix embeddings (same 3 tokens for every sentence)
+    if (!role_embeds_cached_) {
+        cached_role_embeds_.resize((size_t)role_len * dim);
+        for (int i = 0; i < role_len; i++)
+            lookup_text_projected(role_ids[i],
+                                   cached_role_embeds_.data() + (size_t)i * dim);
+        role_embeds_cached_ = true;
+    }
+
     // ========================================================================
     // x-vector-only branch (Python: modeling_qwen3_tts.py:2188 else-branch)
     //
@@ -753,12 +762,10 @@ bool TalkerLLM::build_input_embeddings(
         int pos = 0;
         std::vector<float> tmp_codec(dim);
 
-        // Section 1: role prefix
-        for (int i = 0; i < role_len; i++) {
-            lookup_text_projected(role_ids[i],
-                                   embeddings.data() + (size_t)pos * dim);
-            pos++;
-        }
+        // Section 1: role prefix (cached)
+        memcpy(embeddings.data(), cached_role_embeds_.data(),
+               (size_t)role_len * dim * sizeof(float));
+        pos += role_len;
 
         // Section 2: mixed prefix (text=tts_pad×(N-2)|tts_bos, codec=codec_prefix[:-1] with spk)
         for (int i = 0; i < N - 1; i++) {
@@ -797,9 +804,18 @@ bool TalkerLLM::build_input_embeddings(
     int target_text_len = (int)target_text_tokens.size();
     int text_lens = ref_text_len + target_text_len + 1;  // +1 for tts_eos
 
-    std::vector<float> text_embeds(text_lens * dim);
-    for (int i = 0; i < ref_text_len; i++)
-        lookup_text_projected(ref_text_tokens[i], text_embeds.data() + (size_t)i * dim);
+    // Cache ref_text projected embeddings (same across all sentences)
+    if (cached_ref_text_keys_ != ref_text_tokens) {
+        cached_ref_text_proj_.resize((size_t)ref_text_len * dim);
+        for (int i = 0; i < ref_text_len; i++)
+            lookup_text_projected(ref_text_tokens[i],
+                                   cached_ref_text_proj_.data() + (size_t)i * dim);
+        cached_ref_text_keys_ = ref_text_tokens;
+    }
+
+    std::vector<float> text_embeds((size_t)text_lens * dim);
+    memcpy(text_embeds.data(), cached_ref_text_proj_.data(),
+           (size_t)ref_text_len * dim * sizeof(float));
     for (int i = 0; i < target_text_len; i++)
         lookup_text_projected(target_text_tokens[i],
                                text_embeds.data() + (size_t)(ref_text_len + i) * dim);
@@ -810,11 +826,16 @@ bool TalkerLLM::build_input_embeddings(
     int ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
     int codec_lens = 1 + ref_frames;  // codec_bos + ref frames
 
-    std::vector<float> codec_embeds(codec_lens * dim);
-    lookup_codec_embedding(cfg.codec_bos_id, codec_embeds.data());
-    for (int f = 0; f < ref_frames; f++)
-        compute_ref_frame_embedding(ref_codes, f,
-                                     codec_embeds.data() + (size_t)(1 + f) * dim);
+    // Cache ref codec frame embeddings (16-group lookups × ref_frames, same across sentences)
+    if (cached_codec_lens_ != codec_lens) {
+        cached_codec_embeds_.resize((size_t)codec_lens * dim);
+        lookup_codec_embedding(cfg.codec_bos_id, cached_codec_embeds_.data());
+        for (int f = 0; f < ref_frames; f++)
+            compute_ref_frame_embedding(ref_codes, f,
+                                         cached_codec_embeds_.data() + (size_t)(1 + f) * dim);
+        cached_codec_lens_ = codec_lens;
+    }
+    const std::vector<float> &codec_embeds = cached_codec_embeds_;
 
     // --- Streaming interleave (matches Python generate_icl_prompt) ---
     int icl_len = std::max(text_lens, codec_lens);
@@ -843,12 +864,10 @@ bool TalkerLLM::build_input_embeddings(
     int pos = 0;
     std::vector<float> tmp_codec(dim);
 
-    // Section 1: Role prefix (text only)
-    for (int i = 0; i < role_len; i++) {
-        lookup_text_projected(role_ids[i],
-                               embeddings.data() + (size_t)pos * dim);
-        pos++;
-    }
+    // Section 1: Role prefix (cached)
+    memcpy(embeddings.data(), cached_role_embeds_.data(),
+           (size_t)role_len * dim * sizeof(float));
+    pos += role_len;
 
     // Section 2: Mixed prefix (N-1 positions)
     for (int i = 0; i < N - 1; i++) {

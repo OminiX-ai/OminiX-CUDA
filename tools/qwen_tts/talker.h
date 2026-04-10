@@ -259,6 +259,17 @@ private:
     bool tts_embeds_cached_ = false;
     void cache_tts_embeddings();
 
+    // Cached ICL embeddings for multi-sentence reuse.  Role prefix and
+    // ref-text / ref-codec embeddings are identical across sentences within
+    // one generate() call; caching avoids redundant text_projection matvecs
+    // and 16-group codec lookups.
+    std::vector<float> cached_role_embeds_;       // [3 * dim]
+    bool role_embeds_cached_ = false;
+    std::vector<float> cached_ref_text_proj_;     // [ref_text_len * dim]
+    std::vector<int>   cached_ref_text_keys_;     // token ids for validation
+    std::vector<float> cached_codec_embeds_;      // [codec_lens * dim]
+    int cached_codec_lens_ = -1;
+
     // Near-repeat loop detector state. Counts how many consecutive codec
     // frames had ≥ 10 of 16 quantizers matching the previous frame.
     // After 3 consecutive near-repeats the talker generation loop forces

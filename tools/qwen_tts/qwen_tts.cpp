@@ -781,6 +781,20 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
             audio_out.insert(audio_out.end(),
                              sentence_audio.begin(), sentence_audio.end());
         }
+
+        // Fade-out the tail of each non-final sentence to suppress vocoder
+        // boundary artifacts.  The causal transposed-conv upsampling stack
+        // produces low-frequency ringing in the last few samples when the
+        // codec signal terminates abruptly at EOS; a short linear fade
+        // eliminates the audible "snoring" noise at sentence pauses.
+        if (!is_last_sentence && !audio_out.empty()) {
+            constexpr int kFadeSamples = 480;  // 20 ms at 24 kHz
+            int fade = std::min(kFadeSamples, (int)audio_out.size());
+            int base = (int)audio_out.size() - fade;
+            for (int i = 0; i < fade; i++) {
+                audio_out[base + i] *= 1.0f - (float)i / (float)fade;
+            }
+        }
     }
 
     if (streaming) {
@@ -789,6 +803,48 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                "(%.2f sec decode, ratio %.1fx)\n",
                audio_out.size(), stream_chunks_emitted, decode_time,
                audio_out.size() / 24000.0 / std::max(decode_time, 1e-6));
+    }
+
+    // ---- Noise gate -------------------------------------------------------
+    // The vocoder produces low-frequency artifacts (audible as a "snoring" or
+    // rumbling sound) during silence regions — both at the start of each
+    // sentence (causal-conv cold-start) and at the end (near-EOS codec
+    // tokens decoded with limited context).  A per-window noise gate
+    // smoothly attenuates these regions while preserving speech.
+    {
+        constexpr int   kGateWindow = 240;    // 10 ms at 24 kHz
+        constexpr float kGateThresh = 0.02f;  // RMS threshold
+        const int n = (int) audio_out.size();
+        const int n_wins = (n + kGateWindow - 1) / kGateWindow;
+
+        // Step 1: per-window gain (quadratic curve for smooth roll-off)
+        std::vector<float> gain(n_wins);
+        for (int w = 0; w < n_wins; w++) {
+            int s = w * kGateWindow;
+            int e = std::min(s + kGateWindow, n);
+            float ss = 0;
+            for (int j = s; j < e; j++) ss += audio_out[j] * audio_out[j];
+            float rms = sqrtf(ss / (e - s));
+            float g = (rms >= kGateThresh) ? 1.0f
+                                           : (rms / kGateThresh);
+            gain[w] = g * g;  // quadratic
+        }
+
+        // Step 2: apply with linear interpolation between adjacent windows
+        // to avoid 100-Hz stepping artefacts at window boundaries.
+        for (int w = 0; w < n_wins; w++) {
+            int s = w * kGateWindow;
+            int e = std::min(s + kGateWindow, n);
+            float g0 = gain[w];
+            float g1 = (w + 1 < n_wins) ? gain[w + 1] : g0;
+            for (int j = s; j < e; j++) {
+                float t = (float)(j - s) / (float)kGateWindow;
+                audio_out[j] *= g0 + (g1 - g0) * t;
+            }
+        }
+
+        printf("  [noise-gate] applied (%d windows, threshold=%.3f)\n",
+               n_wins, kGateThresh);
     }
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
