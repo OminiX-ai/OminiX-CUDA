@@ -651,6 +651,16 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     double decode_time   = 0;
     int    n_gen_frames  = 0;
 
+    // Pre-tokenize ref_text once (identical for all sentences).
+    std::vector<int> ref_text_tokens;
+    if (!effective_ref_text.empty()) {
+        auto ref_ids = tokenizer_.encode(
+            "<|im_start|>assistant\n" + effective_ref_text + "<|im_end|>\n");
+        if (ref_ids.size() > 5) {
+            ref_text_tokens.assign(ref_ids.begin() + 3, ref_ids.end() - 2);
+        }
+    }
+
     // === Sentence loop ============================================
     for (size_t s_idx = 0; s_idx < sentences.size(); s_idx++) {
         const std::string &sentence = sentences[s_idx];
@@ -660,10 +670,17 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
             printf("\n=== Sentence %zu/%zu ===\n", s_idx + 1, sentences.size());
         }
 
-        // Tokenize this sentence (ref_text shared across all sentences).
-        std::vector<int> ref_text_tokens, target_text_tokens;
-        tokenize_tts_text(effective_ref_text, sentence,
-                          ref_text_tokens, target_text_tokens);
+        // Tokenize target text only (ref_text already tokenized above).
+        std::vector<int> target_text_tokens;
+        {
+            auto target_ids = tokenizer_.encode(
+                "<|im_start|>assistant\n" + sentence + "<|im_end|>\n<|im_start|>assistant\n");
+            if (target_ids.size() > 8) {
+                target_text_tokens.assign(target_ids.begin() + 3, target_ids.end() - 5);
+            }
+            printf("[tokenize] ref_text: %zu tokens, target_text: %zu tokens\n",
+                   ref_text_tokens.size(), target_text_tokens.size());
+        }
 
         if (params.profiling && s_idx == 0) {
             FILE *f = fopen("logs/cpp_ref_text_tokens.bin", "wb");

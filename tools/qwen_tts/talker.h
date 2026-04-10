@@ -270,6 +270,9 @@ private:
     std::vector<float> cached_codec_embeds_;      // [codec_lens * dim]
     int cached_codec_lens_ = -1;
 
+    // Scratch buffer for compute_next_embedding (avoids per-frame malloc)
+    std::vector<float> emb_scratch_;              // [dim]
+
     // Near-repeat loop detector state. Counts how many consecutive codec
     // frames had ≥ 10 of 16 quantizers matching the previous frame.
     // After 3 consecutive near-repeats the talker generation loop forces

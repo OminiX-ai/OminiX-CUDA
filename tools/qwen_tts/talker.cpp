@@ -1398,22 +1398,42 @@ void TalkerLLM::compute_next_embedding(
     // Start with group 0 embedding from Talker
     lookup_codec_embedding(group0_token, out);
 
-    // Add Code Predictor codec embeddings for groups 1-15
+    // Add Code Predictor codec embeddings for groups 1-15.
+    // Uses a pre-allocated scratch buffer (emb_scratch_) to avoid a
+    // per-frame heap allocation, and NEON intrinsics for the accumulate.
     auto &cp_model = cp_session_->get_model();
-    std::vector<float> tmp(dim);
+    if ((int)emb_scratch_.size() < dim) emb_scratch_.resize(dim);
+    float *tmp = emb_scratch_.data();
     int n_groups = (int)group_tokens.size();
     for (int g = 0; g < n_groups; g++) {
         read_embedding_row(cp_model.codec_embeddings_[g],
-                            group_tokens[g], tmp.data(), dim);
-        for (int i = 0; i < dim; i++) {
-            out[i] += tmp[i];
+                            group_tokens[g], tmp, dim);
+#ifdef __aarch64__
+        for (int i = 0; i + 15 < dim; i += 16) {
+            vst1q_f32(out + i,      vaddq_f32(vld1q_f32(out + i),      vld1q_f32(tmp + i)));
+            vst1q_f32(out + i + 4,  vaddq_f32(vld1q_f32(out + i + 4),  vld1q_f32(tmp + i + 4)));
+            vst1q_f32(out + i + 8,  vaddq_f32(vld1q_f32(out + i + 8),  vld1q_f32(tmp + i + 8)));
+            vst1q_f32(out + i + 12, vaddq_f32(vld1q_f32(out + i + 12), vld1q_f32(tmp + i + 12)));
         }
+        for (int i = (dim / 16) * 16; i < dim; i++) out[i] += tmp[i];
+#else
+        for (int i = 0; i < dim; i++) out[i] += tmp[i];
+#endif
     }
 
     // Add tts_pad text component (every position = text + codec)
-    for (int i = 0; i < dim; i++) {
-        out[i] += tts_pad_embed_[i];
+    const float *pad = tts_pad_embed_.data();
+#ifdef __aarch64__
+    for (int i = 0; i + 15 < dim; i += 16) {
+        vst1q_f32(out + i,      vaddq_f32(vld1q_f32(out + i),      vld1q_f32(pad + i)));
+        vst1q_f32(out + i + 4,  vaddq_f32(vld1q_f32(out + i + 4),  vld1q_f32(pad + i + 4)));
+        vst1q_f32(out + i + 8,  vaddq_f32(vld1q_f32(out + i + 8),  vld1q_f32(pad + i + 8)));
+        vst1q_f32(out + i + 12, vaddq_f32(vld1q_f32(out + i + 12), vld1q_f32(pad + i + 12)));
     }
+    for (int i = (dim / 16) * 16; i < dim; i++) out[i] += pad[i];
+#else
+    for (int i = 0; i < dim; i++) out[i] += pad[i];
+#endif
 }
 
 // ============================================================================
