@@ -33,6 +33,10 @@ struct TalkerSamplingParams {
     int cp_top_k = 50;
     float cp_top_p = 1.0f;
     bool cp_do_sample = true;
+    // CP codec group limit: predict only groups 1..cp_max_groups (0=all 15).
+    // Lower values skip higher codebook levels for faster inference.
+    // Groups 1-8 carry ~95% of signal quality; 9-15 are fine detail.
+    int cp_max_groups = 0;
 };
 
 // ============================================================================

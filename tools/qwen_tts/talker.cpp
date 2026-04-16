@@ -1402,11 +1402,16 @@ bool TalkerLLM::predict_code_groups(
     int group0_token, std::vector<int> &group_tokens,
     const TalkerSamplingParams &sampling) {
 
-    int n_groups = cp_config_.num_code_groups - 1;  // 15
+    int n_groups_full = cp_config_.num_code_groups - 1;  // 15
+    int n_groups = (sampling.cp_max_groups > 0 && sampling.cp_max_groups < n_groups_full)
+                    ? sampling.cp_max_groups : n_groups_full;
     int talker_hidden = cp_config_.talker_hidden_size;  // 2048
     int cp_hidden = cp_config_.hidden_size;  // 1024
     int vocab_size = cp_config_.vocab_size;  // 2048
-    group_tokens.resize(n_groups);
+    // Zero-fill skipped groups — decoder sums contributions, zero = no effect.
+    // Note: EOS may not fire when groups are skipped because the model wasn't
+    // trained with partial codebooks. Use --max_tokens to limit output length.
+    group_tokens.resize(n_groups_full, 0);
 
     auto &cp_model = cp_session_->get_model();
 

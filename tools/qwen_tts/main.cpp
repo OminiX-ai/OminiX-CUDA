@@ -33,6 +33,8 @@ static void print_usage(const char* prog) {
     printf("  --repetition_penalty <f>   Repetition penalty (default: 1.05)\n");
     printf("  --greedy                   Disable sampling (use greedy decoding)\n");
     printf("  --seed <int>               Random seed for sampling (default: 42)\n");
+    printf("  --cp_groups <int>          Max codec groups to predict (1-15, default=all 15)\n");
+    printf("                             Lower = faster but less detail (8 recommended)\n");
     printf("  --mode <mode>              Generation mode: icl (default), xvec, customvoice\n");
     printf("  --speaker <name>           Speaker name for customvoice mode (e.g., serena)\n");
     printf("  -p, --profiling            Enable profiling\n");
@@ -91,6 +93,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--greedy") {
             params.sampling.do_sample = false;
             params.sampling.cp_do_sample = false;
+        } else if (arg == "--cp_groups" && i + 1 < argc) {
+            params.sampling.cp_max_groups = std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             set_sampling_seed(std::atoi(argv[++i]));
         } else if (arg == "--mode" && i + 1 < argc) {
