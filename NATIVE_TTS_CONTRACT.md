@@ -26,11 +26,15 @@ on five distinct utterances).
 
 ## 3. Current state (update as work lands)
 
-**As of 2026-04-18**: M1 done. Native TalkerCannEngine lands at
-`tools/qwen_tts/talker_cann_engine.{h,cpp}`. Smoke test passes (init,
-forward_decode, forward_prefill, reset_kv_cache, set_rope_speed). Active
-work: M2 (integrate native Talker into talker.cpp via `--native_talker`
-flag).
+**As of 2026-04-18**: M1 done + M2.1/M2.2 wired. Native TalkerCannEngine
+lands at `tools/qwen_tts/talker_cann_engine.{h,cpp}`. Smoke test passes
+(init, forward_decode, forward_prefill, reset_kv_cache, set_rope_speed).
+M2.1 `--native_talker` flag plumbed main.cpp → QwenTTSParams → TalkerLLM::
+load_model. M2.2 ICL `generate()` branches to native prefill + native
+decode when flag is active. `generate_xvec` / `generate_customvoice`
+stay on llama.cpp for now (they use MRoPE 4×pos — native engine is pure
+temporal RoPE; would need M2+ extension). Active work: M2.3 end-to-end
+build + bench on Ascend 910B4.
 
 - **Rust harness**: `qwen3-tts-ggml` ↔ `qwen_tts_api` FFI in place and working.
   The generation loop, sampling, and anti-loop logic come from
@@ -112,11 +116,14 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ### M2 — Integrate native Talker into qwen_tts_api (2-3 days)
 
-- [ ] 2.1 Add `--native_talker` flag to `main.cpp` (mirrors existing
-  `--cp_cann`). Default off.
-- [ ] 2.2 In `talker.cpp`, wire `TalkerCannEngine` as a third path alongside
-  `cp_use_llama_` and custom impl. `TalkerLLM::generate*()` branches to it
-  when flag is active.
+- [x] 2.1 Add `--native_talker` flag to `main.cpp` (mirrors existing
+  `--cp_cann`). Default off. Plumbed through `QwenTTSParams::native_talker`
+  → `TalkerLLM::load_model(..., use_talker_cann)`.
+- [x] 2.2 In `talker.cpp`, wire `TalkerCannEngine` as a third path alongside
+  `cp_use_llama_` and custom impl. `TalkerLLM::generate()` (ICL) branches
+  to it when flag is active. Prefill → `forward_prefill`, per-step decode
+  → `forward_decode`. `generate_xvec` / `generate_customvoice` remain on
+  llama.cpp (MRoPE 4×pos not yet supported in native engine).
 - [ ] 2.3 With both `--native_talker --cp_cann` enabled, generate on same
   utterance+seed as the llama.cpp baseline. Compare audio.
 - [ ] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85;

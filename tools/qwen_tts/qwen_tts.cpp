@@ -83,7 +83,9 @@ bool QwenTTS::load(const QwenTTSParams& params) {
                              model_dir + "qwen_tts_code_predictor.gguf",
                              params.n_threads,
                              params.n_gpu_layers,
-                             params.cp_model)) {
+                             params.cp_model,
+                             params.cp_cann,
+                             params.native_talker)) {
         printf("FAIL: cannot load Talker LLM\n");
         return false;
     }

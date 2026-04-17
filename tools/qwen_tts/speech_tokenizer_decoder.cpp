@@ -271,6 +271,10 @@ ggml_tensor *SpeechTokenizerDecoderModel::build_causal_transconv1d(
     ggml_context *ctx0, ggml_tensor *x, ggml_tensor *w, ggml_tensor *b,
     int stride) {
     int kernel_size = (int)w->ne[0];
+    // ggml_conv_transpose_1d (via im2col) requires F16 kernel weights.
+    if (w->type != GGML_TYPE_F16) {
+        w = ggml_cast(ctx0, w, GGML_TYPE_F16);
+    }
     // ggml_conv_transpose_1d(ctx, w, x, stride, padding, dilation)
     // Use p=0, d=1 for the raw transposed conv
     ggml_tensor *out = ggml_conv_transpose_1d(ctx0, w, x, stride, 0, 1);

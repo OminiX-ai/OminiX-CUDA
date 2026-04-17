@@ -1,6 +1,10 @@
 #include "talker.h"
 #include "tts_transformer.h"
 #include "ggml.h"
+#if defined(QWEN_TTS_HAS_CP_CANN)
+#include "cp_cann_engine.h"
+#include "talker_cann_engine.h"
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -443,6 +447,16 @@ TalkerEmbeddingModel::build_graph(ggml_context *ctx0) {
 // ============================================================================
 
 TalkerLLM::~TalkerLLM() {
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (cp_cann_engine_) {
+        delete cp_cann_engine_;
+        cp_cann_engine_ = nullptr;
+    }
+    if (talker_cann_engine_) {
+        delete talker_cann_engine_;
+        talker_cann_engine_ = nullptr;
+    }
+#endif
     if (cp_llama_ctx_) {
         llama_free(cp_llama_ctx_);
         cp_llama_ctx_ = nullptr;
@@ -470,7 +484,9 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
                              const std::string &code_predictor_path,
                              int n_threads,
                              int n_gpu_layers,
-                             const std::string &cp_llama_path) {
+                             const std::string &cp_llama_path,
+                             bool use_cp_cann,
+                             bool use_talker_cann) {
     // 1. Load custom embedding/head tensors from original Talker GGUF
     ContextParams embed_params;
     embed_params.n_threads = n_threads;
@@ -554,9 +570,64 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
         }
     }
 
-    printf("[talker] all components loaded (hidden=%d, groups=%d, cp_threads=%d, cp_llama=%s)\n",
+    // 5. Optionally enable native CP CANN engine (direct ACL ops).
+    //    Takes precedence over llama.cpp CP path when both are requested.
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (use_cp_cann) {
+        init_cp_f32_weights();
+        cp_cann_engine_ = new CpCannEngine();
+        // CpWeightsF32 mirrors TalkerLLM::CPWeightsF32 field-for-field; this
+        // avoids a deep copy but relies on the two structs staying in sync.
+        const CpWeightsF32 &cp_view =
+            *reinterpret_cast<const CpWeightsF32 *>(&cp_f32_);
+        if (cp_cann_engine_->init(cp_view, cp_config_, 0)) {
+            cp_use_cann_ = true;
+            // Native CANN owns CP now; release the llama.cpp CP context to
+            // avoid holding duplicate NPU KV buffers.
+            if (cp_llama_ctx_) {
+                llama_free(cp_llama_ctx_);
+                cp_llama_ctx_ = nullptr;
+            }
+            if (cp_llama_model_) {
+                llama_model_free(cp_llama_model_);
+                cp_llama_model_ = nullptr;
+            }
+            cp_use_llama_ = false;
+        } else {
+            printf("[talker] WARN: CP CANN engine init failed, "
+                   "falling back to %s path\n",
+                   cp_use_llama_ ? "llama.cpp" : "CPU");
+            delete cp_cann_engine_;
+            cp_cann_engine_ = nullptr;
+        }
+    }
+#else
+    (void)use_cp_cann;
+#endif
+
+    printf("[talker] all components loaded (hidden=%d, groups=%d, cp_threads=%d, cp=%s)\n",
            n_embd_, talker_config_.num_code_groups, cp_n_threads,
-           cp_use_llama_ ? "yes" : "no");
+           cp_use_cann_ ? "cann-native" : (cp_use_llama_ ? "llama.cpp" : "cpu"));
+
+    // 6. Optionally enable native Talker backbone engine.
+    //    When active, it replaces llama.cpp for the main Talker transformer.
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (use_talker_cann) {
+        talker_cann_engine_ = new TalkerCannEngine();
+        if (talker_cann_engine_->init_from_gguf(talker_llama_path,
+                                                  talker_config_, 0)) {
+            talker_use_cann_ = true;
+            printf("[talker] native TalkerCannEngine initialized\n");
+        } else {
+            printf("[talker] WARN: native TalkerCannEngine init failed, "
+                   "falling back to llama.cpp Talker\n");
+            delete talker_cann_engine_;
+            talker_cann_engine_ = nullptr;
+        }
+    }
+#else
+    (void)use_talker_cann;
+#endif
     return true;
 }
 
@@ -843,6 +914,11 @@ bool TalkerLLM::build_input_embeddings(
 // ============================================================================
 
 void TalkerLLM::reset_cache_public() {
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (talker_use_cann_ && talker_cann_engine_) {
+        talker_cann_engine_->reset_kv_cache();
+    }
+#endif
     if (llama_ctx_) {
         llama_memory_clear(llama_get_memory(llama_ctx_), true);
     }
@@ -851,10 +927,36 @@ void TalkerLLM::reset_cache_public() {
 
 int TalkerLLM::forward_public(const float *input_embeds, int seq_len,
                                float *logits_out, float *hidden_out) {
-    if (!llama_ctx_) return -1;
     int dim = n_embd_;
-
     cache_tts_embeddings();
+
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    // Native path: bypass llama.cpp entirely for the Talker backbone.
+    // Prefill: seq_len > 1 → forward_prefill, advance cursor by seq_len.
+    // Decode:  seq_len == 1 → forward_decode at current position.
+    if (talker_use_cann_ && talker_cann_engine_) {
+        std::vector<float> hidden(dim);
+        if (seq_len == 1) {
+            talker_cann_engine_->forward_decode(input_embeds, api_cur_pos_,
+                                                 hidden.data());
+            api_cur_pos_ += 1;
+        } else {
+            talker_cann_engine_->forward_prefill(input_embeds, seq_len,
+                                                  api_cur_pos_,
+                                                  hidden.data());
+            api_cur_pos_ += seq_len;
+        }
+        if (hidden_out) {
+            memcpy(hidden_out, hidden.data(), dim * sizeof(float));
+        }
+        if (logits_out) {
+            apply_codec_head(hidden.data(), logits_out);
+        }
+        return 0;
+    }
+#endif
+
+    if (!llama_ctx_) return -1;
 
     llama_batch batch = llama_batch_init(seq_len, dim, 1);
     batch.n_tokens = seq_len;
@@ -1424,6 +1526,50 @@ bool TalkerLLM::predict_code_groups(
     // Pre-convert weights on first call (needed for input_proj + lm_heads in both paths)
     init_cp_f32_weights();
 
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (cp_use_cann_ && cp_cann_engine_ && cp_cann_engine_->is_ready()) {
+        // ============================================================
+        // Native CANN path: CP transformer runs entirely on NPU via
+        // direct ACL ops. input_proj + lm_heads stay on CPU (the engine
+        // applies input_proj internally but we still compute logits here).
+        // ============================================================
+        auto &cp_model_cann = cp_session_->get_model();
+        cp_cann_engine_->reset_kv_cache();
+
+        std::vector<float> cp_out(cp_hidden);
+
+        // Position 0: talker hidden state (engine does input_proj internally)
+        cp_cann_engine_->forward_one_token(hidden_states, 0, cp_out.data());
+
+        // Position 1: group-0 codec embedding in talker space
+        std::vector<float> g0_emb(talker_hidden);
+        lookup_codec_embedding(group0_token, g0_emb.data());
+        cp_cann_engine_->forward_one_token(g0_emb.data(), 1, cp_out.data());
+
+        // Decode groups 1-15 autoregressively
+        std::vector<float> logits(vocab_size);
+        std::vector<float> group_emb(talker_hidden);
+
+        for (int g = 0; g < n_groups; g++) {
+            cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
+                          cp_out.data(), logits.data(), vocab_size, cp_hidden);
+
+            int sampled = sample_token(logits.data(), vocab_size,
+                                       sampling.cp_temperature, sampling.cp_top_k,
+                                       sampling.cp_top_p, sampling.cp_do_sample);
+            group_tokens[g] = sampled;
+
+            if (g < n_groups - 1) {
+                read_embedding_row(cp_model_cann.codec_embeddings_[g],
+                                   sampled, group_emb.data(), talker_hidden);
+                cp_cann_engine_->forward_one_token(group_emb.data(), g + 2,
+                                                   cp_out.data());
+            }
+        }
+        return true;
+    }
+#endif
+
     if (cp_use_llama_) {
         // ============================================================
         // NPU path: CP transformer via llama.cpp
@@ -1616,8 +1762,14 @@ bool TalkerLLM::generate(
     int max_new_tokens,
     const TalkerSamplingParams &sampling) {
 
-    if (!llama_ctx_) {
-        printf("[talker] llama.cpp backbone not loaded\n");
+    const bool use_native_talker =
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        talker_use_cann_ && talker_cann_engine_ != nullptr;
+#else
+        false;
+#endif
+    if (!use_native_talker && !llama_ctx_) {
+        printf("[talker] neither llama.cpp backbone nor native Talker loaded\n");
         return false;
     }
 
@@ -1644,43 +1796,46 @@ bool TalkerLLM::generate(
     auto build_emb_t1 = std::chrono::high_resolution_clock::now();
     double build_emb_ms = std::chrono::duration<double, std::milli>(build_emb_t1 - gen_t0).count();
 
-    // 2. Prefill: feed all embeddings to llama.cpp
-    llama_memory_clear(llama_get_memory(llama_ctx_), true);
-
-    llama_batch batch = llama_batch_init(prefill_len, dim, 1);
-    batch.n_tokens = prefill_len;
-    memcpy(batch.embd, prefill_embs.data(),
-           (size_t)prefill_len * dim * sizeof(float));
-    for (int i = 0; i < prefill_len; i++) {
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
-    }
-
+    // 2. Prefill: feed all embeddings through the Talker backbone.
+    std::vector<float> hidden(dim);
     printf("[talker] prefill %d tokens (dim=%d)...\n", prefill_len, dim);
     auto prefill_t0 = std::chrono::high_resolution_clock::now();
-    int decode_rc = llama_decode(llama_ctx_, batch);
-    if (decode_rc != 0) {
-        printf("[talker] prefill failed\n");
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (use_native_talker) {
+        talker_cann_engine_->reset_kv_cache();
+        talker_cann_engine_->forward_prefill(prefill_embs.data(), prefill_len,
+                                              0, hidden.data());
+    } else
+#endif
+    {
+        llama_memory_clear(llama_get_memory(llama_ctx_), true);
+        llama_batch batch = llama_batch_init(prefill_len, dim, 1);
+        batch.n_tokens = prefill_len;
+        memcpy(batch.embd, prefill_embs.data(),
+               (size_t)prefill_len * dim * sizeof(float));
+        for (int i = 0; i < prefill_len; i++) {
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
+        }
+        int decode_rc = llama_decode(llama_ctx_, batch);
+        if (decode_rc != 0) {
+            printf("[talker] prefill failed\n");
+            llama_batch_free(batch);
+            return false;
+        }
         llama_batch_free(batch);
-        return false;
+
+        float *embd_llama = llama_get_embeddings_ith(llama_ctx_, -1);
+        if (!embd_llama) {
+            printf("[talker] failed to get embeddings after prefill\n");
+            return false;
+        }
+        memcpy(hidden.data(), embd_llama, dim * sizeof(float));
     }
-    llama_batch_free(batch);
     auto prefill_t1 = std::chrono::high_resolution_clock::now();
     double talker_prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
-
-    // 3. Get hidden states from last position
-    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
-    if (!embd) {
-        printf("[talker] failed to get embeddings after prefill\n");
-        return false;
-    }
-
-    // llama.cpp embeddings mode gives post-norm hidden states,
-    // so codec_head can be applied directly.
-    std::vector<float> hidden(dim);
-    memcpy(hidden.data(), embd, dim * sizeof(float));
 
     // 4. Autoregressive decode loop
     int cur_pos = prefill_len;
@@ -1781,24 +1936,32 @@ bool TalkerLLM::generate(
         auto trailing_t1 = std::chrono::high_resolution_clock::now();
         total_trailing_ms += std::chrono::duration<double, std::milli>(trailing_t1 - trailing_t0).count();
 
-        // 4e. Feed to llama.cpp (reuse pre-allocated batch)
+        // 4e. Feed to the Talker backbone for the next hidden state.
         auto llm_t0 = std::chrono::high_resolution_clock::now();
-        memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
-        talker_step_batch_.pos[0] = cur_pos;
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        if (use_native_talker) {
+            talker_cann_engine_->forward_decode(next_emb.data(), cur_pos,
+                                                  hidden.data());
+            cur_pos++;
+        } else
+#endif
+        {
+            memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
+            talker_step_batch_.pos[0] = cur_pos;
 
-        if (llama_decode(llama_ctx_, talker_step_batch_) != 0) {
-            printf("[talker] decode failed at step %d\n", step);
-            return false;
-        }
-        cur_pos++;
+            if (llama_decode(llama_ctx_, talker_step_batch_) != 0) {
+                printf("[talker] decode failed at step %d\n", step);
+                return false;
+            }
+            cur_pos++;
 
-        // 4f. Get new hidden states
-        embd = llama_get_embeddings_ith(llama_ctx_, -1);
-        if (!embd) {
-            printf("[talker] failed to get embeddings at step %d\n", step);
-            return false;
+            float *embd_step = llama_get_embeddings_ith(llama_ctx_, -1);
+            if (!embd_step) {
+                printf("[talker] failed to get embeddings at step %d\n", step);
+                return false;
+            }
+            memcpy(hidden.data(), embd_step, dim * sizeof(float));
         }
-        memcpy(hidden.data(), embd, dim * sizeof(float));
         auto llm_t1 = std::chrono::high_resolution_clock::now();
         total_llm_ms += std::chrono::duration<double, std::milli>(llm_t1 - llm_t0).count();
         total_loop_ms += std::chrono::duration<double, std::milli>(llm_t1 - loop_t0).count();

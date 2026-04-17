@@ -240,6 +240,11 @@ ggml_tensor *build_conv1d(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
   if (p < 0) {
     p = (w->ne[0] - 1) / 2;
   }
+  // ggml_conv_1d uses im2col with hardcoded GGML_TYPE_F16 kernel type.
+  // Cast weight to F16 if GGUF stored it as F32 (happens with newer decoder exports).
+  if (w->type != GGML_TYPE_F16) {
+    w = ggml_cast(ctx0, w, GGML_TYPE_F16);
+  }
   // Use original im2col+matmul approach (known working)
   // Direct conv1d kernel available: ggml_conv_1d_direct(ctx0, w, cur, s, p, d);
   cur = ggml_conv_1d(ctx0, w, cur, s, p, d);

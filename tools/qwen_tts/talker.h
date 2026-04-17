@@ -174,6 +174,9 @@ public:
 // High-level Talker LLM interface
 // ============================================================================
 
+class CpCannEngine;         // cp_cann_engine.h (optional, Ascend-only)
+class TalkerCannEngine;     // talker_cann_engine.h (optional, Ascend-only)
+
 class TalkerLLM {
 public:
     TalkerLLM() = default;
@@ -183,12 +186,20 @@ public:
     //   talker_llama_path: llama.cpp-compatible GGUF (backbone)
     //   talker_embed_path: original Talker GGUF (embeddings + heads)
     //   code_predictor_path: Code Predictor GGUF
+    //   use_cp_cann: when true and cp_llama_path is empty, run CP via the
+    //     native CANN engine (direct ACL ops, bypasses llama.cpp).
+    //   use_talker_cann: when true, also run the Talker backbone via a
+    //     native aclnn engine instead of llama.cpp. Unifies the numerical
+    //     path with CP and eliminates framework-mixing artifacts that
+    //     produced audible fragments in the hybrid setup.
     bool load_model(const std::string &talker_llama_path,
                     const std::string &talker_embed_path,
                     const std::string &code_predictor_path,
                     int n_threads = 4,
                     int n_gpu_layers = 0,
-                    const std::string &cp_llama_path = "");
+                    const std::string &cp_llama_path = "",
+                    bool use_cp_cann = false,
+                    bool use_talker_cann = false);
 
     // Generate codec tokens (ICL voice cloning mode)
     //   ref_text_tokens: tokenized ref text content (no role prefix/suffix)
@@ -292,6 +303,18 @@ private:
     llama_model *cp_llama_model_ = nullptr;
     llama_context *cp_llama_ctx_ = nullptr;
     bool cp_use_llama_ = false;
+
+    // CP via native CANN engine (direct ACL ops, lowest-overhead NPU path).
+    // Raw pointer (not unique_ptr) so the destructor can be defined in
+    // talker.cpp where CpCannEngine's full type is conditionally visible.
+    CpCannEngine *cp_cann_engine_ = nullptr;
+    bool cp_use_cann_ = false;
+
+    // Native Talker backbone (M2) — when enabled, bypasses llama.cpp's
+    // llama_decode for the Talker transformer too, running the full 28-layer
+    // forward through direct aclnn calls. Matches CpCannEngine pattern.
+    TalkerCannEngine *talker_cann_engine_ = nullptr;
+    bool talker_use_cann_ = false;
 
     // Custom embedding/head tensors
     std::unique_ptr<InferenceSession<TalkerEmbeddingModel>> embed_session_;

@@ -23,6 +23,8 @@ static void print_usage(const char* prog) {
     printf("                             If not exists + ref_audio given: encode and save\n");
     printf("  --talker_model <path>      Override Talker GGUF file (for quantized models)\n");
     printf("  --cp_model <path>          Override CP llama GGUF (for NPU acceleration)\n");
+    printf("  --cp_cann                  Use native CANN CP engine (Ascend only, bypasses llama.cpp)\n");
+    printf("  --native_talker            Use native CANN Talker engine (Ascend only, bypasses llama.cpp)\n");
     printf("  -d, --device <device>      Compute device (CPU, default: CPU)\n");
     printf("  -n, --n_threads <num>      Thread count (default: 8)\n");
     printf("  --n_gpu_layers <num>       Layers to offload to GPU/NPU (default: 0)\n");
@@ -31,7 +33,9 @@ static void print_usage(const char* prog) {
     printf("  --top_k <int>              Top-K sampling (default: 50, 0=disabled)\n");
     printf("  --top_p <float>            Top-P nucleus sampling (default: 1.0)\n");
     printf("  --repetition_penalty <f>   Repetition penalty (default: 1.05)\n");
-    printf("  --greedy                   Disable sampling (use greedy decoding)\n");
+    printf("  --greedy                   Disable sampling on both Talker and CP (greedy decoding)\n");
+    printf("  --cp_greedy                Greedy CP sampling only (Talker still samples). Eliminates\n");
+    printf("                             logit-drift amplification in the native CP engine.\n");
     printf("  --seed <int>               Random seed for sampling (default: 42)\n");
     printf("  --cp_groups <int>          Max codec groups to predict (1-15, default=all 15)\n");
     printf("                             Lower = faster but less detail (8 recommended)\n");
@@ -74,6 +78,10 @@ int main(int argc, char** argv) {
             params.talker_model = argv[++i];
         } else if (arg == "--cp_model" && i + 1 < argc) {
             params.cp_model = argv[++i];
+        } else if (arg == "--cp_cann") {
+            params.cp_cann = true;
+        } else if (arg == "--native_talker") {
+            params.native_talker = true;
         } else if (arg == "--ref_cache" && i + 1 < argc) {
             params.ref_cache = argv[++i];
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
@@ -92,6 +100,8 @@ int main(int argc, char** argv) {
             params.sampling.top_p = std::atof(argv[++i]);
         } else if (arg == "--repetition_penalty" && i + 1 < argc) {
             params.sampling.repetition_penalty = std::atof(argv[++i]);
+        } else if (arg == "--cp_greedy") {
+            params.sampling.cp_do_sample = false;
         } else if (arg == "--greedy") {
             params.sampling.do_sample = false;
             params.sampling.cp_do_sample = false;
