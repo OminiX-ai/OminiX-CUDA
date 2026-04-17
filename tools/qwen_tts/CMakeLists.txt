@@ -16,6 +16,19 @@ set(SRC_FILES
     stft.cpp
 )
 
+# Native CP CANN engine: optional, enabled on Ascend where CANN headers exist.
+# We dlopen the CANN libs at runtime (see cp_cann_symbols.cpp) so nothing
+# needs to be linked — just need the toolkit headers + libdl.
+option(QWEN_TTS_CP_CANN "Build native CP CANN engine (Ascend only)" OFF)
+if(DEFINED ENV{ASCEND_TOOLKIT_HOME} AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include/acl/acl.h")
+    set(QWEN_TTS_CP_CANN ON CACHE BOOL "" FORCE)
+endif()
+if(QWEN_TTS_CP_CANN)
+    list(APPEND SRC_FILES cp_cann_engine.cpp cp_cann_symbols.cpp
+                          talker_cann_engine.cpp)
+    message(STATUS "qwen_tts: CP CANN engine ENABLED (+ native Talker)")
+endif()
+
 # kissfft library for STFT computation
 set(KISSFFT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/kissfft)
 set(KISSFFT_SRC
@@ -28,10 +41,15 @@ add_executable(${TARGET} ${SRC_FILES})
 
 target_link_libraries     (${TARGET} PUBLIC ggml llama qwen_common)
 
-# Native CANN CP engine: prototype exists (cp_cann_engine.cpp) but requires
-# linking against CANN's aclnn libraries which have circular dependency issues.
-# TODO: Either compile as part of ggml-cann shared lib, or use dlsym at runtime.
+# Native CP CANN engine: implemented via dlopen/dlsym at runtime to sidestep
+# CANN stub-lib circular deps. We only need libdl + the toolkit headers.
 target_link_libraries     (${TARGET} PRIVATE Threads::Threads)
+if(QWEN_TTS_CP_CANN)
+    target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_CP_CANN=1)
+    target_include_directories(${TARGET} PRIVATE
+        $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include)
+endif()
 target_include_directories(${TARGET} PUBLIC  .)
 target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR}
     $ENV{ASCEND_TOOLKIT_HOME}/include)
@@ -117,3 +135,28 @@ add_executable(test_tokenizer test_tokenizer.cpp)
 target_link_libraries     (test_tokenizer PRIVATE Threads::Threads qwen_common)
 target_include_directories(test_tokenizer PRIVATE . ../.. ../../vendor)
 target_compile_features   (test_tokenizer PRIVATE cxx_std_17)
+
+# Test: native TalkerCannEngine (Ascend only). Only built when the CANN
+# engine source is present — it depends on cp_cann_symbols + the aclnn
+# headers. The test pulls in the engine and its symbol loader directly; it
+# does NOT link talker.cpp (no need for the llama.cpp Talker path).
+if(QWEN_TTS_CP_CANN)
+    add_executable(test_talker_native
+        test_talker_native.cpp
+        talker_cann_engine.cpp
+        cp_cann_symbols.cpp
+        model_defs.cpp
+    )
+    target_link_libraries     (test_talker_native PUBLIC ggml llama qwen_common)
+    target_link_libraries     (test_talker_native PRIVATE Threads::Threads common
+                                                           ${CMAKE_DL_LIBS})
+    target_include_directories(test_talker_native PUBLIC  .)
+    target_include_directories(test_talker_native PRIVATE ../.. ../../vendor
+        $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include
+        $ENV{ASCEND_TOOLKIT_HOME}/include)
+    target_compile_definitions(test_talker_native PRIVATE QWEN_TTS_HAS_CP_CANN=1)
+    target_compile_features   (test_talker_native PRIVATE cxx_std_17)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        target_compile_options(test_talker_native PRIVATE -march=armv8.2-a+fp16)
+    endif()
+endif()
