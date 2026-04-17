@@ -49,13 +49,13 @@ hard with a descriptive error; on Ascend copy
   - Round-trip ref audio → encoder → decoder → ASR matches the book
     excerpt perfectly (decoder is fine; F16 cast in build_conv1d holds).
 
-**Native Talker path still broken** post-fix: emits "Oh." regardless
-of target. `forward_prefill` completes in 12 ms for a 127-token
-sequence (suspiciously fast — llama.cpp prefill for the same inputs
-takes ~1.2 s). Hypothesis: the fused prefill output or KV-cache layout
-isn't conditioning the decode step on the target-text positions.
-Separate bug; does NOT block pipeline correctness on the llama.cpp
-path. Will investigate next.
+**Native Talker path now works** — isolated the batched FIAS prefill
+as the bug source (wrong hidden state: RMS 2.75 vs llama's 3.70) and
+switched `forward_prefill` to iterate single-token `forward_decode`.
+ASR passes 4/4 including a 32-word technical sentence. Throughput
+hits 18.3 fps on a 171-frame run (vs 12.2 fps llama baseline, +50%).
+M3 (default-on native, strip llama.cpp from hot path) is now
+unblocked; gated on tuning the prefill cost further.
 
 Quality gate (M2.4): DTW log-mel ≥0.85 on 3/3 utterances
 (utt1=0.908, utt2=0.921, utt3=0.900) vs llama.cpp baseline, both seed=42,
@@ -170,22 +170,25 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   short/medium/long pairs on ellen ref, seed=42, max_tokens=100/250/250.
   Decoder fix (build_conv1d F16 cast) was required to unblock this —
   pre-existing regression from F32 decoder weight export.
-- [~] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85
-  — **VOIDED for now**. Initial 3/3 pass was invalid: both paths
-  produced similarly-broken nonsense audio from a silent tokenizer
-  misconfiguration (see §3). After the tokenizer_config.json fix the
-  llama.cpp path is clean but native_talker still emits nonsense, so
-  a fair DTW isn't possible until the native path is fixed.
-  New approach: `scripts/asr_quality_check.sh` uses qwen3-asr for a
-  content-level PASS/FAIL (catches exactly this failure mode).
-- [x] 2.5 **Throughput gate**: ≥ 20 fps end-to-end on benchmark script.
-  Achieved with `--cp_groups 8`: short 18.3 fps, medium 21.0 fps, long
-  22.3 fps (all on ellen ref, seed=42). Without the flag (15 groups),
-  we're at 14-15 fps — CP dominates at ~44 ms/step. `--cp_layers` is
-  not honored by the native CP engine (needs wiring if we want to tune
-  it further). Gate considered PASS at the `--cp_groups 8` setting,
-  which the CLI help already recommends ("Groups 1-8 carry ~95% of
-  signal quality").
+- [x] 2.4 **Quality gate**: replaced DTW-log-mel with qwen3-asr
+  content check. Native path now passes 4/4:
+  - utt1 "Good morning, how are you today." → verbatim
+  - utt2 "The sun is shining brightly…" → verbatim
+  - utt3 "Please remember to turn off the lights." → verbatim
+  - 32-word technical sentence → verbatim
+  Root cause of the earlier native "Oh." was the batched FIAS prefill
+  producing a bad hidden state (RMS 2.75 vs llama's 3.70 on identical
+  input). Fix: iterate `forward_decode` over the prefill sequence
+  instead of the batched path (`TALKER_PREFILL_BATCHED=1` to force
+  the broken path for debugging). Commit 948413b1.
+- [~] 2.5 **Throughput gate**: ≥ 20 fps end-to-end. Currently native
+  hits 18.3 fps on a 171-frame steady-state run (+50% over the 12.2
+  fps llama.cpp baseline) but short runs are prefill-dominated:
+  25-frame utt1 = 7.7 fps. Gap to the 20 fps bar is the iterative
+  prefill (2.0 s on 127 tokens at ~16 ms/token). Closing the gap
+  requires either (a) fixing the batched FIAS prefill so we get the
+  12 ms native prefill back, or (b) caching the role-prefix KV across
+  calls. Marking partial until that lands.
 - [x] 2.6 File regression test that runs this config nightly.
   `scripts/native_tts_quality_gate.sh` — runs both native + llama on
   the three canonical M2.4 utterances, emits a summary.tsv with per-run
