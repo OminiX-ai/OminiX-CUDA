@@ -57,6 +57,18 @@ hits 18.3 fps on a 171-frame run (vs 12.2 fps llama baseline, +50%).
 M3 (default-on native, strip llama.cpp from hot path) is now
 unblocked; gated on tuning the prefill cost further.
 
+**As of 2026-04-19 (Track A)**: batched prefill restored as the
+default. Commit 2b0a2998's RoPE-unroll + FIAS-S_q=1 rewrite had
+already silently fixed the 0.28-cos-sim bug, but the env-var gate
+still defaulted to the iterative fallback. This ticket flipped the
+gate (new env `TALKER_PREFILL_ITERATIVE=1` forces the legacy path)
+and added a real-input diagnostic harness (`test_prefill_diff` with
+embedding-dump replay via `TALKER_PREFILL_INPUT_DUMP`) plus
+`test_mm_diff`. Main prefill on 127 tokens: 127 ms default vs
+2054 ms iterative (16× speedup). 209-frame natural-EOS run hits
+23.2 fps, 126-frame run hits 23.0 fps — M2.5 throughput gate
+(≥20 fps on ≥150-frame runs) now passes.
+
 Quality gate (M2.4): DTW log-mel ≥0.85 on 3/3 utterances
 (utt1=0.908, utt2=0.921, utt3=0.900) vs llama.cpp baseline, both seed=42,
 max_tokens=200, cp_groups=8.
@@ -181,14 +193,34 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   input). Fix: iterate `forward_decode` over the prefill sequence
   instead of the batched path (`TALKER_PREFILL_BATCHED=1` to force
   the broken path for debugging). Commit 948413b1.
-- [~] 2.5 **Throughput gate**: ≥ 20 fps end-to-end. Currently native
-  hits 18.3 fps on a 171-frame steady-state run (+50% over the 12.2
-  fps llama.cpp baseline) but short runs are prefill-dominated:
-  25-frame utt1 = 7.7 fps. Gap to the 20 fps bar is the iterative
-  prefill (2.0 s on 127 tokens at ~16 ms/token). Closing the gap
-  requires either (a) fixing the batched FIAS prefill so we get the
-  12 ms native prefill back, or (b) caching the role-prefix KV across
-  calls. Marking partial until that lands.
+- [x] 2.5 **Throughput gate**: ≥ 20 fps end-to-end. Batched prefill
+  restored as default (env `TALKER_PREFILL_ITERATIVE=1` forces the
+  legacy fallback). On seq_len=127 the steady-state prefill is ~127 ms
+  (vs ~2054 ms iterative, 16× speedup), and end-to-end throughput on
+  a natural-EOS 209-frame run (≥150-frame gate) is 23.2 fps — above
+  the 20 fps bar. The 3 canonical M2.4 utterances ASR identically to
+  the iterative baseline (utt1 edit-distance-2 as documented in M3.4;
+  utt2/utt3 verbatim). Real-input cos-sim of batched vs iterative
+  hidden on seq_len=127 = 0.9999+ (`test_prefill_diff` with dumped
+  real embeddings; synthetic random inputs hid the divergence with
+  cos-sim 0.999 while real embeddings at σ 0.08 had exposed the
+  pre-M2.5 batched path's 0.28 failure). The batched fixes already
+  landed in commit 2b0a2998 (per-row RoPE unrolling, FIAS S_q=1
+  per-row loop, innerPrecise=0, nextTokens=65535); this ticket only
+  flips the default so callers see the fast path without setting an
+  env var.
+  **Verified-by:**
+  (a) commit on this ticket — flips default to batched, adds real-
+      input test harness (`test_prefill_diff`+`test_mm_diff`) and
+      `TALKER_PREFILL_INPUT_DUMP` env var for cos-sim replay;
+  (b) `/tmp/asr_final/utt{1,2,3}.wav` on Ascend (scp'd locally) ASR
+      content check 3/3 at edit-distance 2 via
+      `scripts/asr_quality_check.sh`; same transcripts as M3.4
+      baseline (utt1 "Good morning. How are you today?" — `,→.`
+      and `?` added, both edit-distance-2);
+  (c) throughput: 209-frame run at 23.2 fps default, 126-frame
+      natural-EOS at 23.0 fps; iterative fallback on same input =
+      ~16 fps. Gate: ASR + throughput.
 - [x] 2.6 File regression test that runs this config nightly.
   `scripts/native_tts_quality_gate.sh` — runs both native + llama on
   the three canonical M2.4 utterances, emits a summary.tsv with per-run
@@ -710,6 +742,45 @@ carrying a silent false claim.
   hooked into both `init` and `init_from_safetensors`). Zero edits to
   `forward_decode`, `forward_prefill`, `run_decode_ops_`,
   `forward_one_token`, any matmul call site, or `CMakeLists.txt`.
+- **2026-04-19 Track A (M2.5 closed) — batched prefill restored as
+  default**: the pre-M2.5 "cos-sim 0.28" bug had in fact been fixed
+  between the M2.4 stamp (commit 948413b1, iterative default) and
+  this ticket (by commit 2b0a2998's RoPE-unroll + FIAS-S_q=1 rewrite),
+  but no one flipped the default back to the batched path. Verifying:
+  rebuilt qwen_tts with the current source and `TALKER_PREFILL_BATCHED=1`
+  produced cos-sim 0.9999+ against the iterative reference on real
+  text embeddings, and ASR content-checks the same 3/3 (utt1 edit-
+  distance-2, utt2/utt3 verbatim) as the iterative path.
+  **Diagnostic surfaces added** (`tools/qwen_tts/`):
+  (1) `test_mm_diff.cpp` — per-row `aclnnMm(W, X_col)` vs batched
+     `aclnnMm(X, W^T_strided_view)` at real Talker dims (K=M=2048,
+     N=127). Both produce bit-identical output (cos-sim 1.0),
+     ruling out strided-weight matmul as a contributor.
+  (2) `test_prefill_diff.cpp` — batched vs iterative `forward_prefill`
+     on synthetic σ∈{0.02, 0.1, 0.5, 1.0} gaussians over
+     seq_len∈{1, 2, 3, 4, 8, 16, 32, 64, 127} (all cos-sim ≥ 0.9996),
+     PLUS an optional real-embedding-file mode (arg 2 = binary
+     `[int32 seq_len][int32 hidden][seq_len*hidden f32]`) for
+     end-to-end-equivalent cos-sim on production inputs. Real input
+     at seq_len=127 = cos-sim 0.999999, cold-vs-warm identical.
+  (3) `TALKER_PREFILL_INPUT_DUMP=<path>` env var in
+     `TalkerCannEngine::forward_prefill` dumps the raw F32 input
+     embeddings on the first call per process — feeds (2) above.
+  **Default flip**: `forward_prefill` now runs the batched path
+  unconditionally; `TALKER_PREFILL_ITERATIVE=1` forces the legacy
+  iterative fallback for regression bisects. The old
+  `TALKER_PREFILL_BATCHED` env var is no longer honored (its sole
+  purpose was to opt into the then-buggy batched path).
+  **Throughput delta**: main prefill on seq_len=127 is ~127 ms
+  (default batched) vs ~2054 ms (iterative fallback), 16× speedup.
+  End-to-end 209-frame natural-EOS run = 23.2 fps default vs
+  ~16 fps iterative. M2.5 throughput gate (≥20 fps on ≥150-frame
+  runs) now passes.
+  **Files touched (Track A only)**: `tools/qwen_tts/talker_cann_engine.cpp`
+  (env-var rename + diagnostic dump + comment update),
+  `tools/qwen_tts/test_prefill_diff.cpp` (real-input mode + scale
+  sweep), `tools/qwen_tts/test_mm_diff.cpp` (real-dim enlargement),
+  `tools/qwen_tts/CMakeLists.txt` (two new test-target entries).
 
 ## 9. Parallelism playbook
 

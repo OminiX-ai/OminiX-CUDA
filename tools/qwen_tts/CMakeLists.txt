@@ -188,4 +188,46 @@ if(QWEN_TTS_CP_CANN)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
         target_compile_options(test_talker_native PRIVATE -march=armv8.2-a+fp16)
     endif()
+
+    # Diagnostic harness: batched vs iterative forward_prefill cos-sim on
+    # synthetic scales + real-embedding-dump replay (see Track A §8 entry
+    # in NATIVE_TTS_CONTRACT.md for the use case).
+    add_executable(test_prefill_diff
+        test_prefill_diff.cpp
+        talker_cann_engine.cpp
+        cp_cann_symbols.cpp
+        model_defs.cpp
+    )
+    target_link_libraries     (test_prefill_diff PUBLIC ggml llama qwen_common)
+    target_link_libraries     (test_prefill_diff PRIVATE Threads::Threads common
+                                                           ${CMAKE_DL_LIBS})
+    target_include_directories(test_prefill_diff PUBLIC  .)
+    target_include_directories(test_prefill_diff PRIVATE ../.. ../../vendor
+        $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include
+        $ENV{ASCEND_TOOLKIT_HOME}/include)
+    target_compile_definitions(test_prefill_diff PRIVATE QWEN_TTS_HAS_CP_CANN=1)
+    target_compile_features   (test_prefill_diff PRIVATE cxx_std_17)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        target_compile_options(test_prefill_diff PRIVATE -march=armv8.2-a+fp16)
+    endif()
+
+    # Diagnostic: per-row aclnnMm(W, X_col) vs batched aclnnMm(X, W^T strided).
+    # Verifies the strided-weight view pattern used in forward_prefill matches
+    # the contiguous-weight pattern used in forward_decode.
+    add_executable(test_mm_diff
+        test_mm_diff.cpp
+        cp_cann_symbols.cpp
+    )
+    target_link_libraries     (test_mm_diff PUBLIC ggml llama qwen_common)
+    target_link_libraries     (test_mm_diff PRIVATE Threads::Threads common
+                                                           ${CMAKE_DL_LIBS})
+    target_include_directories(test_mm_diff PUBLIC  .)
+    target_include_directories(test_mm_diff PRIVATE ../.. ../../vendor
+        $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include
+        $ENV{ASCEND_TOOLKIT_HOME}/include)
+    target_compile_definitions(test_mm_diff PRIVATE QWEN_TTS_HAS_CP_CANN=1)
+    target_compile_features   (test_mm_diff PRIVATE cxx_std_17)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        target_compile_options(test_mm_diff PRIVATE -march=armv8.2-a+fp16)
+    endif()
 endif()

@@ -99,7 +99,8 @@ void upload_f32_as_f16(void *dev, const float *host, size_t n) {
 
 aclTensor *make_tensor(void *buf, int64_t rank,
                         const int64_t *shape, const int64_t *strides,
-                        aclDataType dtype) {
+                        aclDataType dtype,
+                        aclFormat fmt = ACL_FORMAT_ND) {
     // Compute storage_len as the maximum offset the strided view can reach
     // (plus one). For contiguous views this equals shape-product, but for
     // strided views over larger buffers (KV cache slices, mask subarrays)
@@ -114,7 +115,7 @@ aclTensor *make_tensor(void *buf, int64_t rank,
         storage_len = max_off + 1;
     }
     return g_cann.aclCreateTensor(shape, rank, dtype, strides, 0,
-                                   ACL_FORMAT_ND, &storage_len, 1, buf);
+                                   fmt, &storage_len, 1, buf);
 }
 
 aclTensor *tensor_1d(void *buf, int64_t n, aclDataType dtype) {
@@ -127,6 +128,18 @@ aclTensor *tensor_2d(void *buf, int64_t d0, int64_t d1, aclDataType dtype) {
     int64_t shape[2]   = {d0, d1};
     int64_t strides[2] = {d1, 1};
     return make_tensor(buf, 2, shape, strides, dtype);
+}
+
+// M5.3 — build a [d0, d1] weight tensor with the caller-selected aclFormat.
+// When `fmt == ACL_FORMAT_FRACTAL_NZ`, aclnnMm dispatches the NZ kernel path
+// (the buffer must already have been pre-converted via
+// aclnnTransMatmulWeight at init — see set_use_nz_weights / nz_applied()).
+// `fmt == ACL_FORMAT_ND` is identical to plain tensor_2d().
+aclTensor *tensor_2d_fmt(void *buf, int64_t d0, int64_t d1,
+                          aclDataType dtype, aclFormat fmt) {
+    int64_t shape[2]   = {d0, d1};
+    int64_t strides[2] = {d1, 1};
+    return make_tensor(buf, 2, shape, strides, dtype, fmt);
 }
 
 aclTensor *tensor_strided(void *buf, int64_t rank,
@@ -523,7 +536,8 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     }
     if (nz_enabled) {
         printf("[talker_cann] FRACTAL_NZ weight pre-conversion ENABLED "
-               "(per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down)\n");
+               "(per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down, "
+               "matmul call sites tag weights with ACL_FORMAT_FRACTAL_NZ)\n");
     }
 
     // ---- Per-layer weights ----
@@ -818,10 +832,16 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
         dbg_sync(il, "input RmsNorm");
 
         // --- Q/K/V projection: [dim, 1] = [dim, n_embd] @ [n_embd, 1] ---
+        // M5.3: when the weight buffers have been pre-converted to FRACTAL_NZ
+        // via aclnnTransMatmulWeight at init (nz_applied_ == true), tag the
+        // weight tensor descriptors with ACL_FORMAT_FRACTAL_NZ so plain
+        // aclnnMm dispatches the NZ kernel path. Activation tensors stay ND.
         {
-            aclTensor *t_w_q = tensor_2d(lw.q_proj_w, q_dim_, n_embd_, ACL_FLOAT16);
-            aclTensor *t_w_k = tensor_2d(lw.k_proj_w, kv_dim_, n_embd_, ACL_FLOAT16);
-            aclTensor *t_w_v = tensor_2d(lw.v_proj_w, kv_dim_, n_embd_, ACL_FLOAT16);
+            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
+                                               : ACL_FORMAT_ND;
+            aclTensor *t_w_q = tensor_2d_fmt(lw.q_proj_w, q_dim_, n_embd_, ACL_FLOAT16, wfmt);
+            aclTensor *t_w_k = tensor_2d_fmt(lw.k_proj_w, kv_dim_, n_embd_, ACL_FLOAT16, wfmt);
+            aclTensor *t_w_v = tensor_2d_fmt(lw.v_proj_w, kv_dim_, n_embd_, ACL_FLOAT16, wfmt);
             aclTensor *t_norm_col = tensor_2d(normed_dev_, n_embd_, 1, ACL_FLOAT16);
             aclTensor *t_q_col = tensor_2d(q_dev_, q_dim_,  1, ACL_FLOAT16);
             aclTensor *t_k_col = tensor_2d(k_dev_, kv_dim_, 1, ACL_FLOAT16);
@@ -975,7 +995,9 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
 
         // --- O projection [n_embd, 1] = [n_embd, q_dim] @ [q_dim, 1] ---
         {
-            aclTensor *t_w_o   = tensor_2d(lw.o_proj_w, n_embd_, q_dim_, ACL_FLOAT16);
+            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
+                                               : ACL_FORMAT_ND;
+            aclTensor *t_w_o   = tensor_2d_fmt(lw.o_proj_w, n_embd_, q_dim_, ACL_FLOAT16, wfmt);
             aclTensor *t_q_col = tensor_2d(q_dev_, q_dim_, 1, ACL_FLOAT16);
             aclTensor *t_o_col = tensor_2d(o_out_dev_, n_embd_, 1, ACL_FLOAT16);
             CANN_OP(Mm, t_w_o, t_q_col, t_o_col, (int8_t)0);
@@ -1018,9 +1040,11 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
         // --- FFN: gate = silu(gate_proj @ normed) * (up_proj @ normed),
         //     ffn_out = down_proj @ gate ---
         {
-            aclTensor *t_w_gate = tensor_2d(lw.gate_proj_w, inter_, n_embd_, ACL_FLOAT16);
-            aclTensor *t_w_up   = tensor_2d(lw.up_proj_w,   inter_, n_embd_, ACL_FLOAT16);
-            aclTensor *t_w_down = tensor_2d(lw.down_proj_w, n_embd_, inter_, ACL_FLOAT16);
+            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
+                                               : ACL_FORMAT_ND;
+            aclTensor *t_w_gate = tensor_2d_fmt(lw.gate_proj_w, inter_, n_embd_, ACL_FLOAT16, wfmt);
+            aclTensor *t_w_up   = tensor_2d_fmt(lw.up_proj_w,   inter_, n_embd_, ACL_FLOAT16, wfmt);
+            aclTensor *t_w_down = tensor_2d_fmt(lw.down_proj_w, n_embd_, inter_, ACL_FLOAT16, wfmt);
             aclTensor *t_norm_col = tensor_2d(normed_dev_, n_embd_, 1, ACL_FLOAT16);
             aclTensor *t_gate_col = tensor_2d(gate_dev_, inter_, 1, ACL_FLOAT16);
             aclTensor *t_up_col   = tensor_2d(up_dev_,   inter_, 1, ACL_FLOAT16);
