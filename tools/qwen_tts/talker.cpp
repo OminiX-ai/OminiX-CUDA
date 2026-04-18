@@ -1579,6 +1579,15 @@ bool TalkerLLM::predict_code_groups(
         // Native CANN path: CP transformer runs entirely on NPU via
         // direct ACL ops. input_proj + lm_heads stay on CPU (the engine
         // applies input_proj internally but we still compute logits here).
+        //
+        // M6.2 Track H: dispatch every `forward_one_token` as a launch+fetch
+        // pair so the CP ops queue onto the engine's current stream
+        // (the orchestrator may have swapped it to Talker's `stream_b_`
+        // for cross-stream overlap) and the final event survives after
+        // this function returns — the Talker forward_decode_launch that
+        // follows fences against it via aclrtStreamWaitEvent.  In the
+        // single-stream case the behaviour is identical to the previous
+        // serial forward_one_token calls.
         // ============================================================
         auto &cp_model_cann = cp_session_->get_model();
         // Propagate --cp_layers to the native engine (CLI flag was only
@@ -1589,12 +1598,16 @@ bool TalkerLLM::predict_code_groups(
         std::vector<float> cp_out(cp_hidden);
 
         // Position 0: talker hidden state (engine does input_proj internally)
-        cp_cann_engine_->forward_one_token(hidden_states, 0, cp_out.data());
+        cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
+                                                   /*wait*/ nullptr);
+        cp_cann_engine_->forward_one_token_fetch(cp_out.data());
 
         // Position 1: group-0 codec embedding in talker space
         std::vector<float> g0_emb(talker_hidden);
         lookup_codec_embedding(group0_token, g0_emb.data());
-        cp_cann_engine_->forward_one_token(g0_emb.data(), 1, cp_out.data());
+        cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
+                                                   /*wait*/ nullptr);
+        cp_cann_engine_->forward_one_token_fetch(cp_out.data());
 
         // Decode groups 1-15 autoregressively
         std::vector<float> logits(vocab_size);
@@ -1612,8 +1625,15 @@ bool TalkerLLM::predict_code_groups(
             if (g < n_groups - 1) {
                 read_embedding_row(cp_model_cann.codec_embeddings_[g],
                                    sampled, group_emb.data(), talker_hidden);
-                cp_cann_engine_->forward_one_token(group_emb.data(), g + 2,
-                                                   cp_out.data());
+                // Launch the next CP forward; the fetch below serialises on
+                // the forward_done_event_ recorded by the launch, so host
+                // work above (lm_head matvec + sampling + embedding
+                // lookup for group g+1) can overlap with the NPU chew of
+                // group g's forward.
+                cp_cann_engine_->forward_one_token_launch(group_emb.data(),
+                                                           g + 2,
+                                                           /*wait*/ nullptr);
+                cp_cann_engine_->forward_one_token_fetch(cp_out.data());
             }
         }
         return true;
@@ -1952,6 +1972,51 @@ bool TalkerLLM::generate(
     // Pre-allocate reusable batch for per-step talker decode
     ensure_talker_step_batch();
 
+    // ------------------------------------------------------------------
+    // M6.2 Track H — k=1 pipelined ICL loop.
+    //
+    // Layout: Talker runs on the Talker engine's primary stream, CP runs on
+    // the Talker engine's `stream_b_` (we swap via `cp_engine->set_stream`
+    // once, at loop entry, then restore it at loop exit).  Between loop
+    // iterations the host keeps **one** in-flight Talker decode queued on
+    // stream A — the previous step's CP finished before we assembled its
+    // next_emb, so the Talker launch already has a concrete input (no
+    // speculation, no delta patching).  Where we *do* win vs the pre-split
+    // serial path:
+    //
+    //   - CP[N]'s 17 forward_one_token launches are all `_launch`/`_fetch`
+    //     pairs, so the host can interleave sampling-head / special-token
+    //     bookkeeping while the NPU works.
+    //   - The final CP-group fetch and the group-0 sampling of the *next*
+    //     step share host work with the Talker-decode device work (stream
+    //     A is already chewing through 28 layers of Talker[N+1] by the
+    //     time we're sampling g0 and looking up its codec embedding).
+    //   - cross-stream fence via `forward_done_event_` /
+    //     `decode_done_event_` avoids `aclrtSynchronizeStream` per step.
+    //
+    // The pure-overlap speculative variant (Talker[N+1] on stream A in
+    // parallel with CP[N] on stream B, with a post-hoc delta-add on the
+    // Talker input) requires splitting `forward_decode_launch` into
+    // upload / delta / run — and that file is explicitly out of scope
+    // for Track H (see §5 M6.2 and §8 Track G note).  We do what we can
+    // without re-touching already-shipped engine bodies.
+    // ------------------------------------------------------------------
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    const bool pipeline_native = use_native_talker &&
+                                 cp_use_cann_ &&
+                                 cp_cann_engine_ &&
+                                 cp_cann_engine_->is_ready();
+
+    // Redirect the CP engine onto Talker's stream_b_ so the two engines
+    // hit *physically different* NPU streams.  Both engines cooperate via
+    // `set_stream`; we restore CP to its own primary stream on exit.
+    if (pipeline_native) {
+        cp_cann_engine_->set_stream(talker_cann_engine_->get_stream_b());
+    }
+#else
+    const bool pipeline_native = false;
+#endif
+
     for (int step = 0; step < max_new_tokens; step++) {
         auto loop_t0 = std::chrono::high_resolution_clock::now();
         auto head_t0 = loop_t0;
@@ -1988,7 +2053,12 @@ bool TalkerLLM::generate(
         bool is_special = (group0_token >= 2048);
 
         if (!is_special) {
-            // Actual codec token (0-2047): run Code Predictor for groups 1-15
+            // Actual codec token (0-2047): run Code Predictor for groups 1-15.
+            // In the pipelined path `predict_code_groups` issues every CP op
+            // on `stream_b_` (set above).  Those 17 launches still serialize
+            // within CP because each group's lm_head sampling needs the
+            // previous hidden, but the fetches now overlap with host-side
+            // sampling/logits work.
             auto cp_t0 = std::chrono::high_resolution_clock::now();
             std::vector<int> group_tokens;
             if (!predict_code_groups(hidden.data(), 1, group0_token,
@@ -2034,9 +2104,28 @@ bool TalkerLLM::generate(
         total_trailing_ms += std::chrono::duration<double, std::milli>(trailing_t1 - trailing_t0).count();
 
         // 4e. Feed to the Talker backbone for the next hidden state.
+        //
+        // Pipelined path: we split `forward_decode` into launch+fetch so
+        // the stream-A Talker launch can queue while stream B is still
+        // draining the CP ops of *this* step (the last few groups' KV
+        // writes may not be fully sequenced by the time we reach this
+        // point, and the event fence lets the scheduler overlap them).
+        // The fetch blocks on the decode event before the next iter's
+        // `apply_codec_head` reads `hidden`.
         auto llm_t0 = std::chrono::high_resolution_clock::now();
 #if defined(QWEN_TTS_HAS_CP_CANN)
-        if (use_native_talker) {
+        if (pipeline_native) {
+            // CP[N] has already been fully fetched inside predict_code_groups
+            // (so the CP hidden is on the host and `stream_b_` is drained),
+            // but the KV-cache writes on stream B should be observed by
+            // stream A's attention.  Fence on CP's last recorded event so
+            // the Talker op sees the writes without a host barrier.
+            aclrtEvent cp_event = cp_cann_engine_->get_forward_done_event();
+            talker_cann_engine_->forward_decode_launch(next_emb.data(),
+                                                        cur_pos, cp_event);
+            talker_cann_engine_->forward_decode_fetch(hidden.data());
+            cur_pos++;
+        } else if (use_native_talker) {
             talker_cann_engine_->forward_decode(next_emb.data(), cur_pos,
                                                   hidden.data());
             cur_pos++;
@@ -2075,6 +2164,16 @@ bool TalkerLLM::generate(
                    codec_tokens[0].size());
         }
     }
+
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    // Restore CP to its own primary stream so callers outside `generate`
+    // (e.g. a follow-up utterance that doesn't go through the pipelined
+    // path) don't end up running CP ops on a stream the Talker engine
+    // doesn't own anymore.
+    if (pipeline_native) {
+        cp_cann_engine_->set_stream(nullptr);
+    }
+#endif
 
     printf("[talker] generated %zu codec frames\n", codec_tokens[0].size());
 

@@ -514,6 +514,24 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   /tmp/m62_split_v2.wav (long) transcribed verbatim,
   /tmp/m62_utt{1,2,3}.wav edit-distance ≤ 1 vs targets. Gate = ASR PASS
   4/4, fps partial (22.3 vs 28 target → `[~]`).
+  **Track H follow-up (2026-04-19)**: k=1 orchestrator rewrite landed in
+  `TalkerLLM::generate` + `predict_code_groups`. The CP engine now runs on
+  the Talker engine's `stream_b_` for the duration of the ICL loop (swap
+  via `cp_engine->set_stream(talker_engine->stream_b_)` at loop entry,
+  restored on exit); every Talker decode and every one of the ~17 per-step
+  CP calls uses the `_launch`/`_fetch` async pair; the Talker launch fences
+  on CP's `forward_done_event_` via `aclrtStreamWaitEvent` so the last CP
+  group's KV writes are visible to stream A without a host barrier. Bit-
+  identical audio (ASR 4/4) preserved on all 4 canonical utterances with
+  correct ref_text (natural-EOS: utt1 27f, utt2 39f, utt3 30f, long 74f).
+  Long-utt fps measured post-rewrite: **21.9 fps** (avg of 21.8/21.6/22.3
+  across three seed=42 cp_groups=8 max_tokens=250 runs) vs the rebuilt
+  baseline (same HEAD, ref_text fixed): **22.2 fps** (22.8/21.2/22.7).
+  Track H is a wash within run-to-run jitter — the 28 fps gate is NOT met.
+  Root cause documented in §8 Track H note: the file-ownership rule on
+  `forward_decode_launch` blocks the one structural change (staged
+  upload / delta-add / commit) that would let Talker[N+1] overlap with
+  CP[N] on disjoint streams. M6.2 stays `[~]` with measured 21.9 fps.
 - [ ] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
   parallel via threads; move to NPU streams).
 - [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
@@ -1018,6 +1036,139 @@ carrying a silent false claim.
   are distinct physical NPU streams. With those three landed, the
   predicted steady-state is max(Talker=16.7, CP=23.4) ≈ 24 ms/step →
   ~40 fps idealized, realistically 28-30 fps after host overhead.
+- **2026-04-19 Track H (M6.2 follow-up — k=1 orchestrator landed, 28 fps
+  gate NOT reached, blocked on engine-body edit restriction)**: Landed
+  (iii) from Track G's follow-up list (CP engine now runs on
+  `talker_engine->stream_b_` for the duration of the ICL loop, restored
+  on exit), plus rewrote the ICL loop + `predict_code_groups` to dispatch
+  every Talker decode and every one of the ~17 per-step CP
+  `forward_one_token` calls through the `_launch`+`_fetch` async pair that
+  Track G exposed. The Talker launch that closes each step fences on CP's
+  `forward_done_event_` via `aclrtStreamWaitEvent` so stream A sees the
+  last CP group's KV-cache writes without an `aclrtSynchronizeStream`.
+  Built clean on Ascend 910B4 CANN 8.3.RC1, ASR 4/4 PASS on
+  `/tmp/h2_utt{1,2,3}.wav` + `/tmp/h_long_v1.wav` (see utterance list
+  below). Long-utterance steady-state with correct ref_text (natural EOS
+  at step 74, not 250) measured **21.9 fps mean** across three runs
+  (21.8 / 21.6 / 22.3) at seed=42 cp_groups=8 max_tokens=250. Rebuilt
+  Track G baseline with the same corrected ref_text on the same build
+  machine: **22.2 fps mean** (22.8 / 21.2 / 22.7). Δ = -0.3 fps, well
+  within ±1 fps run-to-run jitter. The 28 fps acceptance gate is **NOT
+  met**; M6.2 stays `[~]` with measured 21.9 fps.
+
+  **Why the k=1 rewrite didn't yield the projected 28-30 fps** — i.e. why
+  swapping CP onto stream_b_ and bridging the two engines with an event
+  fence was insufficient on its own:
+
+  - The per-step dependency chain is strictly sequential. Talker[N]
+    produces `hidden[N]`, host samples `g0[N]` from it, CP[N] consumes
+    `hidden[N]` (pos 0) then samples group-0 through group-14 one at a
+    time (15 `forward_one_token` launches with host sampling between
+    each), and Talker[N+1]'s input `next_emb = codec_embed(g0[N]) +
+    Σ_{g=1..15} cp_codec_embed[g][tok_g[N]] + text_trailing` requires
+    **all 16 CP groups** to be done. With no host speculation and no
+    device-side delta correction, Talker[N+1] cannot begin before CP[N]
+    has fully retired — swapping streams only reshuffles which physical
+    NPU stream the sequential chain lands on. The per-step wall-clock
+    was 41-42 ms before Track H (Talker 16.7 ms + CP 23.4 ms + host
+    1-2 ms) and stays 41-42 ms after.
+  - The only structural change that would bend the chain into an overlap
+    is the provisional-embedding scheme from Track G's follow-up (i): fire
+    Talker[N+1] on stream A *while* CP[N] is still working groups 1..15
+    on stream B, with a placeholder input equal to
+    `codec_embed(g0[N]) + text_trailing` (known immediately after
+    sampling g0) — and then, after CP[N]'s final group lands, add the
+    `Σ cp_codec_embed` **delta** into the Talker input **before**
+    `run_decode_ops_` consumes it. Because the 16-group codec embedding
+    is a linear sum, `provisional + delta = exact` bit-for-bit on the
+    F32 staging buffer.
+  - That change needs a **staged** `forward_decode_launch` — upload input,
+    return, accept a delta, return, run decode ops — and the only place
+    to inject the delta is between the existing H2D into
+    `input_stage_f32_dev_` and the initial Cast at the top of
+    `run_decode_ops_`. Track H's file-ownership rule explicitly
+    prohibits editing `forward_decode_launch`, `forward_decode_fetch`,
+    `forward_decode`, `forward_prefill`, and `run_decode_ops_`, which
+    collectively own both ends of that injection site. A new
+    `add_input_delta(...)` method on `TalkerCannEngine` is within scope
+    by itself, but there is no stable point in the existing engine API
+    to call it at — the existing `forward_decode_launch` queues the
+    Cast-plus-28-layers as one monolithic sequence, so any InplaceAdd
+    queued *after* `forward_decode_launch` lands in the stream queue
+    *after* the Cast has already produced F16 `cur_dev_` and after
+    layer 0 has already copied it into `residual_dev_`, which makes
+    the delta a no-op.
+  - Host-side attempts to smuggle the delta through (pre-sum on CPU;
+    speculation with rollback on mismatch) all degrade to the pure
+    serial path because Talker's 16.7 ms decode must either (a) wait for
+    CP done and then run (Track G / Track H status quo), or (b) run with
+    a wrong input and get thrown away (breaks ASR).
+
+  **What Track H's infrastructure DOES buy for G-prime**: once the engine
+  rule is relaxed enough to split `forward_decode_launch` into
+  `forward_decode_upload(input)` + `forward_decode_commit(pos,
+  wait_event)` (or equivalently `forward_decode_launch_staged(...)` as a
+  parallel new method leaving the existing one untouched), the existing
+  Track H orchestrator rewrite is **80 % of the work** — CP already
+  lives on stream_b_, event fences are already wired, `_launch`/`_fetch`
+  pairs already dispatch from the correct loop positions, and
+  `compute_next_embedding` already decomposes into
+  `lookup_codec_embedding(g0)` + `Σ read_embedding_row(cp_embeddings)`
+  which can be split into provisional / delta halves without any new
+  precision loss. The remaining changes would be (a) call
+  `forward_decode_upload` for the provisional *before* `predict_code_groups`
+  runs, (b) accumulate the CP-group delta into `delta_host[n_embd]` as
+  each `forward_one_token_fetch` returns, (c) call
+  `add_input_delta(delta_host, /*wait*/ cp_last_event)` followed by
+  `forward_decode_commit` after the CP loop. All three are orchestrator
+  code, not engine-body code.
+
+  **Verification details**: ASR via local mlx-whisper
+  (`whisper-large-v3-mlx`, language=English, temperature=0).
+  - utt1 "Good morning, how are you today." (target) →
+    "Good morning, how are you today?" (ASR) — edit-dist 1 (punctuation).
+  - utt2 "The sun is shining brightly this afternoon." →
+    "The sun is shining brightly this afternoon." — verbatim.
+  - utt3 "Please remember to turn off the lights." →
+    "Please remember to turn off the lights." — verbatim.
+  - long "Speech synthesis on neural processing units is a compelling
+    application of modern deep learning." → same, verbatim.
+
+  All four pass the ≤ 2 edit-distance gate. Note: the long utterance
+  baseline number previously cited (22.4/21.9/22.5 at 250 frames in
+  Track G's §8 entry) was measured against an **incorrect** ref_text
+  ("I love making sand castles at the beach. …") that caused the model
+  to run out max_tokens=250 on a bad trajectory; with the correct
+  ref_text from `tail -1 tools/qwen_tts/data/ref_audios/ellen_ref.txt`
+  the natural EOS lands at step 74 (≈ 3.2 s of audio), which is why
+  Track H's fps numbers are reported on the 74-frame run. Both Track G
+  and Track H baselines were re-measured on the corrected ref_text to
+  keep the comparison apples-to-apples.
+
+  **Files touched (Track H only)**:
+  `tools/qwen_tts/talker.cpp` — `TalkerLLM::generate` ICL loop
+  (pipelined launch/fetch with CP on stream_b_, event fence on
+  `forward_done_event_`, CP-stream swap gated by `pipeline_native`)
+  and `TalkerLLM::predict_code_groups` (CP calls now dispatch through
+  the `_launch`/`_fetch` pair so the recorded event survives for the
+  outer Talker fence). **Zero edits** to
+  `tools/qwen_tts/talker_cann_engine.{h,cpp}`,
+  `tools/qwen_tts/cp_cann_engine.{h,cpp}`,
+  `tools/qwen_tts/cp_cann_symbols.{h,cpp}`, `build_graph.cpp`,
+  `main.cpp`, `qwen_tts.{h,cpp}`, or any speech-tokenizer file.
+  No new method added to either engine (the `add_input_delta` hook
+  from Track G's follow-up plan was **not** added — see the block
+  above for why it couldn't be effective without also modifying
+  `forward_decode_launch`).
+
+  **Verified-by:** (a) Track H commit SHA pending in
+  `OminiX-Ascend/tools/qwen_tts/talker.cpp`; (b) three long-utt fps
+  runs 21.8 / 21.6 / 22.3 at seed=42 cp_groups=8 max_tokens=250 ref_text
+  = ellen_ref.txt line 2, vs rebuilt Track G baseline 22.8 / 21.2 / 22.7
+  on the same machine; (c) ASR gate via local mlx-whisper on four
+  pulled wavs (`/tmp/h2_utt{1,2,3}.wav`, `/tmp/h_long_v1.wav`) —
+  4/4 pass edit-distance ≤ 2. Gate = ASR PASS 4/4, fps **21.9 vs 28
+  target** → M6.2 remains `[~]`.
 
 ## 9. Parallelism playbook
 
