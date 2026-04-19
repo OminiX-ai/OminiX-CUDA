@@ -600,7 +600,7 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   records `decode_done_event_`). The ICL loop now launches the Talker
   cast before `predict_code_groups`, then builds the groups-1..15 sum
   on host and applies it via `add_input_delta_f32` before queuing the
-  layers. Track J commit SHA pending in `tools/qwen_tts/{talker,
+  layers. Track J commit SHA `b2bf8a54` in `tools/qwen_tts/{talker,
   talker_cann_engine}.{h,cpp}`. **ASR 4/4 PASS** on utt1 edit-dist 2
   (`, → .`, `. → ?`), utt2/utt3/long verbatim. **DTW log-mel cos-sim
   0.973** (aligned mean, n_mels=80) between NZ-on-speculative and
@@ -1532,7 +1532,7 @@ carrying a silent false claim.
   `qwen_tts.{h,cpp}`, `build_graph.cpp`, speech-tokenizer files, or
   `CMakeLists.txt`.
 
-  **Verified-by**: (a) Track J commit SHA pending in
+  **Verified-by**: (a) Track J commit SHA `b2bf8a54` in
   `OminiX-Ascend/tools/qwen_tts/{talker.cpp,talker_cann_engine.{h,cpp}}`
   under CANN 8.5 on ModelArts 910B4; (b) long-utt fps runs
   29.0/28.9/26.1/25.2/25.6/25.7/25.0 = avg 26.5 at
