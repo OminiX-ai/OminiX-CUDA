@@ -180,6 +180,21 @@ bool load_once() {
     resolve_optional(h_op, "aclnnTransMatmulWeight",
                      g_cann.aclnnTransMatmulWeight);
 
+    // Optional: aclnnMatmulWeightNz (M5.3, CANN 8.5+). Matmul op that actually
+    // consumes an NZ-laid-out weight buffer (as opposed to plain aclnnMm on
+    // CANN 8.3 which silently falls back to the ND kernel). Gated via
+    // has_matmul_weight_nz(); callers use plain aclnnMm when the symbol is
+    // absent. The Nz variant of BatchMatMul is pulled in for parity with a
+    // possible future batched path — still optional.
+    resolve_optional(h_op, "aclnnMatmulWeightNzGetWorkspaceSize",
+                     g_cann.aclnnMatmulWeightNzGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnMatmulWeightNz",
+                     g_cann.aclnnMatmulWeightNz);
+    resolve_optional(h_op, "aclnnBatchMatMulWeightNzGetWorkspaceSize",
+                     g_cann.aclnnBatchMatMulWeightNzGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnBatchMatMulWeightNz",
+                     g_cann.aclnnBatchMatMulWeightNz);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};

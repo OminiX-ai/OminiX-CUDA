@@ -54,6 +54,18 @@
                                          stream_));                   \
 } while (0)
 
+// M5.3 — matmul call. On 8.5, plain aclnnMm dispatches to the NZ kernel as
+// long as the `mat2` weight tensor is tagged with ACL_FORMAT_FRACTAL_NZ AND
+// the weight buffer has been pre-converted via aclnnTransMatmulWeight at
+// init. The CANN 8.5 MatmulWeightNz op exists but requires a 4D storage-
+// shape descriptor that plain tensor_2d doesn't build (EZ1001: "Only
+// support mat2 storageShapeDim is 4"); matching ggml-cann's ggml-cann.cpp
+// path (plain aclnnMm + FRACTAL_NZ format tag on mat2 only) dispatches the
+// same kernel without that complication. `A` is activation tensor (ND), `W`
+// is weight tensor (NZ when applied, else ND), `O` is output. Compute
+// semantics: O = A @ W, shape [M, K] @ [K, N].
+#define CANN_MATMUL(A, W, O) CANN_OP(Mm, (A), (W), (O), (int8_t)0)
+
 // ---------------------------------------------------------------------------
 // fp32 <-> fp16 helpers (aarch64 native __fp16).
 // ---------------------------------------------------------------------------
@@ -546,8 +558,10 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     }
     if (nz_enabled) {
         printf("[talker_cann] FRACTAL_NZ weight pre-conversion ENABLED "
-               "(per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down, "
-               "matmul call sites tag weights with ACL_FORMAT_FRACTAL_NZ)\n");
+               "(per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down; "
+               "decode/prefill matmul call sites swap operands to "
+               "activation@weight_T and tag weight mat2 with "
+               "ACL_FORMAT_FRACTAL_NZ for M5.3)\n");
     }
 
     // ---- Per-layer weights ----
@@ -841,17 +855,54 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
         }
         dbg_sync(il, "input RmsNorm");
 
-        // --- Q/K/V projection: [dim, 1] = [dim, n_embd] @ [n_embd, 1] ---
-        // M5.3: when the weight buffers have been pre-converted to FRACTAL_NZ
-        // via aclnnTransMatmulWeight at init (nz_applied_ == true), tag the
-        // weight tensor descriptors with ACL_FORMAT_FRACTAL_NZ so plain
-        // aclnnMm dispatches the NZ kernel path. Activation tensors stay ND.
-        {
-            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
-                                               : ACL_FORMAT_ND;
-            aclTensor *t_w_q = tensor_2d_fmt(lw.q_proj_w, q_dim_, n_embd_, ACL_FLOAT16, wfmt);
-            aclTensor *t_w_k = tensor_2d_fmt(lw.k_proj_w, kv_dim_, n_embd_, ACL_FLOAT16, wfmt);
-            aclTensor *t_w_v = tensor_2d_fmt(lw.v_proj_w, kv_dim_, n_embd_, ACL_FLOAT16, wfmt);
+        // --- Q/K/V projection ---
+        // M5.3: two paths, picked at runtime via nz_applied_.
+        //
+        //   ND path (default / fallback): compute as
+        //     [dim, 1] = W[dim, n_embd] @ x[n_embd, 1]
+        //   via plain aclnnMm. This matches the F16 ggml-cann reference.
+        //
+        //   NZ path (TALKER_NZ_WEIGHTS=1 + CANN 8.5): aclnnMatmulWeightNz's
+        //   contract is self:ND, mat2:NZ — so the weight must be mat2 (RHS),
+        //   not self (LHS). We swap operands to the mathematically equivalent
+        //   [1, dim] = x^T[1, n_embd] @ W^T[n_embd, dim]. The W^T view over
+        //   the NZ-converted buffer uses shape [n_embd, dim], strides (1, in).
+        //   Activation rows are ND; weight descriptors carry FRACTAL_NZ.
+        if (nz_applied_) {
+            // Weight descriptors: transposed view with NZ format tag.
+            auto wT = [&](void *buf, int64_t rows, int64_t cols) {
+                int64_t shape[2]   = {cols, rows};
+                int64_t strides[2] = {1, cols};
+                return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
+                                    ACL_FORMAT_FRACTAL_NZ);
+            };
+            aclTensor *t_wq_T = wT(lw.q_proj_w, q_dim_,  n_embd_);
+            aclTensor *t_wk_T = wT(lw.k_proj_w, kv_dim_, n_embd_);
+            aclTensor *t_wv_T = wT(lw.v_proj_w, kv_dim_, n_embd_);
+            // Activation as [1, n_embd] row. Output as [1, dim] row — same
+            // buffer underneath as the existing column views, just described
+            // as a 1-by-N instead of N-by-1.
+            aclTensor *t_norm_row = tensor_2d(normed_dev_, 1, n_embd_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_,  ACL_FLOAT16);
+            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+            aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_, ACL_FLOAT16);
+            CANN_OP(Mm, t_norm_row, t_wq_T, t_q_row, (int8_t)0);
+            dbg_sync(il, "q_proj");
+            CANN_OP(Mm, t_norm_row, t_wk_T, t_k_row, (int8_t)0);
+            dbg_sync(il, "k_proj");
+            CANN_OP(Mm, t_norm_row, t_wv_T, t_v_row, (int8_t)0);
+            dbg_sync(il, "v_proj");
+            g_cann.aclDestroyTensor(t_wq_T);
+            g_cann.aclDestroyTensor(t_wk_T);
+            g_cann.aclDestroyTensor(t_wv_T);
+            g_cann.aclDestroyTensor(t_norm_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_k_row);
+            g_cann.aclDestroyTensor(t_v_row);
+        } else {
+            aclTensor *t_w_q = tensor_2d(lw.q_proj_w, q_dim_, n_embd_, ACL_FLOAT16);
+            aclTensor *t_w_k = tensor_2d(lw.k_proj_w, kv_dim_, n_embd_, ACL_FLOAT16);
+            aclTensor *t_w_v = tensor_2d(lw.v_proj_w, kv_dim_, n_embd_, ACL_FLOAT16);
             aclTensor *t_norm_col = tensor_2d(normed_dev_, n_embd_, 1, ACL_FLOAT16);
             aclTensor *t_q_col = tensor_2d(q_dev_, q_dim_,  1, ACL_FLOAT16);
             aclTensor *t_k_col = tensor_2d(k_dev_, kv_dim_, 1, ACL_FLOAT16);
@@ -1003,11 +1054,21 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
         // t_k_bsnd / t_v_bsnd owned by the destroyed lists.
         dbg_sync(il, "fias");
 
-        // --- O projection [n_embd, 1] = [n_embd, q_dim] @ [q_dim, 1] ---
-        {
-            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
-                                               : ACL_FORMAT_ND;
-            aclTensor *t_w_o   = tensor_2d_fmt(lw.o_proj_w, n_embd_, q_dim_, ACL_FLOAT16, wfmt);
+        // --- O projection ---
+        // M5.3: NZ path swaps operands as in Q/K/V (see comments there).
+        if (nz_applied_) {
+            int64_t wT_shape[2]   = {(int64_t)q_dim_, (int64_t)n_embd_};
+            int64_t wT_strides[2] = {1, (int64_t)q_dim_};
+            aclTensor *t_wo_T = make_tensor(lw.o_proj_w, 2, wT_shape, wT_strides,
+                                             ACL_FLOAT16, ACL_FORMAT_FRACTAL_NZ);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_o_row = tensor_2d(o_out_dev_, 1, n_embd_, ACL_FLOAT16);
+            CANN_OP(Mm, t_q_row, t_wo_T, t_o_row, (int8_t)0);
+            g_cann.aclDestroyTensor(t_wo_T);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_o_row);
+        } else {
+            aclTensor *t_w_o   = tensor_2d(lw.o_proj_w, n_embd_, q_dim_, ACL_FLOAT16);
             aclTensor *t_q_col = tensor_2d(q_dev_, q_dim_, 1, ACL_FLOAT16);
             aclTensor *t_o_col = tensor_2d(o_out_dev_, n_embd_, 1, ACL_FLOAT16);
             CANN_OP(Mm, t_w_o, t_q_col, t_o_col, (int8_t)0);
@@ -1049,12 +1110,41 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
 
         // --- FFN: gate = silu(gate_proj @ normed) * (up_proj @ normed),
         //     ffn_out = down_proj @ gate ---
-        {
-            const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
-                                               : ACL_FORMAT_ND;
-            aclTensor *t_w_gate = tensor_2d_fmt(lw.gate_proj_w, inter_, n_embd_, ACL_FLOAT16, wfmt);
-            aclTensor *t_w_up   = tensor_2d_fmt(lw.up_proj_w,   inter_, n_embd_, ACL_FLOAT16, wfmt);
-            aclTensor *t_w_down = tensor_2d_fmt(lw.down_proj_w, n_embd_, inter_, ACL_FLOAT16, wfmt);
+        // M5.3: NZ path swaps operands so the weight is mat2 (see Q/K/V).
+        if (nz_applied_) {
+            auto wT = [&](void *buf, int64_t rows, int64_t cols) {
+                int64_t shape[2]   = {cols, rows};
+                int64_t strides[2] = {1, cols};
+                return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
+                                    ACL_FORMAT_FRACTAL_NZ);
+            };
+            aclTensor *t_wg_T = wT(lw.gate_proj_w, inter_,  n_embd_);
+            aclTensor *t_wu_T = wT(lw.up_proj_w,   inter_,  n_embd_);
+            aclTensor *t_wd_T = wT(lw.down_proj_w, n_embd_, inter_);
+            aclTensor *t_norm_row = tensor_2d(normed_dev_, 1, n_embd_, ACL_FLOAT16);
+            aclTensor *t_gate_row = tensor_2d(gate_dev_,   1, inter_,  ACL_FLOAT16);
+            aclTensor *t_up_row   = tensor_2d(up_dev_,     1, inter_,  ACL_FLOAT16);
+            aclTensor *t_gate_flat = tensor_1d(gate_dev_, inter_, ACL_FLOAT16);
+            aclTensor *t_up_flat   = tensor_1d(up_dev_,   inter_, ACL_FLOAT16);
+            aclTensor *t_ffn_row   = tensor_2d(ffn_out_dev_, 1, n_embd_, ACL_FLOAT16);
+            CANN_OP(Mm, t_norm_row, t_wg_T, t_gate_row, (int8_t)0);
+            CANN_OP(Mm, t_norm_row, t_wu_T, t_up_row,   (int8_t)0);
+            CANN_OP(Silu, t_gate_flat, t_gate_flat);
+            CANN_OP(InplaceMul, t_gate_flat, t_up_flat);
+            CANN_OP(Mm, t_gate_row, t_wd_T, t_ffn_row,  (int8_t)0);
+            g_cann.aclDestroyTensor(t_wg_T);
+            g_cann.aclDestroyTensor(t_wu_T);
+            g_cann.aclDestroyTensor(t_wd_T);
+            g_cann.aclDestroyTensor(t_norm_row);
+            g_cann.aclDestroyTensor(t_gate_row);
+            g_cann.aclDestroyTensor(t_up_row);
+            g_cann.aclDestroyTensor(t_gate_flat);
+            g_cann.aclDestroyTensor(t_up_flat);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else {
+            aclTensor *t_w_gate = tensor_2d(lw.gate_proj_w, inter_, n_embd_, ACL_FLOAT16);
+            aclTensor *t_w_up   = tensor_2d(lw.up_proj_w,   inter_, n_embd_, ACL_FLOAT16);
+            aclTensor *t_w_down = tensor_2d(lw.down_proj_w, n_embd_, inter_, ACL_FLOAT16);
             aclTensor *t_norm_col = tensor_2d(normed_dev_, n_embd_, 1, ACL_FLOAT16);
             aclTensor *t_gate_col = tensor_2d(gate_dev_, inter_, 1, ACL_FLOAT16);
             aclTensor *t_up_col   = tensor_2d(up_dev_,   inter_, 1, ACL_FLOAT16);
@@ -1402,12 +1492,20 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         // aclnnMm computes A @ B with A:[M,K], B:[K,N] -> [M,N]. We have
         // normed:[seq_len, n_embd] and weight:[q_dim, n_embd]. Use
         // B = weight^T viewed as [n_embd, q_dim] via strides = (1, n_embd).
+        // M5.3: prefill already uses the activation-first, weight^T
+        // convention (ggml-cann pattern) — here we just toggle the weight
+        // tensor's format tag to FRACTAL_NZ when nz_applied_ and dispatch the
+        // NZ-aware matmul op. Pre-conversion via aclnnTransMatmulWeight
+        // happened once at init.
+        const aclFormat wfmt_prefill = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
+                                                    : ACL_FORMAT_ND;
         auto weight_T_tensor = [&](void *buf, int64_t rows, int64_t cols) {
             // original shape [rows, cols] row-major. Transposed view [cols, rows]
             // with strides (1, cols).
             int64_t shape[2]   = {cols, rows};
             int64_t strides[2] = {1, cols};
-            return tensor_strided(buf, 2, shape, strides, ACL_FLOAT16);
+            return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
+                                wfmt_prefill);
         };
         {
             aclTensor *t_normed = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
@@ -1417,9 +1515,9 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             aclTensor *t_q = tensor_2d(q_batch_dev_, seq_len, q_dim_,  ACL_FLOAT16);
             aclTensor *t_k = tensor_2d(k_batch_dev_, seq_len, kv_dim_, ACL_FLOAT16);
             aclTensor *t_v = tensor_2d(v_batch_dev_, seq_len, kv_dim_, ACL_FLOAT16);
-            CANN_OP(Mm, t_normed, t_wq_T, t_q, (int8_t)0);
-            CANN_OP(Mm, t_normed, t_wk_T, t_k, (int8_t)0);
-            CANN_OP(Mm, t_normed, t_wv_T, t_v, (int8_t)0);
+            CANN_MATMUL(t_normed, t_wq_T, t_q);
+            CANN_MATMUL(t_normed, t_wk_T, t_k);
+            CANN_MATMUL(t_normed, t_wv_T, t_v);
             g_cann.aclDestroyTensor(t_normed);
             g_cann.aclDestroyTensor(t_wq_T);
             g_cann.aclDestroyTensor(t_wk_T);
@@ -1614,7 +1712,7 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             aclTensor *t_wo_T = weight_T_tensor(lw.o_proj_w, n_embd_, q_dim_);
             aclTensor *t_o    = tensor_2d(o_out_batch_dev_, seq_len, n_embd_,
                                             ACL_FLOAT16);
-            CANN_OP(Mm, t_attn, t_wo_T, t_o, (int8_t)0);
+            CANN_MATMUL(t_attn, t_wo_T, t_o);
             g_cann.aclDestroyTensor(t_attn);
             g_cann.aclDestroyTensor(t_wo_T);
             g_cann.aclDestroyTensor(t_o);
@@ -1673,11 +1771,11 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
                                                ACL_FLOAT16);
             aclTensor *t_ffn     = tensor_2d(ffn_out_batch_dev_, seq_len, n_embd_,
                                                ACL_FLOAT16);
-            CANN_OP(Mm, t_normed, t_wg_T, t_gate, (int8_t)0);
-            CANN_OP(Mm, t_normed, t_wu_T, t_up,   (int8_t)0);
+            CANN_MATMUL(t_normed, t_wg_T, t_gate);
+            CANN_MATMUL(t_normed, t_wu_T, t_up);
             CANN_OP(Silu, t_gate_fl, t_gate_fl);
             CANN_OP(InplaceMul, t_gate_fl, t_up_fl);
-            CANN_OP(Mm, t_gate, t_wd_T, t_ffn, (int8_t)0);
+            CANN_MATMUL(t_gate, t_wd_T, t_ffn);
             g_cann.aclDestroyTensor(t_normed);
             g_cann.aclDestroyTensor(t_wg_T);
             g_cann.aclDestroyTensor(t_wu_T);

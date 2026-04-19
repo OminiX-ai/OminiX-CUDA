@@ -319,30 +319,33 @@ void CpCannEngine::build_persistent_tensors_() {
                                        ACL_FLOAT);
     t_.normed_f32_flat    = tensor_1d(normed_f32_dev_, cp_hidden_, ACL_FLOAT);
 
-    // M5.3 — once aclnnTransMatmulWeight has refreshed each F16 matmul weight
-    // buffer to the NZ layout, tag the persistent weight descriptors with
-    // ACL_FORMAT_FRACTAL_NZ so plain aclnnMm picks the NZ kernel. Activation
-    // descriptors (normed_col / q_col / gate_col / ...) stay ND.
-    const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
-                                       : ACL_FORMAT_ND;
+    // M5.3 — for the ND fallback path keep the weight descriptors as plain
+    // [out, in] ND tensors (self=weight, mat2=activation ordering of
+    // aclnnMm). For the NZ path, forward_one_token builds transposed
+    // [in, out] NZ-tagged weight descriptors inline, because aclnnMm with
+    // FRACTAL_NZ dispatches the NZ kernel only when the weight is mat2
+    // (RHS) — the same convention ggml-cann uses in ggml-cann.cpp.
+    // Activation becomes self (LHS). The persistent [out, in] ND
+    // descriptors created below are only used by the fallback path.
     if (nz_applied_) {
-        printf("[cp_cann] matmul call sites tag weights with "
-               "ACL_FORMAT_FRACTAL_NZ (M5.3)\n");
+        printf("[cp_cann] M5.3 NZ matmul enabled — forward_one_token will "
+               "dispatch aclnnMm with transposed FRACTAL_NZ-tagged weight "
+               "descriptors (ggml-cann pattern)\n");
     }
     t_.layer.resize(n_layers_);
     for (int il = 0; il < n_layers_; ++il) {
         auto &lw = layer_w_[il];
         auto &lt = t_.layer[il];
-        lt.q_proj    = tensor_2d_fmt(lw.q_proj_w,    q_dim_,     cp_hidden_, ACL_FLOAT16, wfmt);
-        lt.k_proj    = tensor_2d_fmt(lw.k_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16, wfmt);
-        lt.v_proj    = tensor_2d_fmt(lw.v_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16, wfmt);
-        lt.o_proj    = tensor_2d_fmt(lw.o_proj_w,    cp_hidden_, q_dim_,     ACL_FLOAT16, wfmt);
+        lt.q_proj    = tensor_2d(lw.q_proj_w,    q_dim_,     cp_hidden_, ACL_FLOAT16);
+        lt.k_proj    = tensor_2d(lw.k_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16);
+        lt.v_proj    = tensor_2d(lw.v_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16);
+        lt.o_proj    = tensor_2d(lw.o_proj_w,    cp_hidden_, q_dim_,     ACL_FLOAT16);
         // Norms kept F32 to match GGUF storage + aclnnRmsNorm SupportInfo[0].
         lt.q_norm    = tensor_1d(lw.q_norm_w,    head_dim_,  ACL_FLOAT);
         lt.k_norm    = tensor_1d(lw.k_norm_w,    head_dim_,  ACL_FLOAT);
-        lt.gate_proj = tensor_2d_fmt(lw.gate_proj_w, inter_,     cp_hidden_, ACL_FLOAT16, wfmt);
-        lt.up_proj   = tensor_2d_fmt(lw.up_proj_w,   inter_,     cp_hidden_, ACL_FLOAT16, wfmt);
-        lt.down_proj = tensor_2d_fmt(lw.down_proj_w, cp_hidden_, inter_,     ACL_FLOAT16, wfmt);
+        lt.gate_proj = tensor_2d(lw.gate_proj_w, inter_,     cp_hidden_, ACL_FLOAT16);
+        lt.up_proj   = tensor_2d(lw.up_proj_w,   inter_,     cp_hidden_, ACL_FLOAT16);
+        lt.down_proj = tensor_2d(lw.down_proj_w, cp_hidden_, inter_,     ACL_FLOAT16);
         lt.input_ln  = tensor_1d(lw.input_ln_w,  cp_hidden_, ACL_FLOAT);
         lt.post_ln   = tensor_1d(lw.post_ln_w,   cp_hidden_, ACL_FLOAT);
     }
@@ -1035,9 +1038,39 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
                 t_.normed_row, t_.rstd_11);
 
-        CANN_OP(Mm, lt.q_proj, t_.normed_col, t_.q_col, /*cubeMathType=*/0);
-        CANN_OP(Mm, lt.k_proj, t_.normed_col, t_.k_col, /*cubeMathType=*/0);
-        CANN_OP(Mm, lt.v_proj, t_.normed_col, t_.v_col, /*cubeMathType=*/0);
+        // M5.3: Q/K/V projections. NZ path swaps operands to satisfy
+        // aclnnMatmulWeightNz's self:ND / mat2:NZ contract. Semantically
+        // identical to the ND path: [out,1] = W[out,in] @ x[in,1]  ≡
+        //                            [1,out] = x^T[1,in] @ W^T[in,out].
+        if (nz_applied_) {
+            auto wT_nz = [&](void *buf, int64_t rows, int64_t cols) {
+                int64_t shape[2]   = {cols, rows};
+                int64_t strides[2] = {1, cols};
+                return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
+                                    ACL_FORMAT_FRACTAL_NZ);
+            };
+            aclTensor *t_wq_T = wT_nz(layer_w_[il].q_proj_w, q_dim_,  cp_hidden_);
+            aclTensor *t_wk_T = wT_nz(layer_w_[il].k_proj_w, kv_dim_, cp_hidden_);
+            aclTensor *t_wv_T = wT_nz(layer_w_[il].v_proj_w, kv_dim_, cp_hidden_);
+            aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_);
+            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_);
+            aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_);
+            CANN_OP(Mm, t_n_row, t_wq_T, t_q_row, (int8_t)0);
+            CANN_OP(Mm, t_n_row, t_wk_T, t_k_row, (int8_t)0);
+            CANN_OP(Mm, t_n_row, t_wv_T, t_v_row, (int8_t)0);
+            g_cann.aclDestroyTensor(t_wq_T);
+            g_cann.aclDestroyTensor(t_wk_T);
+            g_cann.aclDestroyTensor(t_wv_T);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_k_row);
+            g_cann.aclDestroyTensor(t_v_row);
+        } else {
+            CANN_OP(Mm, lt.q_proj, t_.normed_col, t_.q_col, /*cubeMathType=*/0);
+            CANN_OP(Mm, lt.k_proj, t_.normed_col, t_.k_col, /*cubeMathType=*/0);
+            CANN_OP(Mm, lt.v_proj, t_.normed_col, t_.v_col, /*cubeMathType=*/0);
+        }
 
         CANN_OP(RmsNorm, t_.q_heads, lt.q_norm, (double)eps_,
                 t_.q_heads, t_.rstd_heads);
@@ -1178,8 +1211,23 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         g_cann.aclDestroyTensor(t_attn_out_bsnd);
         // t_k_bsnd / t_v_bsnd are owned by the destroyed lists — no free here.
 
-        CANN_OP(Mm, lt.o_proj, t_.q_col, t_.o_out_col,
-                /*cubeMathType=*/0);
+        // M5.3: O projection. NZ path swaps operands.
+        if (nz_applied_) {
+            int64_t wT_shape[2]   = {(int64_t)q_dim_, (int64_t)cp_hidden_};
+            int64_t wT_strides[2] = {1, (int64_t)q_dim_};
+            aclTensor *t_wo_T = make_tensor(layer_w_[il].o_proj_w, 2, wT_shape,
+                                             wT_strides, ACL_FLOAT16,
+                                             ACL_FORMAT_FRACTAL_NZ);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_);
+            aclTensor *t_o_row = tensor_2d(o_out_dev_, 1, cp_hidden_);
+            CANN_OP(Mm, t_q_row, t_wo_T, t_o_row, (int8_t)0);
+            g_cann.aclDestroyTensor(t_wo_T);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_o_row);
+        } else {
+            CANN_OP(Mm, lt.o_proj, t_.q_col, t_.o_out_col,
+                    /*cubeMathType=*/0);
+        }
 
         // cur = residual + o_out  (F16 add)
         CANN_OP(Add, t_.residual_flat, t_.o_out_flat, one_scalar_,
@@ -1194,14 +1242,43 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         CANN_OP(RmsNorm, t_.cur_row, lt.post_ln, (double)eps_,
                 t_.normed_row, t_.rstd_11);
 
-        CANN_OP(Mm, lt.gate_proj, t_.normed_col, t_.gate_col,
-                /*cubeMathType=*/0);
-        CANN_OP(Mm, lt.up_proj,   t_.normed_col, t_.up_col,
-                /*cubeMathType=*/0);
-        CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
-        CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
-        CANN_OP(Mm, lt.down_proj, t_.gate_col, t_.ffn_out_col,
-                /*cubeMathType=*/0);
+        // M5.3: FFN gate/up/down. NZ path swaps operands as above.
+        if (nz_applied_) {
+            auto wT_nz = [&](void *buf, int64_t rows, int64_t cols) {
+                int64_t shape[2]   = {cols, rows};
+                int64_t strides[2] = {1, cols};
+                return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
+                                    ACL_FORMAT_FRACTAL_NZ);
+            };
+            aclTensor *t_wg_T = wT_nz(layer_w_[il].gate_proj_w, inter_,      cp_hidden_);
+            aclTensor *t_wu_T = wT_nz(layer_w_[il].up_proj_w,   inter_,      cp_hidden_);
+            aclTensor *t_wd_T = wT_nz(layer_w_[il].down_proj_w, cp_hidden_,  inter_);
+            aclTensor *t_n_row    = tensor_2d(normed_dev_, 1, cp_hidden_);
+            aclTensor *t_gate_row = tensor_2d(gate_dev_, 1, inter_);
+            aclTensor *t_up_row   = tensor_2d(up_dev_,   1, inter_);
+            aclTensor *t_ffn_row  = tensor_2d(ffn_out_dev_, 1, cp_hidden_);
+            CANN_OP(Mm, t_n_row, t_wg_T, t_gate_row, (int8_t)0);
+            CANN_OP(Mm, t_n_row, t_wu_T, t_up_row,   (int8_t)0);
+            CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
+            CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
+            CANN_OP(Mm, t_gate_row, t_wd_T, t_ffn_row, (int8_t)0);
+            g_cann.aclDestroyTensor(t_wg_T);
+            g_cann.aclDestroyTensor(t_wu_T);
+            g_cann.aclDestroyTensor(t_wd_T);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_gate_row);
+            g_cann.aclDestroyTensor(t_up_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else {
+            CANN_OP(Mm, lt.gate_proj, t_.normed_col, t_.gate_col,
+                    /*cubeMathType=*/0);
+            CANN_OP(Mm, lt.up_proj,   t_.normed_col, t_.up_col,
+                    /*cubeMathType=*/0);
+            CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
+            CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
+            CANN_OP(Mm, lt.down_proj, t_.gate_col, t_.ffn_out_col,
+                    /*cubeMathType=*/0);
+        }
 
         // cur = residual + ffn_out  (F16 add)
         CANN_OP(Add, t_.residual_flat, t_.ffn_out_flat, one_scalar_,

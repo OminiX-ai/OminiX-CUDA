@@ -188,6 +188,37 @@ struct CannSyms {
                                            aclOpExecutor *executor,
                                            aclrtStream stream);
 
+    // ---- aclnnMatmulWeightNz (M5.3, CANN 8.5+) -----------------------------
+    // Explicit NZ matmul: self = activation (ND), mat2 = weight (NZ layout,
+    // pre-converted via aclnnTransMatmulWeight). Computes self @ mat2 just
+    // like aclnnMm, but actually consumes the NZ-laid-out weight buffer
+    // instead of silently treating it as ND (which is what plain aclnnMm does
+    // on CANN 8.3 and produces garbled output). Signature identical to
+    // aclnnMm / aclnnMmGetWorkspaceSize. Per aclnn_matmul.h in CANN 8.5.
+    // Capability gated via has_matmul_weight_nz().
+    aclnnStatus (*aclnnMatmulWeightNzGetWorkspaceSize)(
+        const aclTensor *self, const aclTensor *mat2, aclTensor *out,
+        int8_t cubeMathType, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnMatmulWeightNz)(void *workspace, uint64_t workspaceSize,
+                                        aclOpExecutor *executor,
+                                        aclrtStream stream);
+
+    // ---- aclnnBatchMatMulWeightNz (M5.3, CANN 8.5+) -------------------------
+    // Batched NZ matmul — reserved for future multi-batch paths. Not used by
+    // the single-token decode / single-batch prefill matmul call sites but
+    // surfaced here for symmetry so callers that grow into batched matmuls
+    // can check has_matmul_weight_nz() and dispatch the batched variant
+    // without another symbol-table bump. Per aclnn_batch_matmul.h in CANN 8.5.
+    aclnnStatus (*aclnnBatchMatMulWeightNzGetWorkspaceSize)(
+        const aclTensor *self, const aclTensor *mat2, aclTensor *out,
+        int8_t cubeMathType, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnBatchMatMulWeightNz)(void *workspace,
+                                             uint64_t workspaceSize,
+                                             aclOpExecutor *executor,
+                                             aclrtStream stream);
+
     // ---- aclGraph (aclmdlRI*) — runtime graph capture/replay ---------------
     // Present on CANN 8.3+. The aclmdlRI / aclmdlRICaptureMode types come from
     // `acl/acl_rt.h` (pulled in transitively by `acl/acl.h` above). If the
@@ -219,6 +250,17 @@ struct CannSyms {
     bool has_nz() const {
         return aclnnTransMatmulWeightGetWorkspaceSize != nullptr &&
                aclnnTransMatmulWeight                 != nullptr;
+    }
+
+    // Capability flag for aclnnMatmulWeightNz (M5.3, CANN 8.5+). When present,
+    // the engines dispatch this op at matmul call sites instead of plain
+    // aclnnMm so the pre-converted NZ weight buffer is actually consumed. On
+    // older CANN toolkits (8.3) this resolves nullptr and callers stay on
+    // plain aclnnMm. Independent from has_nz(): even if TransMatmulWeight is
+    // available, without MatmulWeightNz the NZ layout is dead weight.
+    bool has_matmul_weight_nz() const {
+        return aclnnMatmulWeightNzGetWorkspaceSize != nullptr &&
+               aclnnMatmulWeightNz                 != nullptr;
     }
 };
 
