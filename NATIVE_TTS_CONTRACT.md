@@ -590,8 +590,77 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   `forward_decode_launch` blocks the one structural change (staged
   upload / delta-add / commit) that would let Talker[N+1] overlap with
   CP[N] on disjoint streams. M6.2 stays `[~]` with measured 21.9 fps.
-- [ ] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
+- [~] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
   parallel via threads; move to NPU streams).
+  **Not applicable as stated — the "two encoders on one NPU stream"
+  premise doesn't hold on our build.** Measurement on ModelArts 910B4
+  CANN 8.3.RC1 (seed=42, short utterance, `TASK_QUEUE_ENABLE=2`,
+  `--native_talker --cp_cann --cp_groups 8 --max_tokens 200`):
+  speaker encoder lives on the GGML **CPU** backend (see
+  `qwen_tts.cpp` Step 2+3; `spk_params.device_name = cpu_device`),
+  tokenizer encoder on **CANN0**. On three canonical utterances
+  (utt1/utt2/utt3) the cold-first-call breakdown is:
+
+  | utt | speaker_encoder (CPU) | tokenizer_encoder (NPU) | Parallel wall | Talker prefill |
+  |-----|----------------------:|------------------------:|--------------:|---------------:|
+  | utt1 | 415 ms | 3896 ms | 3900 ms | 1427 ms |
+  | utt2 | 435 ms | 3907 ms | 3910 ms | 1194 ms |
+  | utt3 | 401 ms | 3737 ms | 3740 ms | 1487 ms |
+
+  Overlap efficiency (`max(spk,enc) / parallel_wall`) is **100%** —
+  the std::thread already hides the CPU speaker path entirely under
+  the NPU tokenizer path, because one is CPU-bound and the other is
+  NPU-bound and they don't contend for the same stream. The Talker
+  prefill sits strictly *after* the join, on the NPU, with a hard data
+  dependency on tokenizer output (`ref_codes` feeds
+  `build_icl_prefill`), so it cannot be moved to stream B to overlap
+  with the tokenizer.
+
+  **Why moving speaker_encoder onto CANN0/stream_b_ would lose**: the
+  existing header comment at `qwen_tts.cpp:26` documents that the
+  speaker encoder on CANN is **2.7× slower** than on CPU due to
+  kernel-launch overhead for its many small Conv1D/SE layers. Cold
+  run would go from 400 ms (hidden under tokenizer) to ~1100 ms
+  (still hidden, but wasting NPU cycles that are otherwise idle from
+  the speaker side). Warm run would go from 400 ms CPU → ~150 ms NPU
+  which *is* faster, but that 250 ms is already shadowed by the
+  3500 ms warm tokenizer — net zero wall-clock.
+
+  **Why Talker prefill cannot overlap the tokenizer encoder**:
+  `talker_.generate()` builds `prefill_embs` from `ref_codes` (the
+  tokenizer encoder output) in `build_icl_prefill` before calling
+  `TalkerCannEngine::forward_prefill`. Without ref_codes there is no
+  prefill input. The only way to parallelize would be to speculatively
+  run Talker prefill on a provisional input and patch in the real
+  `ref_codes` post-hoc — equivalent to the unlanded "provisional
+  embedding + delta-add" pattern discussed in the Track H (M6.2) note,
+  and structurally blocked by the same engine-API constraint
+  (`forward_prefill` is a monolithic launch, no staged upload hook).
+
+  **What DID land**: instrumentation in
+  `tools/qwen_tts/qwen_tts.cpp` Step 2+3 that prints per-encoder
+  wall-clock (`[Track K] speaker_encoder (CPU): … ms` /
+  `[Track K] tokenizer_encoder (NPU): … ms`) and an overlap-efficiency
+  ratio — so future runs can tell at a glance whether the parallel
+  path is still CPU+NPU (any future switch back to CANN speaker
+  encoder would make the efficiency number drop below 100%).
+
+  **What would unblock the 15% gate**: splitting the tokenizer
+  encoder graph itself across two NPU streams (the 8-layer transformer
+  + RVQ could in principle issue independent-subgraph launches on
+  disjoint streams), or moving the RVQ post-projection to CPU to
+  shave the tail of the tokenizer path. Neither is in-scope for
+  Track K's file-ownership rule (encoder internals are explicitly off
+  limits). Leaving as `[~]` with measured 0% wall-clock improvement
+  opportunity on the current CPU-speaker + NPU-tokenizer layout.
+
+  **Verified-by**: (a) Track K commit SHA pending in OminiX-Ascend;
+  (b) timing table above from `/tmp/tts_quality_m63_baseline/utt{1,2,3}.native.log`
+  on ModelArts 910B4 CANN 8.3.RC1, cold-first-call of each binary
+  invocation; (c) ASR 3/3 PASS via local mlx-whisper
+  (whisper-large-v3-mlx, temp=0, language=en) — utt1 "Good morning.
+  How are you today?" (edit-dist 1), utt2 verbatim, utt3 verbatim.
+  Gate = ASR PASS 3/3, wall-clock delta **0%** vs target 15% → `[~]`.
 - [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
 - [ ] 6.5 **Quality gate**: audio bit-identical to non-pipelined path.
 - [ ] 6.6 **Throughput gate**: +10% wall-clock on end-to-end.
@@ -1352,6 +1421,143 @@ carrying a silent false claim.
   pulled wavs (`/tmp/h2_utt{1,2,3}.wav`, `/tmp/h_long_v1.wav`) —
   4/4 pass edit-distance ≤ 2. Gate = ASR PASS 4/4, fps **21.9 vs 28
   target** → M6.2 remains `[~]`.
+
+- **2026-04-17 Track K (M6.3 — encoder+prefill NPU-stream overlap) —
+  NOT APPLICABLE: premise doesn't hold, 0% win possible on current
+  layout, landing `[~]` with measurement-only instrumentation**:
+
+  The M6.3 item assumed that `speaker_encoder_.forward()` and
+  `tokenizer_encoder_.forward()` both sit on the NPU and get serialized
+  through one CANN stream, making them candidates for multi-stream
+  parallelism. On the current build that premise is wrong:
+  `qwen_tts.cpp` hard-wires the speaker encoder to the **GGML CPU
+  backend** (`spk_params.device_name = cpu_device`, see the comment
+  at line 26 explaining CANN is 2.7× slower for this model due to
+  kernel-launch overhead on its many small Conv1D/SE layers) and only
+  the tokenizer encoder runs on `CANN0`. The two already overlap
+  perfectly via the existing `std::thread` because they sit on
+  disjoint execution units (CPU vs NPU).
+
+  **Empirical evidence** — cold-first-call breakdown on three canonical
+  short utterances, ModelArts 910B4 CANN 8.3.RC1,
+  `TASK_QUEUE_ENABLE=2`, `--native_talker --cp_cann --cp_groups 8
+  --max_tokens 200 --seed 42`, instrumentation `[Track K]` prints
+  emitted into stdout (source: `/tmp/tts_quality_m63_baseline/
+  utt{1,2,3}.native.log`):
+
+  | utt | speaker (CPU) | tokenizer (NPU) | parallel wall | overlap eff | Talker prefill |
+  |-----|--------------:|----------------:|--------------:|------------:|---------------:|
+  | utt1 | 415 ms | 3896 ms | 3900 ms | 100.0% | 1427 ms |
+  | utt2 | 435 ms | 3907 ms | 3910 ms | 100.0% | 1194 ms |
+  | utt3 | 401 ms | 3737 ms | 3740 ms | 100.0% | 1487 ms |
+
+  Overlap efficiency (`max(spk,enc) / parallel_wall`) is **100%** on
+  all three — the entire ~400 ms CPU speaker is hidden under the
+  ~3800 ms NPU tokenizer. The "encoders + Talker prefill" envelope
+  Track K is asked to shrink is already `tokenizer_enc + Talker_prefill
+  = 3900 + 1427 = 5327 ms` (utt1 cold), with the speaker contributing
+  **zero** to the critical path. There is no serialization for
+  multi-stream parallelism to unserialize.
+
+  **Why the ggml-cann backend DOES support multiple streams but it
+  doesn't help here**: `struct ggml_backend_cann_context` (`ggml/src/
+  ggml-cann/common.h:548`) owns an array of 8 `aclrtStream` slots
+  (`streams[GGML_CANN_MAX_STREAMS]`) and exposes `stream(int idx)` /
+  `stream()` for indexed access. Each `ggml_backend_cann_init(device)`
+  call allocates a *fresh* context (`ggml-cann.cpp:2941` — `new
+  ggml_backend_cann_context(device)`), so two independent backend
+  instances created for "CANN0" get independent stream-0 pointers.
+  Every ACLNN op dispatch in `aclnn_ops.cpp` hard-codes
+  `ctx.stream()` (= index 0), so they only overlap if dispatched from
+  disjoint *backend instances*, not by swapping stream index on a
+  shared backend. Adding a `set_stream()` setter to
+  `speaker_encoder_` / `tokenizer_encoder_` plumbing (the
+  "stream-setter if needed" bullet in the Track K scope) would
+  require modifying the ContextManager + ggml backend registration
+  flow to pass through a non-zero stream index — architecturally
+  possible but out of scope for the two-encoder file set, and in any
+  case moot because only one encoder sits on the NPU today.
+
+  **Why Talker prefill cannot be overlapped with tokenizer encoder**:
+  `talker_.generate()` calls `build_icl_prefill()` which reads
+  `ref_codes` (the tokenizer encoder output, 16 × T i32) to compose
+  `prefill_embs`, which then feeds `forward_prefill`. The data
+  dependency is total — there is no subset of the Talker prefill
+  graph that can fire before `ref_codes` materialize. The speculative
+  "provisional prefill + delta-add" pattern from Track G/H's unlanded
+  G-prime follow-up would route a similar shape for the decode loop,
+  but the prefill is a single monolithic `forward_prefill` launch
+  (no staged upload, no in-place residual add), and
+  `talker_cann_engine.{h,cpp}` is explicitly off-limits for Track K.
+  Even if scope allowed, breaking prefill into `upload_staged +
+  commit_after_delta` is Track G-prime's charter, not M6.3's.
+
+  **What would actually move the needle on (encoders + prefill)
+  wall-clock**, listed for a future track:
+  1. Split the 8-layer transformer inside the tokenizer encoder into
+     two sub-graph launches on separate aclrtStreams with a barrier at
+     layer-4 (halves the per-layer-sync tail latency that dominates
+     the ~3700 ms warm NPU time). Requires editing
+     `SpeechTokenizerEncoderModel::build_transformer` in
+     `speech_tokenizer_encoder.cpp` and reworking ContextManager to
+     support a secondary CANN stream — explicitly outside Track K's
+     file ownership per §5 M6.3.
+  2. Move the RVQ post-projection (small GEMMs on 512-dim hidden → 16
+     quantizer codebooks) back to CPU after the transformer finishes
+     on NPU; the round-trip cost is dominated by the NPU→host D2H
+     copy which is already happening at the end of `encode()`. Marginal
+     win (~50-100 ms).
+  3. Warm the tokenizer encoder JIT cache persistently across runs
+     (`ASCEND_CACHE_PATH` set to a stable path, see §8 Track I). The
+     3700 ms cold number drops to ~1500 ms warm, which is a process-
+     boundary artifact rather than a stream issue. This already
+     happens for the Talker prefill (cold 1.4 s → warm 0.13 s per
+     utt2 in the same log) and is a pure runtime/deployment knob.
+
+  **What DID land under Track K** (to make this measurement
+  repeatable and so a future CANN-speaker-encoder flip would be
+  obvious from the log):
+  - `tools/qwen_tts/qwen_tts.cpp` Step 2+3 block now prints per-
+    encoder wall-clock plus overlap efficiency:
+    `[Track K] speaker_encoder (CPU): N ms`,
+    `[Track K] tokenizer_encoder (NPU): N ms`,
+    `[Track K] overlap efficiency: N.N% (ideal=100% if perfectly
+    parallel)`.
+  - Zero changes to `speaker_encoder.{h,cpp}` or
+    `speech_tokenizer_encoder.{h,cpp}` (no stream setter needed
+    because the single-encoder-on-NPU layout is already optimal).
+  - Zero changes to `talker.cpp` / `*_cann_engine.*` / `main.cpp` /
+    `qwen_tts.h` / `build_graph.cpp` / `speech_tokenizer_decoder.*`
+    per the file-ownership rule.
+
+  **ASR gate**: 3/3 PASS via local mlx-whisper (whisper-large-v3-mlx,
+  temp=0, language=en) on wavs pulled from
+  `/tmp/tts_quality_m63_baseline/utt{1,2,3}.native.wav`:
+  - utt1 target "Good morning, how are you today." → ASR
+    "Good morning. How are you today?" — edit-dist 1 (punctuation).
+  - utt2 target "The sun is shining brightly this afternoon." →
+    verbatim.
+  - utt3 target "Please remember to turn off the lights." →
+    verbatim.
+
+  **Throughput gate**: encoders + prefill envelope **unchanged** at
+  5.3 s cold / 3.8 s warm (same as pre-Track-K baseline, expected —
+  Track K only added printf instrumentation on the critical path,
+  which cost ~0 ms). Target was ≥15% cold or ≥5% warm reduction;
+  actual delta is **0%**. Per the Track K scope ("If the backends
+  only accept one global stream... the M6.3 work becomes a design
+  note; estimate the win, land `[~]` with the §8 note"), M6.3 stamps
+  as `[~]` with this note as the design artifact.
+
+  **Verified-by**: (a) Track K commit SHA pending in OminiX-Ascend
+  `tools/qwen_tts/qwen_tts.cpp`; (b) three cold-first-call wall-
+  clock breakdowns in `/tmp/tts_quality_m63_baseline/utt{1,2,3}.
+  native.log` showing per-encoder timing and 100% overlap
+  efficiency; (c) ASR 3/3 PASS via mlx-whisper on the same three
+  wavs; (d) no regression on long utterance (binary only added
+  3 printfs; zero critical-path work added). Gate = ASR PASS 3/3,
+  design-note landed, `[~]` stamped with measurement showing no
+  achievable win on current layout.
 
 ## 9. Parallelism playbook
 

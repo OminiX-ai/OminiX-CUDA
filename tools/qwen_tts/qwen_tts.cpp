@@ -269,23 +269,44 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     }
 
     // Step 2+3: Speaker embedding + Audio encoding (parallel)
+    //
+    // Track K / M6.3 note: the two encoders live on disjoint resources:
+    //   - speaker encoder: CPU (GGML CPU backend — see `load()`; CANN is 2.7× slower here)
+    //   - tokenizer encoder: NPU (CANN0 when n_gpu_layers>0)
+    //
+    // Because they sit on different execution units, they already overlap
+    // trivially via std::thread without needing distinct aclrtStreams. A
+    // secondary NPU stream buys nothing when only one of the two halves is
+    // actually on the NPU. Adding per-encoder timing below to quantify who
+    // dominates the "Parallel time" wall-clock and how much overlap is real.
     printf("\n--- Step 2+3: Speaker + Encoder (parallel) ---\n");
     auto t0 = std::chrono::high_resolution_clock::now();
 
     bool spk_ok = false, enc_ok = false;
+    double spk_only_ms = 0.0, enc_only_ms = 0.0;
 
     // Run speaker encoder in a separate thread
     std::thread spk_thread([&]() {
+        auto s0 = std::chrono::high_resolution_clock::now();
         spk_ok = speaker_encoder_.extract(ref_audio, 24000, spk_embedding);
+        auto s1 = std::chrono::high_resolution_clock::now();
+        spk_only_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
     });
 
     // Run audio encoder in main thread
+    auto e0 = std::chrono::high_resolution_clock::now();
     enc_ok = tokenizer_encoder_.encode(ref_audio, ref_codes, &encoder_hidden);
+    auto e1 = std::chrono::high_resolution_clock::now();
+    enc_only_ms = std::chrono::duration<double, std::milli>(e1 - e0).count();
 
     spk_thread.join();
 
     auto t1 = std::chrono::high_resolution_clock::now();
     double parallel_time = std::chrono::duration<double>(t1 - t0).count();
+    printf("  [Track K] speaker_encoder (CPU): %.0f ms\n", spk_only_ms);
+    printf("  [Track K] tokenizer_encoder (NPU): %.0f ms\n", enc_only_ms);
+    printf("  [Track K] overlap efficiency: %.1f%% (ideal=100%% if perfectly parallel)\n",
+           100.0 * std::max(spk_only_ms, enc_only_ms) / (parallel_time * 1000.0));
 
     if (!spk_ok) { printf("FAIL: speaker embedding extraction failed\n"); return false; }
     if (!enc_ok) { printf("FAIL: audio encoding failed\n"); return false; }
