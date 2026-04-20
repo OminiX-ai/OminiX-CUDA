@@ -830,6 +830,10 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
 
     // x-vector mode starts from a cold decoder state; the first ~150 ms
     // carry the same settle ripple we trim on the ICL ref/gen boundary.
+    // (Attempted a 30 ms trim to avoid clipping the first syllable, but
+    // A/B with the llama.cpp fallback showed xvec has a pervasive
+    // speaker-pipeline rumble that the short trim exposes without any
+    // offsetting benefit — see tracked issue "xvec rumble".)
     const int cold_start_trim = 3600;  // 150 ms at 24 kHz
     if ((int)full_audio.size() > cold_start_trim) {
         audio_out.assign(full_audio.begin() + cold_start_trim, full_audio.end());
@@ -880,7 +884,7 @@ bool QwenTTS::generate_customvoice(const QwenTTSParams& params, std::vector<floa
         return false;
     }
 
-    // Cold-start decoder settle — same 150 ms trim as xvec (see ICL notes).
+    // Cold-start decoder settle — same 150 ms trim as xvec.
     const int cold_start_trim = 3600;
     if ((int)full_audio.size() > cold_start_trim) {
         audio_out.assign(full_audio.begin() + cold_start_trim, full_audio.end());
