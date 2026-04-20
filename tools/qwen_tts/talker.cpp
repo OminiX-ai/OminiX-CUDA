@@ -2354,15 +2354,25 @@ bool TalkerLLM::generate_xvec(
     int max_new_tokens,
     const TalkerSamplingParams &sampling) {
 
-#if !defined(QWEN_TTS_LLAMA)
-    (void)target_text_tokens; (void)spk_embedding; (void)language;
-    (void)codec_tokens; (void)max_new_tokens; (void)sampling;
-    printf("[talker] x-vec mode requires llama.cpp "
-           "(build with -DQWEN_TTS_LLAMA=ON; native Talker does not yet implement "
-           "MRoPE 4×pos)\n");
-    return false;
+    // B6.2 — Dispatch: native TalkerCannEngine (when available and its
+    // GGUF carries `qwen3.rope.dimension_sections` so set_use_mrope_xvec_layout
+    // can take effect) → llama.cpp fallback → unavailable.
+    const bool use_native_talker =
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        talker_use_cann_ && talker_cann_engine_ != nullptr;
 #else
-    if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+        false;
+#endif
+#if !defined(QWEN_TTS_LLAMA)
+    if (!use_native_talker) {
+        (void)target_text_tokens; (void)spk_embedding; (void)language;
+        (void)codec_tokens; (void)max_new_tokens; (void)sampling;
+        printf("[talker] x-vec mode: no backbone available "
+               "(native TalkerCannEngine not ready and llama.cpp not compiled in)\n");
+        return false;
+    }
+#endif
+
     int dim = n_embd_;
     int n_groups = talker_config_.num_code_groups;
     auto gen_t0 = std::chrono::high_resolution_clock::now();
@@ -2375,30 +2385,74 @@ bool TalkerLLM::generate_xvec(
     if (!build_xvec_prefill(target_text_tokens, spk_embedding, language,
                             prefill_embs, prefill_len)) return false;
 
-    // Prefill
-    llama_memory_clear(llama_get_memory(llama_ctx_), true);
-    llama_batch batch = llama_batch_init(prefill_len, dim, 1);
-    batch.n_tokens = prefill_len;
-    memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
-    // MRoPE: position tensor needs 4× entries [temporal, h, w, extra]
-    // TTS uses temporal only: h=w=extra=0
-    free(batch.pos);
-    batch.pos = (llama_pos *)calloc(4 * prefill_len, sizeof(llama_pos));
-    for (int i = 0; i < prefill_len; i++) {
-        batch.pos[i] = i;  // temporal positions; h/w/extra = 0 (calloc)
-        batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
-    }
-    printf("[talker] x-vec prefill %d tokens (MRoPE 4×pos)...\n", prefill_len);
-    if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
-    llama_batch_free(batch);
-
-    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
-    if (!embd) return false;
     std::vector<float> hidden(dim);
-    memcpy(hidden.data(), embd, dim * sizeof(float));
 
-    // Autoregressive loop (same as ICL generate)
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    // Flip the engine into sector-aware RoPE layout for this call. The
+    // engine's setter is a no-op when mrope_temporal_section_ is unset in
+    // the GGUF (prints a diagnostic and returns false); we detect that via
+    // use_mrope_xvec_layout() and fall back to llama.cpp in that case.
+    struct MropeLayoutGuard {
+        TalkerCannEngine *eng;
+        bool prev;
+        ~MropeLayoutGuard() { if (eng) eng->set_use_mrope_xvec_layout(prev); }
+    };
+    MropeLayoutGuard mrope_guard = { nullptr, false };
+    bool dispatch_native = use_native_talker;
+    if (use_native_talker) {
+        bool prev = talker_cann_engine_->use_mrope_xvec_layout();
+        talker_cann_engine_->set_use_mrope_xvec_layout(true);
+        if (!talker_cann_engine_->use_mrope_xvec_layout()) {
+            // Setter refused — metadata missing. Fall back to llama.cpp.
+            printf("[talker] x-vec: native engine lacks mrope_section metadata; "
+                   "falling back to llama.cpp\n");
+            dispatch_native = false;
+        } else {
+            mrope_guard = { talker_cann_engine_, prev };
+        }
+    }
+#else
+    const bool dispatch_native = false;
+#endif
+
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (dispatch_native) {
+        printf("[talker] x-vec prefill %d tokens (native TalkerCannEngine, "
+               "mrope_xvec_layout on)...\n", prefill_len);
+        talker_cann_engine_->reset_kv_cache();
+        talker_cann_engine_->forward_prefill(prefill_embs.data(), prefill_len,
+                                              0, hidden.data());
+    } else
+#endif
+    {
+#if defined(QWEN_TTS_LLAMA)
+        if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+        llama_memory_clear(llama_get_memory(llama_ctx_), true);
+        llama_batch batch = llama_batch_init(prefill_len, dim, 1);
+        batch.n_tokens = prefill_len;
+        memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
+        // MRoPE: position tensor needs 4× entries [temporal, h, w, extra]
+        // TTS uses temporal only: h=w=extra=0
+        free(batch.pos);
+        batch.pos = (llama_pos *)calloc(4 * prefill_len, sizeof(llama_pos));
+        for (int i = 0; i < prefill_len; i++) {
+            batch.pos[i] = i;  // temporal positions; h/w/extra = 0 (calloc)
+            batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
+            batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
+        }
+        printf("[talker] x-vec prefill %d tokens (llama.cpp MRoPE 4×pos)...\n", prefill_len);
+        if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
+        llama_batch_free(batch);
+
+        float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        if (!embd) return false;
+        memcpy(hidden.data(), embd, dim * sizeof(float));
+#else
+        return false;
+#endif
+    }
+
+    // Autoregressive loop (shared by native + llama.cpp paths).
     int cur_pos = prefill_len;
     int vocab_size = talker_config_.vocab_size;
     std::vector<float> logits_buf(vocab_size), next_emb(dim);
@@ -2434,23 +2488,34 @@ bool TalkerLLM::generate_xvec(
             for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
         }
 
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        if (dispatch_native) {
+            talker_cann_engine_->forward_decode(next_emb.data(), cur_pos, hidden.data());
+            cur_pos++;
+            continue;
+        }
+#endif
+#if defined(QWEN_TTS_LLAMA)
         // Forward one step (reuse pre-allocated batch)
         ensure_talker_step_batch();
         memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
         talker_step_batch_.pos[0] = cur_pos;
         if (llama_decode(llama_ctx_, talker_step_batch_) != 0) return false;
         cur_pos++;
-        embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
         if (!embd) return false;
         memcpy(hidden.data(), embd, dim * sizeof(float));
+#else
+        return false;
+#endif
     }
 
     auto gen_t1 = std::chrono::high_resolution_clock::now();
-    printf("[talker] x-vec generate: %d frames in %.1f ms\n",
+    printf("[talker] x-vec generate: %d frames in %.1f ms (%s)\n",
            (int)codec_tokens[0].size(),
-           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
+           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count(),
+           dispatch_native ? "native" : "llama.cpp");
     return true;
-#endif  // QWEN_TTS_LLAMA
 }
 
 // ============================================================================
@@ -2465,15 +2530,22 @@ bool TalkerLLM::generate_customvoice(
     int max_new_tokens,
     const TalkerSamplingParams &sampling) {
 
-#if !defined(QWEN_TTS_LLAMA)
-    (void)target_text_tokens; (void)speaker; (void)language;
-    (void)codec_tokens; (void)max_new_tokens; (void)sampling;
-    printf("[talker] customvoice mode requires llama.cpp "
-           "(build with -DQWEN_TTS_LLAMA=ON; native Talker does not yet implement "
-           "MRoPE 4×pos)\n");
-    return false;
+    // B6.2 — Same dispatch pattern as generate_xvec: native engine preferred
+    // when available and GGUF carries mrope_section; llama.cpp fallback.
+    const bool use_native_talker =
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        talker_use_cann_ && talker_cann_engine_ != nullptr;
 #else
-    if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+        false;
+#endif
+#if !defined(QWEN_TTS_LLAMA)
+    if (!use_native_talker) {
+        (void)target_text_tokens; (void)speaker; (void)language;
+        (void)codec_tokens; (void)max_new_tokens; (void)sampling;
+        printf("[talker] customvoice mode: no backbone available\n");
+        return false;
+    }
+#endif
 
     // Resolve speaker name to token ID
     auto spk_it = talker_config_.spk_ids.find(speaker);
@@ -2497,24 +2569,64 @@ bool TalkerLLM::generate_customvoice(
     if (!build_customvoice_prefill(target_text_tokens, spk_token_id, language,
                                    prefill_embs, prefill_len)) return false;
 
-    // Prefill
-    llama_memory_clear(llama_get_memory(llama_ctx_), true);
-    llama_batch batch = llama_batch_init(prefill_len, dim, 1);
-    batch.n_tokens = prefill_len;
-    memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
-    for (int i = 0; i < prefill_len; i++) {
-        batch.pos[i] = i;  batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
-    }
-    printf("[talker] customvoice prefill %d tokens (speaker=%s, id=%d)...\n",
-           prefill_len, speaker.c_str(), spk_token_id);
-    if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
-    llama_batch_free(batch);
-
-    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
-    if (!embd) return false;
     std::vector<float> hidden(dim);
-    memcpy(hidden.data(), embd, dim * sizeof(float));
+
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    struct MropeLayoutGuard {
+        TalkerCannEngine *eng;
+        bool prev;
+        ~MropeLayoutGuard() { if (eng) eng->set_use_mrope_xvec_layout(prev); }
+    };
+    MropeLayoutGuard mrope_guard = { nullptr, false };
+    bool dispatch_native = use_native_talker;
+    if (use_native_talker) {
+        bool prev = talker_cann_engine_->use_mrope_xvec_layout();
+        talker_cann_engine_->set_use_mrope_xvec_layout(true);
+        if (!talker_cann_engine_->use_mrope_xvec_layout()) {
+            printf("[talker] customvoice: native engine lacks mrope_section "
+                   "metadata; falling back to llama.cpp\n");
+            dispatch_native = false;
+        } else {
+            mrope_guard = { talker_cann_engine_, prev };
+        }
+    }
+#else
+    const bool dispatch_native = false;
+#endif
+
+#if defined(QWEN_TTS_HAS_CP_CANN)
+    if (dispatch_native) {
+        printf("[talker] customvoice prefill %d tokens (speaker=%s, id=%d, "
+               "native TalkerCannEngine)...\n",
+               prefill_len, speaker.c_str(), spk_token_id);
+        talker_cann_engine_->reset_kv_cache();
+        talker_cann_engine_->forward_prefill(prefill_embs.data(), prefill_len,
+                                              0, hidden.data());
+    } else
+#endif
+    {
+#if defined(QWEN_TTS_LLAMA)
+        if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+        llama_memory_clear(llama_get_memory(llama_ctx_), true);
+        llama_batch batch = llama_batch_init(prefill_len, dim, 1);
+        batch.n_tokens = prefill_len;
+        memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
+        for (int i = 0; i < prefill_len; i++) {
+            batch.pos[i] = i;  batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
+            batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
+        }
+        printf("[talker] customvoice prefill %d tokens (speaker=%s, id=%d, llama.cpp)...\n",
+               prefill_len, speaker.c_str(), spk_token_id);
+        if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
+        llama_batch_free(batch);
+
+        float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        if (!embd) return false;
+        memcpy(hidden.data(), embd, dim * sizeof(float));
+#else
+        return false;
+#endif
+    }
 
     // Autoregressive loop (same as x-vec/ICL)
     int cur_pos = prefill_len;
@@ -2551,23 +2663,34 @@ bool TalkerLLM::generate_customvoice(
             for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
         }
 
+#if defined(QWEN_TTS_HAS_CP_CANN)
+        if (dispatch_native) {
+            talker_cann_engine_->forward_decode(next_emb.data(), cur_pos, hidden.data());
+            cur_pos++;
+            continue;
+        }
+#endif
+#if defined(QWEN_TTS_LLAMA)
         llama_batch sb = llama_batch_init(1, dim, 1);
         sb.n_tokens = 1;  memcpy(sb.embd, next_emb.data(), dim * sizeof(float));
         sb.pos[0] = cur_pos;  sb.n_seq_id[0] = 1;  sb.seq_id[0][0] = 0;  sb.logits[0] = 1;
         if (llama_decode(llama_ctx_, sb) != 0) { llama_batch_free(sb); return false; }
         llama_batch_free(sb);
         cur_pos++;
-        embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
         if (!embd) return false;
         memcpy(hidden.data(), embd, dim * sizeof(float));
+#else
+        return false;
+#endif
     }
 
     auto gen_t1 = std::chrono::high_resolution_clock::now();
-    printf("[talker] customvoice generate: %d frames in %.1f ms\n",
+    printf("[talker] customvoice generate: %d frames in %.1f ms (%s)\n",
            (int)codec_tokens[0].size(),
-           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
+           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count(),
+           dispatch_native ? "native" : "llama.cpp");
     return true;
-#endif  // QWEN_TTS_LLAMA
 }
 
 // ============================================================================

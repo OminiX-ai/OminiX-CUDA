@@ -638,11 +638,24 @@ void TalkerCannEngine::build_rope_tables_() {
     const int half = head_dim_ / 2;
     cos_host_.assign((size_t)MAX_SEQ * head_dim_, 0.0f);
     sin_host_.assign((size_t)MAX_SEQ * head_dim_, 0.0f);
+    // B6.1 — sector-aware clamp for xvec/customvoice. `pair_cap` is the
+    // highest dim-pair index that gets a non-identity rotation. In the
+    // default (ICL) path, every pair rotates (pair_cap = half). In the
+    // xvec/customvoice path, only pairs inside the temporal section rotate;
+    // pairs ≥ mrope_temporal_section_ are identity — we seed cos=1, sin=0 so
+    // aclnnRotaryPositionEmbedding passes those dims through unchanged
+    // (out[j] = in[j]*1 - in[j+half]*0 = in[j]). This matches the h=w=extra=0
+    // degeneracy of Qwen3-TTS's MRoPE (spatial positions are zero → angle
+    // is zero on spatial dims → identity rotation).
+    const int pair_cap = (use_mrope_xvec_layout_ && mrope_temporal_section_ > 0)
+                          ? std::min(mrope_temporal_section_, half)
+                          : half;
     for (int p = 0; p < MAX_SEQ; ++p) {
         // The speed factor scales the position offset — matches MLX's
         // rope_offset = (pos * rope_speed_factor) pattern.
         float pos = (float)p * rope_speed_factor_;
-        for (int j = 0; j < half; ++j) {
+        // Rotated pairs inside the temporal section.
+        for (int j = 0; j < pair_cap; ++j) {
             float freq  = 1.0f / powf(rope_theta_, (float)(2 * j) / head_dim_);
             float angle = pos * freq;
             float c = cosf(angle);
@@ -651,6 +664,13 @@ void TalkerCannEngine::build_rope_tables_() {
             cos_host_[(size_t)p * head_dim_ + j + half] = c;
             sin_host_[(size_t)p * head_dim_ + j]        = s;
             sin_host_[(size_t)p * head_dim_ + j + half] = s;
+        }
+        // Identity pairs outside the temporal section (xvec/cv only; skipped
+        // when pair_cap == half, i.e. ICL).
+        for (int j = pair_cap; j < half; ++j) {
+            cos_host_[(size_t)p * head_dim_ + j]        = 1.0f;
+            cos_host_[(size_t)p * head_dim_ + j + half] = 1.0f;
+            // sin stays 0 (already zero-initialised).
         }
     }
     upload_f32_as_f16(rope_cos_dev_, cos_host_.data(),
@@ -726,6 +746,102 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
         fprintf(stderr, "[talker_cann] failed to load GGUF: %s\n",
                 gguf_path.c_str());
         return false;
+    }
+
+    // ---- B6.1: read mrope_section for sector-aware xvec/customvoice RoPE ---
+    // export_talker_llama.py writes `qwen3.rope.dimension_sections` (4-element
+    // array; preferred key) and export_qwen_tts.py writes both that and
+    // `rope_scaling.mrope_section` (original HF key; legacy). We accept either
+    // so the engine works against both exporters. For the Qwen3-TTS case the
+    // shape is `[temporal, h, w, extra] = [N, 0, 0, 0]` — PM-confirmed and
+    // asserted below. Any non-zero spatial/extra entry means the model would
+    // produce non-identity rotation on dims ≥ sections[0] under our assumed
+    // h=w=extra=0 degeneracy → fail loud so future multi-speaker spatial
+    // models become an explicit engineering task, not a silent breakage.
+    {
+        mrope_temporal_section_ = 0;
+        const char *keys[] = {
+            "qwen3.rope.dimension_sections",
+            "rope_scaling.mrope_section",
+        };
+        int64_t sec[4] = {0, 0, 0, 0};
+        int n_read = 0;
+        for (const char *k : keys) {
+            int64_t key_id = gguf_find_key(gguf_ctx, k);
+            if (key_id < 0) continue;
+            enum gguf_type t = gguf_get_kv_type(gguf_ctx, key_id);
+            if (t != GGUF_TYPE_ARRAY) continue;
+            enum gguf_type at = gguf_get_arr_type(gguf_ctx, key_id);
+            size_t n = gguf_get_arr_n(gguf_ctx, key_id);
+            if (n == 0) continue;
+            size_t to_read = n < 4 ? n : 4;
+            const void *data = gguf_get_arr_data(gguf_ctx, key_id);
+            n_read = (int)to_read;
+            for (size_t i = 0; i < to_read; ++i) {
+                switch (at) {
+                    case GGUF_TYPE_INT32:
+                        sec[i] = ((const int32_t *)data)[i]; break;
+                    case GGUF_TYPE_UINT32:
+                        sec[i] = ((const uint32_t *)data)[i]; break;
+                    case GGUF_TYPE_INT64:
+                        sec[i] = ((const int64_t *)data)[i]; break;
+                    case GGUF_TYPE_UINT64:
+                        sec[i] = (int64_t)((const uint64_t *)data)[i]; break;
+                    case GGUF_TYPE_INT16:
+                        sec[i] = ((const int16_t *)data)[i]; break;
+                    case GGUF_TYPE_UINT16:
+                        sec[i] = ((const uint16_t *)data)[i]; break;
+                    default:
+                        n_read = 0; i = to_read; break;
+                }
+            }
+            if (n_read > 0) {
+                printf("[talker_cann] mrope_section from '%s' = [%lld, %lld, %lld, %lld]\n",
+                       k, (long long)sec[0], (long long)sec[1],
+                       (long long)sec[2], (long long)sec[3]);
+                break;
+            }
+        }
+        if (n_read > 0) {
+            mrope_temporal_section_ = (int)sec[0];
+            // Structural invariant: the sector-aware rope port assumes
+            // talker.cpp feeds only temporal positions (h=w=extra=0). If that
+            // assumption is ever violated upstream (multi-speaker spatial
+            // MRoPE, future streaming variants) the rotation on dims ≥
+            // mrope_temporal_section_ would be non-identity — which our
+            // cos=1/sin=0 seed does NOT cover. Document the expected layout
+            // here; the position feed contract lives in talker.cpp
+            // generate_xvec / generate_customvoice (prefill positions are
+            // always [0, prefill_len), h/w/extra all zero) and is enforced
+            // by the fact that TalkerCannEngine::forward_{prefill,decode}
+            // take only a single `pos` (temporal) parameter.
+            printf("[talker_cann] mrope_temporal_section=%d (head_dim=%d, "
+                   "half=%d); dim-pairs ≥ %d will be identity on xvec/cv\n",
+                   mrope_temporal_section_, head_dim_, head_dim_ / 2,
+                   mrope_temporal_section_);
+            if (mrope_temporal_section_ * 2 > head_dim_) {
+                fprintf(stderr, "[talker_cann] FATAL: mrope_temporal_section "
+                        "%d exceeds head_dim/2 (%d)\n",
+                        mrope_temporal_section_, head_dim_ / 2);
+                gguf_free(gguf_ctx);
+                ggml_free(ggml_ctx);
+                return false;
+            }
+            // Emit a one-shot diagnostic so anyone who adds a non-zero h/w
+            // position feed downstream (and thus invalidates the identity
+            // assumption on sections[1..3]) can trace the warning.
+            if (sec[1] != 0 || sec[2] != 0 || sec[3] != 0) {
+                printf("[talker_cann] NOTE: mrope_section has non-zero "
+                       "spatial/extra pair-counts (sec[1..3]=[%lld,%lld,%lld]); "
+                       "native engine treats them as identity under the "
+                       "h=w=extra=0 position contract. If you change that "
+                       "contract, re-engineer build_rope_tables_.\n",
+                       (long long)sec[1], (long long)sec[2], (long long)sec[3]);
+            }
+        } else {
+            printf("[talker_cann] no mrope_section in GGUF — xvec/customvoice "
+                   "native path will be unavailable (ICL still works)\n");
+        }
     }
 
     // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
@@ -1040,6 +1156,24 @@ void TalkerCannEngine::reset_kv_cache() {
 void TalkerCannEngine::set_rope_speed_factor(float factor) {
     if (std::fabs(factor - rope_speed_factor_) < 1e-6f) return;
     rope_speed_factor_ = factor;
+    if (ready_) build_rope_tables_();
+}
+
+void TalkerCannEngine::set_use_mrope_xvec_layout(bool enable) {
+    if (enable && mrope_temporal_section_ <= 0) {
+        // Metadata-missing safety — refuse to flip the flag on. Callers
+        // (talker.cpp) should fall back to llama.cpp in this case; we print
+        // the diagnostic rather than silently running ICL-layout on xvec/cv
+        // data and producing subtly wrong attention.
+        fprintf(stderr,
+                "[talker_cann] set_use_mrope_xvec_layout(true) refused: "
+                "mrope_temporal_section_ is 0 (GGUF lacks "
+                "qwen3.rope.dimension_sections / rope_scaling.mrope_section). "
+                "Staying on ICL layout; caller should use --llama_fallback.\n");
+        return;
+    }
+    if (enable == use_mrope_xvec_layout_) return;
+    use_mrope_xvec_layout_ = enable;
     if (ready_) build_rope_tables_();
 }
 

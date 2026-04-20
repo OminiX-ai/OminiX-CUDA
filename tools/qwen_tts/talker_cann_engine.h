@@ -112,6 +112,36 @@ public:
     // change; cheap on subsequent forwards with unchanged factor.
     void set_rope_speed_factor(float factor);
 
+    // B6.1 — Sector-aware RoPE layout toggle for xvec / customvoice modes.
+    //
+    // Qwen3-TTS's HF config declares `mrope_section=[temporal, h, w, extra]`;
+    // the model was exported with h=w=extra=0 (spatial positions all zero —
+    // see export_talker_llama.py / export_qwen_tts.py), so on dim-pair
+    // indices inside the temporal section the rotation angle is
+    // `pos * inv_freq` (standard RoPE), and on dim-pair indices outside the
+    // temporal section the angle is `0 * inv_freq = 0` — i.e. identity
+    // (cos=1, sin=0). Native ICL uses the full-head standard-RoPE path and
+    // works because Talker's attention is invariant to the choice of RoPE
+    // axis pairing on the zero-rotation dims. xvec/customvoice were landed
+    // on the llama.cpp fallback because llama.cpp applies MRoPE with the
+    // GGUF sections verbatim — this flag lets the native engine reproduce
+    // the same sector-aware layout without adding a separate decode path.
+    //
+    // When `use_mrope_xvec_layout_` is true, build_rope_tables_ clamps the
+    // rotation to pair-indices < mrope_temporal_section_ (dims inside the
+    // temporal sector rotate normally; dim-pairs at index ≥ the section
+    // boundary get cos=1, sin=0, i.e. identity, matching the h=w=extra=0
+    // degenerate case). When false (default), every dim rotates — ICL's
+    // current behaviour, unchanged.
+    //
+    // Toggling rebuilds the cos/sin tables (same cheap path as
+    // set_rope_speed_factor). Callers (talker.cpp generate_xvec /
+    // generate_customvoice) flip this on before dispatch and reset to false
+    // on exit so subsequent ICL requests on the same engine handle are not
+    // affected.
+    void set_use_mrope_xvec_layout(bool enable);
+    bool use_mrope_xvec_layout() const { return use_mrope_xvec_layout_; }
+
     // Pre-convert each matmul weight buffer to CANN's FRACTAL_NZ layout
     // (M5.2). MUST be called before init_from_gguf — the conversion is
     // applied inline during weight upload. When enabled AND the runtime
@@ -197,6 +227,15 @@ private:
     float eps_        = 0.0f;
     float rope_theta_ = 0.0f;
     float rope_speed_factor_ = 1.0f;
+
+    // B6.1 — sector-aware RoPE layout (see public set_use_mrope_xvec_layout).
+    // `mrope_temporal_section_` is the pair-count of the temporal section,
+    // populated in init_from_gguf from `qwen3.rope.dimension_sections[0]` (or
+    // `rope_scaling.mrope_section[0]`); dim-pair indices ≥ this get
+    // cos=1/sin=0 when the flag below is true. Zero means "metadata absent,
+    // fall back to full-head rotation" — the flag is refused in that case.
+    int  mrope_temporal_section_    = 0;
+    bool use_mrope_xvec_layout_     = false;
 
     // Talker sequence budget — Talker may prefill up to ~100 text tokens plus
     // generate a few thousand codec frames. 4096 is a conservative cap that

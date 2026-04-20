@@ -804,13 +804,12 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
     std::vector<int> ref_text_tokens, target_text_tokens;
     tokenize_tts_text("", params.text, ref_text_tokens, target_text_tokens);
 
-    // Generate codec tokens via x-vector mode
+    // Generate codec tokens via x-vector mode.
+    // B6.2: TalkerLLM::generate_xvec now auto-dispatches to the native
+    // TalkerCannEngine when available (with sector-aware MRoPE layout);
+    // falls back to llama.cpp MRoPE 4×pos path otherwise.
     std::vector<std::vector<int>> codec_tokens;
-    // Use llama.cpp backbone with MRoPE (dimension_sections in GGUF enables
-    // automatic MRoPE via use_mrope() → CANN-accelerated rope_multi kernel).
-    // The standalone transformer is no longer needed when GGUF has MRoPE metadata.
     {
-        printf("  Using llama.cpp backbone (MRoPE via GGUF metadata)\n");
         if (!talker_.generate_xvec(target_text_tokens, spk_embedding,
                                     lang, codec_tokens,
                                     params.max_new_tokens, params.sampling)) {
