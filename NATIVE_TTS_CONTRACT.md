@@ -2275,6 +2275,35 @@ carrying a silent false claim.
   a legitimate 8.3% win that is one file-ownership-blocked edit
   (frame-yield in `TalkerLLM::generate`) away from the +10% gate.
 
+- **2026-04-20 Clean-quality fps floor revised — `cp_groups=8` rejected
+  on user ear-check**: the S3 33.8 fps measurement relied on
+  `--cp_groups 8` (CP truncated to first 8 of 15 codebooks). Today's
+  ear-test on 4 ref/mode combinations all heard an audible
+  low-frequency rumble / "hollow" artifact with cp_groups=8. Full
+  cp_groups=15 restores clean voice at the cost of ~1/3 fps.
+
+  **Validated clean-quality fps on ac01 (ModelArts 910B4, W8 + TQE=2
+  + default cp_groups=15, content-aware prefix trim, seed=42)**:
+
+  | mode | fps | artifact | lang/ref |
+  |---|---|---|---|
+  | ICL | **23.3** | `ab_w8_long.wav` | Chinese / mayun_ref |
+  | xvec | **22.2** | `mayun_xvec_cp15.wav` | Chinese / mayun_ref |
+  | customvoice (serena) | **21.0** | `cv_serena_zh.wav` | Chinese / built-in |
+
+  All three modes within 10% of each other → **parity achieved across
+  ICL / xvec / customvoice at clean audio**. Contract §1 ≥25 fps gate
+  is NOT met at clean quality; previous claim assumed ASR-PASS under
+  cp_groups=8 was a sufficient proxy for user-ear acceptance — it
+  isn't on English/ellen or longer mayun runs.
+
+  **Next perf track**: the 15-codebook CP dispatch is the bottleneck
+  (~48 ms/frame CV vs ~25 ms/frame prior). Candidate wins: (a) batch
+  the 15 per-codebook projection matmuls into one blocked matmul;
+  (b) move CP sampling from CPU to NPU to eliminate per-group
+  NPU→CPU→NPU hops; (c) speculative decoding across adjacent frames.
+  None attempted yet.
+
 - **2026-04-19 Post-v1 unification direction** (PM, architectural):
   Three stacks exist today — OminiX-MLX (Rust, mlx-rs, Apple
   Silicon), OminiX-Ascend (C/C++, llama.cpp fork, CANN), OminiX-API
