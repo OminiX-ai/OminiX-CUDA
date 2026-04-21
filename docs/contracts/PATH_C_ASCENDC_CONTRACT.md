@@ -19,20 +19,41 @@ via one or two custom AscendC kernels fusing CP-transformer
 sublayers, **without regressing audio quality** (user-ear identical,
 token drift ≤ 1 / frame / group).
 
-## 1a. STATUS (2026-04-21, updated): PAUSED
+## 1a. STATUS (2026-04-21 FINAL): CLOSED
 
-W4.1.3 wiring landed on fork (commit `3ac9aab5`), env-gated off by
-default. W4.1.4 correctness gate **FAILED CATASTROPHICALLY**
-(max_drift=1949, 1/256 exact-match positions). The W4.1.2v kernel
-passes offline diff ≤ 5e-4 but diverges at runtime — wiring bug or a
-runtime-vs-offline state mismatch. Root-cause investigation **not
-pre-funded**; this contract is paused.
+**W4.1.3 wiring landed env-gated (fork `63a3d90e`). W4.1.4 drift gate
+FAILED (max_drift=1949). PC-tile re-spike confirmed structural close.**
 
-**PM pivoted to CannFusion**: see `CANNFUSION_CONTRACT.md`. Path C
-lane stays landed for future return but is not the active effort.
-W4.1.5 / W4.1.6 NOT run. W4.2 / W4.3 NOT started.
+Agent PC-tile (2026-04-21) benchmarked a 40-AIV-core tiled F16 matmul
+at M=1 CP decode shapes vs `aclnnMm`:
 
-If Path C is ever resumed, first step is a rootcause agent on the
+| Shape | aclnnMm | gemv-only (40 cores) | gemv + reduce |
+|---|---|---|---|
+| K=1024 N=3072 | 27 μs | **18.5 μs (-32%)** | 38 μs (+42%) |
+| K=1024 N=2048 | 23 μs | 17 μs | 34 μs |
+| K=3072 N=1024 | 26 μs | 34 μs | 47 μs |
+
+**Gemv-only at 40 cores beats aclnnMm by ~26% in wall** (324 GB/s vs
+222 GB/s HBM utilisation). BUT the mandatory cross-core F32→F16 reduce
+kernel costs 18-22 μs — wipes the gemv win. Atomic-add is race-prone
+at blockDim ≥ 20 and NaN-prone at blockDim=40 on 910B4 (hardware
+limitation, not a kernel bug).
+
+The ONLY way for Path C to win is to **fuse the reduce into a
+downstream op** (next RmsNorm / Add / Mm). That fusion is exactly the
+full attn-sublayer fusion W4.1 failed numerically. Re-authoring
+correctly is estimated 2-3 weeks of expert AscendC work.
+
+**PM decision**: Path C CLOSED. Artefacts preserved for reference:
+- `~/pc_tile_probe/tiled_matmul.cpp` (207 LoC) on ac02
+- `~/work/OminiX-Ascend-w1/tools/qwen_tts/ascendc/fused_attn_sublayer.cpp`
+  on ac01 (W4.1.2v, paused)
+
+If Path C is ever resumed, the spike proved multi-core tiling CAN beat
+vendor at the gemv layer — the bottleneck is cross-op fusion, not
+parallelism. Start any resumption by writing a fused RmsNorm + Mm (or
+Mm + RmsNorm) spike and measuring whether the reduce folds in.
+
 runtime divergence before any further wiring work.
 
 ## 2. Non-goals
