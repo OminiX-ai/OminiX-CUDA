@@ -76,9 +76,40 @@ public:
                                    aclrtEvent wait_event = nullptr);
     void forward_one_token_fetch(float *hidden_out);
 
+    // W1: device-only sync after `_launch`. Blocks on `forward_done_event_`
+    // (or `stream_` if no event) without doing the D2H of hidden_out. Use
+    // this when the hidden state stays on NPU for a downstream op such as
+    // `forward_lm_head`; skips the ~0.2 ms memcpy cost per group.
+    void forward_one_token_sync();
+
     // Accessor for the event last recorded by `_launch` — lets an external
     // orchestrator wait on CP's completion from a different stream.
     aclrtEvent get_forward_done_event() const { return forward_done_event_; }
+
+    // ---- W1 NPU lm_head port --------------------------------------------------
+    // Dispatch the per-group lm_head matmul on NPU. Reads the F32 hidden
+    // state currently sitting in `output_stage_f32_dev_` (the output buffer
+    // written by `forward_one_token_launch`), casts to F16, multiplies by
+    // `lm_head_w_dev_[group_idx]` (F16 [vocab, cp_hidden]), and writes F16
+    // logits into an engine-owned device buffer. Shape-stable: vocab_size ×
+    // cp_hidden for all 15 groups. `fetch_logits` downloads those logits to
+    // a host F32 buffer (F16→F32 upconvert inline).
+    //
+    // Contract:
+    //   - `forward_one_token_launch` must have produced a valid hidden in
+    //     `output_stage_f32_dev_` before `forward_lm_head` is called.
+    //   - W1 gates the whole port behind `TALKER_LM_HEAD_NPU=1`. When the
+    //     env var is unset the caller MUST stay on the CPU `cp_matvec_f32`
+    //     path and MUST NOT call these methods.
+    //   - Not thread-safe across groups — dispatch + fetch are serial on
+    //     `stream_`.
+    void forward_lm_head(int group_idx);
+    void fetch_logits(float *host_out);
+
+    // True iff lm_head weights were uploaded to NPU during init. Caller
+    // should check this before calling forward_lm_head / fetch_logits.
+    bool has_lm_head() const { return lm_head_ready_; }
+    int  lm_head_vocab_size() const { return lm_head_vocab_size_; }
 
     // Reset KV cache for a new frame
     void reset_kv_cache();
@@ -204,6 +235,19 @@ private:
     };
     std::vector<LayerWeights> layer_w_;
     void *final_norm_w_dev_ = nullptr;  // [cp_hidden]
+
+    // ---- W1: lm_head weights on NPU ---------------------------------------
+    // F16, [vocab_size, cp_hidden] per group. Uploaded during init() /
+    // init_from_safetensors() when `TALKER_LM_HEAD_NPU=1` is set. Each
+    // group's weight is dispatched via aclnnMm into `logits_f16_dev_`.
+    // `logits_stage_f32_dev_` is the F32 staging buffer used by
+    // `fetch_logits` for the D2H downcast.
+    std::vector<void *> lm_head_w_dev_;
+    void *logits_f16_dev_        = nullptr;  // F16 [vocab_size]
+    void *logits_stage_f32_dev_  = nullptr;  // F32 [vocab_size]
+    bool  lm_head_ready_         = false;
+    int   lm_head_vocab_size_    = 0;        // 2048 typically
+    int   lm_head_n_groups_      = 0;        // 15 typically
 
     // ---- NPU intermediate buffers (pre-allocated, reused every forward) ----
     void *cur_dev_ = nullptr;       // [cp_hidden]
@@ -345,6 +389,12 @@ private:
     // TalkerCannEngine equivalent for the full shape contract.
     void w8_matmul_(const aclTensor *x, void *weight_dev, void *scale_dev,
                      int64_t out_n, int64_t in_k, const aclTensor *y);
+
+    // W1: upload per-group lm_head weights (F16) + allocate logits buffers.
+    // No-op when already initialised. Caller provides the F32 host-side
+    // weights in [n_groups][vocab_size * cp_hidden] row-major layout.
+    bool init_lm_head_(const std::vector<std::vector<float>> &lm_head_w,
+                        int vocab_size);
 
     // Create all persistent aclTensor descriptors after weights + buffers
     // have been allocated. Called once at the end of init().

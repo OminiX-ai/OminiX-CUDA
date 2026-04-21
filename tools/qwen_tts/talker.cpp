@@ -1617,6 +1617,12 @@ bool TalkerLLM::predict_code_groups(
         cp_cann_engine_->set_active_layers(sampling.cp_max_layers);
         cp_cann_engine_->reset_kv_cache();
 
+        // ---- W1: NPU lm_head port toggle ----
+        // Activated when the engine uploaded the lm_head weights at init
+        // (gated by TALKER_LM_HEAD_NPU=1 env var inside the engine).
+        // Falls back to CPU matvec when disabled so A/B is a single flag.
+        const bool lm_head_npu = cp_cann_engine_->has_lm_head();
+
         // ---- TALKER_CP_PROF instrumentation (env-gated) ----
         // Per-frame phase timing for the CP path. Prints a single line
         // "[cp-prof] lm=.. sample=.. emb=.. fwd=.. (n_groups=N)" after every
@@ -1640,7 +1646,12 @@ bool TalkerLLM::predict_code_groups(
             auto t0 = cp_clock::now();
             cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
                                                        /*wait*/ nullptr);
-            cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            if (lm_head_npu) {
+                // Hidden stays on NPU — no D2H needed. sync only.
+                cp_cann_engine_->forward_one_token_sync();
+            } else {
+                cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            }
             prof_tick(prof_fwd_ms, t0);
         }
 
@@ -1655,7 +1666,11 @@ bool TalkerLLM::predict_code_groups(
             auto t0 = cp_clock::now();
             cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
                                                        /*wait*/ nullptr);
-            cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            if (lm_head_npu) {
+                cp_cann_engine_->forward_one_token_sync();
+            } else {
+                cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            }
             prof_tick(prof_fwd_ms, t0);
         }
 
@@ -1666,9 +1681,18 @@ bool TalkerLLM::predict_code_groups(
         for (int g = 0; g < n_groups; g++) {
             {
                 auto t0 = cp_clock::now();
-                cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
-                              cp_out.data(), logits.data(),
-                              vocab_size, cp_hidden);
+                if (lm_head_npu) {
+                    // NPU path: cp_out (F32) lives in output_stage_f32_dev_
+                    // on-device, never downloaded. forward_lm_head queues
+                    // Cast→Mm→Cast on stream_; fetch_logits blocks on the
+                    // stream and downloads F32 logits to the host buffer.
+                    cp_cann_engine_->forward_lm_head(g);
+                    cp_cann_engine_->fetch_logits(logits.data());
+                } else {
+                    cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
+                                  cp_out.data(), logits.data(),
+                                  vocab_size, cp_hidden);
+                }
                 prof_tick(prof_lm_ms, t0);
             }
 
@@ -1699,7 +1723,11 @@ bool TalkerLLM::predict_code_groups(
                     cp_cann_engine_->forward_one_token_launch(group_emb.data(),
                                                                g + 2,
                                                                /*wait*/ nullptr);
-                    cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                    if (lm_head_npu) {
+                        cp_cann_engine_->forward_one_token_sync();
+                    } else {
+                        cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                    }
                     prof_tick(prof_fwd_ms, t0);
                 }
             }

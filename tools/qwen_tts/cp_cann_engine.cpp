@@ -176,6 +176,11 @@ CpCannEngine::~CpCannEngine() {
     }
     free_dev(final_norm_w_dev_);
 
+    // W1: lm_head weight buffers + logits staging.
+    for (auto &p : lm_head_w_dev_) free_dev(p);
+    free_dev(logits_f16_dev_);
+    free_dev(logits_stage_f32_dev_);
+
     free_dev(cur_dev_);
     free_dev(residual_dev_);
     free_dev(normed_dev_);
@@ -1229,6 +1234,20 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
 
     build_persistent_tensors_();
 
+    // W1: opt-in NPU lm_head port. Gated behind TALKER_LM_HEAD_NPU to keep
+    // the default CPU matvec path bit-for-bit unchanged. Uploads F16 copies
+    // of every per-group [vocab, cp_hidden] head weight and allocates two
+    // small logits buffers (F16 on device, F32 staging for D2H).
+    {
+        const char *env = getenv("TALKER_LM_HEAD_NPU");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            if (!init_lm_head_(w.lm_head_w, cfg.vocab_size)) {
+                printf("[cp_cann] TALKER_LM_HEAD_NPU requested but lm_head "
+                       "upload failed; caller should stay on CPU path\n");
+            }
+        }
+    }
+
     ready_ = true;
     printf("[cp_cann] v4 F16 engine initialized: %d layers, device %d\n",
            n_layers_, device_);
@@ -1644,4 +1663,112 @@ void CpCannEngine::forward_one_token(const float *input_talker_space,
                                       int pos, float *hidden_out) {
     forward_one_token_launch(input_talker_space, pos, nullptr);
     forward_one_token_fetch(hidden_out);
+}
+
+// W1 helper: sync without D2H. After this returns, output_stage_f32_dev_
+// holds the hidden state ready for the next on-device consumer.
+void CpCannEngine::forward_one_token_sync() {
+    assert(ready_);
+    if (forward_done_event_ && g_cann.aclrtSynchronizeEvent) {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeEvent(forward_done_event_));
+    } else {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    }
+}
+
+// ============================================================================
+// W1: NPU lm_head port
+// ============================================================================
+
+bool CpCannEngine::init_lm_head_(const std::vector<std::vector<float>> &heads,
+                                  int vocab_size) {
+    if (lm_head_ready_) return true;
+    if (heads.empty() || vocab_size <= 0) {
+        fprintf(stderr, "[cp_cann] init_lm_head_: empty heads or zero "
+                "vocab (%zu, %d)\n", heads.size(), vocab_size);
+        return false;
+    }
+    const size_t E = sizeof(uint16_t);
+    const size_t per = (size_t)vocab_size * cp_hidden_;
+    lm_head_w_dev_.assign(heads.size(), nullptr);
+    for (size_t g = 0; g < heads.size(); ++g) {
+        if (heads[g].size() != per) {
+            fprintf(stderr, "[cp_cann] lm_head[%zu] size %zu != expected %zu "
+                    "(vocab=%d, cp_hidden=%d)\n",
+                    g, heads[g].size(), per, vocab_size, cp_hidden_);
+            return false;
+        }
+        alloc_dev(&lm_head_w_dev_[g], per * E);
+        upload_f16(lm_head_w_dev_[g], heads[g].data(), per);
+    }
+    alloc_dev(&logits_f16_dev_,       vocab_size * E);
+    alloc_dev(&logits_stage_f32_dev_, vocab_size * sizeof(float));
+    lm_head_vocab_size_ = vocab_size;
+    lm_head_n_groups_   = (int)heads.size();
+    lm_head_ready_      = true;
+    printf("[cp_cann] W1: uploaded %d lm_head weights (F16, vocab=%d, "
+           "cp_hidden=%d) — NPU lm_head path ENABLED\n",
+           lm_head_n_groups_, lm_head_vocab_size_, cp_hidden_);
+    return true;
+}
+
+void CpCannEngine::forward_lm_head(int group_idx) {
+    assert(ready_);
+    assert(lm_head_ready_);
+    assert(group_idx >= 0 && group_idx < lm_head_n_groups_);
+
+    // Fence against the forward_one_token that produced output_stage_f32_dev_
+    // on `stream_`. Same stream ⇒ ops are serial anyway, so this is only a
+    // safety net in case a future caller splits across streams.
+    // (No explicit wait needed for same-stream ordering.)
+
+    // 1. Cast the F32 hidden (output_stage_f32_dev_ [cp_hidden]) to F16.
+    //    We reuse `cur_dev_` (F16 [cp_hidden]) as staging — it's only touched
+    //    at layer 0 of the next forward and we run lm_head between forwards.
+    {
+        aclTensor *t_h_f32 = tensor_1d(output_stage_f32_dev_, cp_hidden_,
+                                        ACL_FLOAT);
+        aclTensor *t_h_f16 = tensor_1d(cur_dev_, cp_hidden_, ACL_FLOAT16);
+        CANN_OP(Cast, t_h_f32, ACL_FLOAT16, t_h_f16);
+        g_cann.aclDestroyTensor(t_h_f32);
+        g_cann.aclDestroyTensor(t_h_f16);
+    }
+
+    // 2. Matmul: logits[vocab] = W[vocab, cp_hidden] @ h[cp_hidden]
+    //    Existing CP convention (see q/k/v/o projections): aclnnMm takes
+    //    a 2-D weight [out, in] and a 2-D activation [in, 1] and writes
+    //    [out, 1]. Mirror that here so the NZ/ND kernel path is identical.
+    {
+        aclTensor *t_w   = tensor_2d(lm_head_w_dev_[group_idx],
+                                      lm_head_vocab_size_, cp_hidden_,
+                                      ACL_FLOAT16);
+        aclTensor *t_x   = tensor_2d(cur_dev_, cp_hidden_, 1, ACL_FLOAT16);
+        aclTensor *t_y   = tensor_2d(logits_f16_dev_,
+                                      lm_head_vocab_size_, 1, ACL_FLOAT16);
+        CANN_OP(Mm, t_w, t_x, t_y, /*cubeMathType=*/0);
+        g_cann.aclDestroyTensor(t_w);
+        g_cann.aclDestroyTensor(t_x);
+        g_cann.aclDestroyTensor(t_y);
+    }
+
+    // 3. Cast F16 logits -> F32 staging (async). D2H + sync happen in fetch.
+    {
+        aclTensor *t_l_f16 = tensor_1d(logits_f16_dev_,      lm_head_vocab_size_,
+                                        ACL_FLOAT16);
+        aclTensor *t_l_f32 = tensor_1d(logits_stage_f32_dev_, lm_head_vocab_size_,
+                                        ACL_FLOAT);
+        CANN_OP(Cast, t_l_f16, ACL_FLOAT, t_l_f32);
+        g_cann.aclDestroyTensor(t_l_f16);
+        g_cann.aclDestroyTensor(t_l_f32);
+    }
+}
+
+void CpCannEngine::fetch_logits(float *host_out) {
+    assert(ready_);
+    assert(lm_head_ready_);
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        host_out, lm_head_vocab_size_ * sizeof(float),
+        logits_stage_f32_dev_, lm_head_vocab_size_ * sizeof(float),
+        ACL_MEMCPY_DEVICE_TO_HOST));
 }
