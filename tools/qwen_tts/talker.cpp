@@ -1617,46 +1617,99 @@ bool TalkerLLM::predict_code_groups(
         cp_cann_engine_->set_active_layers(sampling.cp_max_layers);
         cp_cann_engine_->reset_kv_cache();
 
+        // ---- TALKER_CP_PROF instrumentation (env-gated) ----
+        // Per-frame phase timing for the CP path. Prints a single line
+        // "[cp-prof] lm=.. sample=.. emb=.. fwd=.. (n_groups=N)" after every
+        // predict_code_groups call when the env var is set. Overhead when off
+        // is a single getenv() lookup.
+        const bool cp_prof_on = (getenv("TALKER_CP_PROF") != nullptr);
+        using cp_clock = std::chrono::high_resolution_clock;
+        double prof_lm_ms = 0.0, prof_sample_ms = 0.0,
+               prof_emb_ms = 0.0, prof_fwd_ms = 0.0;
+        auto prof_tick = [&](double &acc, cp_clock::time_point t0) {
+            if (cp_prof_on) {
+                acc += std::chrono::duration<double, std::milli>(
+                    cp_clock::now() - t0).count();
+            }
+        };
+
         std::vector<float> cp_out(cp_hidden);
 
         // Position 0: talker hidden state (engine does input_proj internally)
-        cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
-                                                   /*wait*/ nullptr);
-        cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+        {
+            auto t0 = cp_clock::now();
+            cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
+                                                       /*wait*/ nullptr);
+            cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            prof_tick(prof_fwd_ms, t0);
+        }
 
         // Position 1: group-0 codec embedding in talker space
         std::vector<float> g0_emb(talker_hidden);
-        lookup_codec_embedding(group0_token, g0_emb.data());
-        cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
-                                                   /*wait*/ nullptr);
-        cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+        {
+            auto t0 = cp_clock::now();
+            lookup_codec_embedding(group0_token, g0_emb.data());
+            prof_tick(prof_emb_ms, t0);
+        }
+        {
+            auto t0 = cp_clock::now();
+            cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
+                                                       /*wait*/ nullptr);
+            cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+            prof_tick(prof_fwd_ms, t0);
+        }
 
         // Decode groups 1-15 autoregressively
         std::vector<float> logits(vocab_size);
         std::vector<float> group_emb(talker_hidden);
 
         for (int g = 0; g < n_groups; g++) {
-            cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
-                          cp_out.data(), logits.data(), vocab_size, cp_hidden);
+            {
+                auto t0 = cp_clock::now();
+                cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
+                              cp_out.data(), logits.data(),
+                              vocab_size, cp_hidden);
+                prof_tick(prof_lm_ms, t0);
+            }
 
-            int sampled = sample_token(logits.data(), vocab_size,
+            int sampled;
+            {
+                auto t0 = cp_clock::now();
+                sampled = sample_token(logits.data(), vocab_size,
                                        sampling.cp_temperature, sampling.cp_top_k,
                                        sampling.cp_top_p, sampling.cp_do_sample);
+                prof_tick(prof_sample_ms, t0);
+            }
             group_tokens[g] = sampled;
 
             if (g < n_groups - 1) {
-                read_embedding_row(cp_model_cann.codec_embeddings_[g],
-                                   sampled, group_emb.data(), talker_hidden);
+                {
+                    auto t0 = cp_clock::now();
+                    read_embedding_row(cp_model_cann.codec_embeddings_[g],
+                                       sampled, group_emb.data(), talker_hidden);
+                    prof_tick(prof_emb_ms, t0);
+                }
                 // Launch the next CP forward; the fetch below serialises on
                 // the forward_done_event_ recorded by the launch, so host
                 // work above (lm_head matvec + sampling + embedding
                 // lookup for group g+1) can overlap with the NPU chew of
                 // group g's forward.
-                cp_cann_engine_->forward_one_token_launch(group_emb.data(),
-                                                           g + 2,
-                                                           /*wait*/ nullptr);
-                cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                {
+                    auto t0 = cp_clock::now();
+                    cp_cann_engine_->forward_one_token_launch(group_emb.data(),
+                                                               g + 2,
+                                                               /*wait*/ nullptr);
+                    cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                    prof_tick(prof_fwd_ms, t0);
+                }
             }
+        }
+        if (cp_prof_on) {
+            fprintf(stderr,
+                    "[cp-prof] lm=%.2f ms sample=%.2f ms emb=%.2f ms "
+                    "fwd=%.2f ms (n_groups=%d)\n",
+                    prof_lm_ms, prof_sample_ms, prof_emb_ms, prof_fwd_ms,
+                    n_groups);
         }
         return true;
     }
