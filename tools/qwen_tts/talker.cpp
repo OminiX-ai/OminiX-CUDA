@@ -1739,6 +1739,22 @@ bool TalkerLLM::predict_code_groups(
                     prof_lm_ms, prof_sample_ms, prof_emb_ms, prof_fwd_ms,
                     n_groups);
         }
+        // W1.4 correctness dump. TALKER_CP_DUMP=<path> appends one CSV line
+        // per predict_code_groups call: "group0,tk1,tk2,...,tk15". Used to
+        // diff NPU vs CPU sampled tokens; ≤ 1 per group is the F16 budget.
+        // Zero cost when unset.
+        if (const char *dump = getenv("TALKER_CP_DUMP")) {
+            static FILE *dump_fp = nullptr;
+            if (!dump_fp) dump_fp = fopen(dump, "a");
+            if (dump_fp) {
+                fprintf(dump_fp, "%d", group0_token);
+                for (int g = 0; g < n_groups; g++) {
+                    fprintf(dump_fp, ",%d", group_tokens[g]);
+                }
+                fprintf(dump_fp, "\n");
+                fflush(dump_fp);
+            }
+        }
         return true;
     }
 #endif
