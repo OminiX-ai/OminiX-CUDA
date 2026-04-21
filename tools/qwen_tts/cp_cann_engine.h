@@ -222,6 +222,12 @@ private:
         void *input_ln_w_f16 = nullptr;
         void *post_ln_w_f16  = nullptr;
 
+        // W4.1 AscendC path: F16 copies of the per-head RmsNorm gammas the
+        // fused attn-sublayer kernel reads directly. Sized [head_dim] F16.
+        // Allocated only when cp_ascendc_applied_; null otherwise.
+        void *q_norm_w_f16   = nullptr;
+        void *k_norm_w_f16   = nullptr;
+
         // A16W8 (Stretch S1): INT8 [out, in] + F16 per-output-channel scale,
         // allocated alongside the F16 buffers when w8_applied_. Null otherwise.
         void *q_proj_w_i8    = nullptr;
@@ -395,6 +401,16 @@ private:
     bool cp_fusion_enabled_ = false;
     bool cp_fusion_applied_ = false;
 
+    // ---- Path C W4.1 AscendC fused attention sublayer -----------------------
+    // Gated by env var TALKER_CP_ASCENDC=1 (opt-in). When set AND the build
+    // has QWEN_TTS_HAS_ASCENDC AND w8_applied_, forward_one_token_launch's
+    // attention sublayer dispatches the single fused kernel
+    // `aclrtlaunch_fused_attn_sublayer` instead of the stock aclnn chain
+    // (RmsNorm → QKV-Mm → QK-norm → RoPE → V-copy → FIAS → O-Mm → +residual).
+    // Unset (or on an ascendc-less build) = bit-identical to W1+W3b.
+    bool cp_ascendc_enabled_ = false;
+    bool cp_ascendc_applied_ = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -427,6 +443,11 @@ private:
     // cp_fusion_applied_. Must be called AFTER the F32 gamma buffers are
     // uploaded and BEFORE build_persistent_tensors_().
     void init_fusion_f16_gammas_();
+
+    // W4.1 AscendC: allocate F16 copies of the per-head Q/K RmsNorm gammas,
+    // and (for the rare ascendc-on-without-fusion case) the input_ln / final
+    // layer-norm gammas too. No-op unless cp_ascendc_applied_.
+    void init_ascendc_f16_gammas_();
 
     // Create all persistent aclTensor descriptors after weights + buffers
     // have been allocated. Called once at the end of init().
