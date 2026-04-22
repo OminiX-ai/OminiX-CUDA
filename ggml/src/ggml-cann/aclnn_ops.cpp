@@ -2296,7 +2296,9 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 const size_t dst_elt_size = ggml_type_size(dst->type);
                 const size_t dst_size     = n_elements * dst_elt_size;
 
-                // 1) D2H: pull the on-device quantised buffer into host memory.
+                // 1) D2H: pull the on-device quantised buffer into host memory. Sync the
+                //    backend stream first so any pending writes complete before the sync copy.
+                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
                 std::vector<uint8_t> device_buffer(device_size);
                 ACL_CHECK(aclrtMemcpy(device_buffer.data(), device_size, src0->data, device_size,
                                       ACL_MEMCPY_DEVICE_TO_HOST));
@@ -2358,7 +2360,11 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 }
 
                 // 4) H2D: park the dequantised buffer in a pool alloc and gather-index.
+                //    Sync the stream first — the pool can recycle an address whose previous
+                //    consumer is still running on ctx.stream(), and the sync memcpy below does
+                //    not itself serialize with the op queue.
                 ggml_cann_pool_alloc dequant_buffer_allocator(ctx.pool(), dst_size);
+                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
                 ACL_CHECK(aclrtMemcpy(dequant_buffer_allocator.get(), dst_size, dst_host.data(), dst_size,
                                       ACL_MEMCPY_HOST_TO_DEVICE));
 
@@ -2370,6 +2376,10 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 }
                 aclnn_index_select_4d(ctx, dequant_buffer_allocator.get(), src0->ne, dequant_nb_,
                                       dst->data, dst->ne, dst->nb, src1, dst->type);
+                // Sync before dequant_buffer_allocator goes out of scope so the async
+                // aclnn_index_select_4d finishes reading the pool buffer before it's
+                // recycled by a later allocator.
+                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
                 break;
             }
         default:
@@ -2785,7 +2795,9 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
 
     // Q4_1 / Q5_* / K-quants are NOT routed through ggml_backend_cann_transform_q4_0 at
     // buffer-copy time, so the on-device layout matches block_<type> exactly. Pull the
-    // bytes back to host verbatim.
+    // bytes back to host verbatim. The D2H read must wait for any pending writes on the
+    // backend stream (e.g., a previous op still scheduled) before the sync copy.
+    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
     std::vector<uint8_t> host_quant(device_q_bytes);
     ACL_CHECK(aclrtMemcpy(host_quant.data(), device_q_bytes, src0->data, device_q_bytes,
                           ACL_MEMCPY_DEVICE_TO_HOST));
@@ -2804,6 +2816,9 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
 
     const size_t         fp16_bytes = n_elements * sizeof(ggml_fp16_t);
     ggml_cann_pool_alloc weight_fp16_alloc(ctx.pool(), fp16_bytes);
+    // Sync the backend stream before the H2D upload so we don't race a prior matmul that
+    // still has the pool buffer live (the pool can recycle the same address across calls).
+    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
     ACL_CHECK(aclrtMemcpy(weight_fp16_alloc.get(), fp16_bytes, fp16_buf.data(), fp16_bytes,
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
@@ -2831,6 +2846,12 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
 
     // cubeMathType = 2 (ALLOW_FP32_DOWN_PRECISION): matches mat_mul_fp 2D path.
     GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), 2);
+
+    // The pool buffer for the dequantised FP16 weight is owned by weight_fp16_alloc and will
+    // be returned to the pool at the end of this scope. Sync the backend stream before then
+    // to guarantee the async aclnnMm has finished reading from it — otherwise a later pool
+    // consumer can overwrite in-flight data.
+    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
 }
 
 void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
