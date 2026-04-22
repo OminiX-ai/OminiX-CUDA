@@ -69,7 +69,9 @@ Same pattern as Q0 (QIE discovery):
 - [ ] A0.2 HF cache state on ac01: is the model + weights already downloaded? If not, what's the bandwidth cost?
 - [ ] A0.3 Existing tooling: does OminiX-Ascend `tools/` have any ASR scaffolding? Is there a `tools/asr/` or similar?
 - [ ] A0.4 Baseline path: does ggml-cann support ASR? Can the current llama.cpp path on ac01 run Qwen3-ASR at all? If yes, measure RTF. If no, note what's missing.
-- [ ] A0.5 Reference dataset: smallest standard set (e.g. 10 clips of LibriSpeech test-clean + 10 from AISHELL-1) that gives stable WER measurement.
+- [ ] A0.5 **Tier-1 gate dataset — TTS→ASR self-consistency loop**: use our working Qwen3-TTS on ac01 to synthesize 20 canonical sentences (10 CN + 10 EN mix, covering various sentence lengths and topic domains) from the 14 existing refs in `data/ref_audios/`. Feed each synthesized wav back into Qwen3-ASR; compute WER / CER against the known-exact input text. This is the **iteration-loop regression gate** — every agent commit that doesn't regress TTS→ASR WER by > 0.5% abs is safe to proceed. Runs in ~30-60 seconds per iteration. Zero external dataset dependency.
+- [ ] A0.6 **Tier-2 gate dataset — real recordings**: smallest standard set (e.g. 10 LibriSpeech test-clean + 10 AISHELL-1 test) that gives stable real-world WER measurement. Used at **milestone gates** (A1 completion, A4 completion, A8 final) to confirm we haven't over-fitted to TTS distribution.
+- [ ] A0.7 **Tier-3 gate — human verification** (optional, on YELLOW cases only): if Tier-1 WER drifts but Tier-2 doesn't, listen to a handful of TTS→ASR mismatches to categorize: "TTS fault" (mispronunciation, synthetic artifact) vs "ASR fault" (misrecognition). Only triggered when Tier-1 and Tier-2 disagree.
 
 **Gate**: A0 deliverables → discovery report at `docs/asr_a0_discovery.md`. PM reviews, confirms or adjusts:
 - Target RTF (calibrated to model size class)
