@@ -2,7 +2,7 @@
 
 ## 1. Status & mandate
 
-**Status**: NEW (drafted 2026-04-22, PM signed).
+**Status**: AMENDED 2026-04-22 per `docs/qie_optimization_learnings.md` feasibility deltas (Q0.5 inserted, Q1 widened, Q2.5 inserted). Original draft 2026-04-22, PM signed.
 **Target**: optimize Qwen-Image-Edit-2511 image-editing inference on Ascend NPU, starting with 910B4 (32 GB HBM constraint — Q4 quant mandatory) via `tools/ominix_diffusion/` as the starting surface.
 
 **Goal** (subject to Q0-v2 calibration):
@@ -81,14 +81,28 @@ Per `docs/qie_q0v2_discovery.md` (verified-by Agent Q0-v2, 2026-04-22, ac02):
 
 **Verdict**: YELLOW. Contract **restructured** — must unblock backend before baseline makes sense.
 
-### Q1 — **ggml-cann backend unblock** (1-2 weeks, HARD GATE, replaces original Q1)
+### Q0.5 — Probe-first prerequisites (3-5 days, parallel with Q1, Mac-side OK)
+
+Amended 2026-04-22 per `docs/qie_optimization_learnings.md` §3.1, §3.4, §2 (RoPE-V2). Three probes that MUST complete before Q4, Q3, and Q2-RoPE-V2 scope respectively. Source-reading + short runtime measurements; no full-model dispatch needed.
+
+- [ ] Q0.5.1 **CFG cond/uncond shape-symmetry probe** (edit mode): source-read `qwen_image.hpp:454-459` + `stable-diffusion.cpp:1884-1906`. Confirm whether `ref_latents` concat applies to both cond and uncond forwards. If asymmetric → Q4 is a 1-week refactor, not drop-in. **Output**: `docs/qie_q0_5_cfg_symmetry.md` with verdict.
+- [ ] Q0.5.2 **FIAv2 wall at seq=4352**: measure FIAv2 dispatch wall on ac02 at joint-attention sequence length (4096 img + ~256 txt). Compare to ggml's `ggml_ext_attention_ext` baseline. If within 20% → wire at Q3. If >30% slower → becomes CANN vendor ask, deprioritize Q3.
+- [ ] Q0.5.3 **RoPE-V2 3D-axial layout probe**: QIE uses `axes_dim = {16, 56, 56}` non-standard 3D decomposition (`rope.hpp:655-658`). Verify `aclnnApplyRotaryPosEmbV2` layout compatibility OR document layout-convert cost. Retire lever if layout-convert eats savings (TTS-V2 precedent).
+- [ ] Q0.5.4 **20-task canonical eye-gate suite definition**: CN+EN × 10 categories (color/style/object-add/remove/text/bg-swap/weather/time/pose/composition). Lock image + prompt + baseline output. Reuse across Q8 + future diffusion contracts. **Output**: `docs/qie_eye_gate_suite.md`.
+
+**Gate**: 3 probe verdicts + suite locked. No fps claim. Decides Q3/Q4/Q5-RoPE-V2 scope.
+
+### Q1 — **ggml-cann backend unblock** (1-3 weeks, HARD GATE, replaces original Q1)
+
+Timeline widened from 1-2 weeks per `docs/qie_optimization_learnings.md` §Part 1: Q1.3 gather_v3 is an unknown-territory CANN-backend debug with no TTS/ASR probe coverage. Schedule-risk mitigation: **Q1.3 gets its own 2-4 hr localization probe before A-agent dispatch.**
 
 Fix the 3 blockers above IN `ggml-cann` (llama.cpp Ascend backend). Upstream-worthy contribution once validated.
 
 - [ ] Q1.1 Add Q4_K / Q5_K / Q6_K dispatch in `ggml_cann_mul_mat` (K-quant variants are HF-common for Qwen-Image; without them Q4 is stuck on Q4_0 which has its own get_rows issue)
 - [ ] Q1.2 Add Q4_0 / Q4_1 dispatch in `ggml_cann_get_rows` — text-encoder embedding-table path MUST accept common quant formats
-- [ ] Q1.3 Debug `ascendc/gather_v3` crash on float-bit-pattern indices in Qwen2.5-VL vision-encoder. Likely indices-as-int32 vs indices-as-float confusion in the op's input handling.
+- [ ] Q1.3 Debug `ascendc/gather_v3` crash on float-bit-pattern indices in Qwen2.5-VL vision-encoder. **Step 1** (2-4 hr probe before A-agent dispatch): dump graph tensor dtypes around first gather on ac02, compare to Qwen2.5-VL MLX reference. Localize to (a) ggml-cann graph-builder dtype-tag bug → patch, or (b) genuine AscendC indices-dtype limit → CANN vendor ask. **Step 2** (patch or escalate based on Step 1).
 - [ ] Q1.4 Runtime smoke: canonical edit task ("convert cat to black and white") completes without crash on ac02 at Q4. First successful baseline run.
+- [ ] Q1.5 Land three backend fixes as separate upstream PRs against `ggerganov/llama.cpp/ggml/src/ggml-cann/`. These benefit SD3/Flux/Z-Image/Wan2 — codify upstream PR as part of Q1 delivery, not separate contract.
 
 **Gate**: baseline run produces a valid output image (any quality, any steps/sec — just "doesn't crash"). Fork commit pushed with the 3 bug fixes isolated as separate commits for upstream review.
 
@@ -117,7 +131,18 @@ Diffusion is **shape-stable per denoising step** → ideal fit for aclGraph. Cap
 
 **Gate**: steps/s lift **+10-30%** vs Q1 baseline (big since diffusion is dispatch-heavy per step). Byte-or-ulp parity preferred; eye-check required.
 
-### Q3 — DiT attention FIAv2 (1 week)
+### Q2.5 — CacheDIT threshold calibration (3-5 days, FREE-ENGINEERING LEVER)
+
+Inserted 2026-04-22 per `docs/qie_optimization_learnings.md` §3.3. `stable-diffusion.cpp:1761-1864` already wires 4 cache modes (EasyCache, UCache, DBCache, TaylorSeer CacheDIT) via `sd_cache_params_t`. **Zero kernel work** — threshold calibration + eye-gate validation only. Realistic lift **+30-60% end-to-end** by skipping 30-50% of block computes at 0.1-threshold with ~1-2% FID cost. May carry the 2× gate standalone before any Q3/Q4/Q5 kernel work.
+
+- [ ] Q2.5.1 Measure default-threshold wall + eye-gate quality on 20-task suite for each of 4 cache modes (baseline no-cache + EasyCache + UCache + DBCache + TaylorSeer)
+- [ ] Q2.5.2 Sweep DBCache threshold {0.05, 0.08, 0.10, 0.15} — find Pareto point where wall-drop ≥ 25% AND eye-gate ≥ baseline
+- [ ] Q2.5.3 TaylorSeer extrapolation: pair with DBCache at best threshold; measure compound lift
+- [ ] Q2.5.4 Lock best configuration as default for Q8 final numbers
+
+**Gate**: **+25-50% end-to-end wall** vs Q2 baseline with eye-gate PASS on 20/20 tasks. Regressions on any task → revert threshold.
+
+### Q3 — DiT attention FIAv2 (1 week, gated on Q0.5.2 verdict)
 
 Image-token attention has sequence length 4096 (64×64 latent) — different from TTS's seq=1-16 decode. FIAv2 may or may not be optimal at this seq-len class.
 
@@ -189,19 +214,24 @@ VAE decode is ~15% of total wall for high-res outputs. UNet-style GroupNorm + Co
 
 ## 8. Timeline (agent-wall)
 
-- Q0-v2: 1-2 days (in flight)
-- Q1: 2-3 weeks (biggest task)
-- Q2: 1-2 weeks
-- Q3: 1 week
-- Q4: 1 week (CFG — high-leverage single lever)
-- Q5: 1 week
-- Q6: 3-5 days
-- Q7: 1-2 weeks
-- Q8: 1 week gates
+Amended 2026-04-22 per feasibility deltas.
 
-**Total**: **~8-12 weeks agent-wall** for Q0-Q8 batch.
+- Q0-v2: 1-2 days (DONE)
+- Q0.5: 3-5 days (parallel with Q1, Mac-side OK) ← **new**
+- Q1: **1-3 weeks** (widened from 1-2; gather_v3 schedule risk)
+- Q2 native engine: 2-3 weeks
+- Q2 aclGraph step-keyed: 1-2 weeks
+- Q2.5 CacheDIT calibration: 3-5 days ← **new, free-engineering lever**
+- Q3 FIAv2: 1 week (gated on Q0.5.2)
+- Q4 CFG batching: 1 week (gated on Q0.5.1)
+- Q5 QKV grouped: 1 week
+- Q6 weight upload: 3-5 days
+- Q7 VAE: 1-2 weeks
+- Q8 final gates: 1 week
 
-**First-value milestone** (Q0-v2 + Q1 + Q2 + Q4): ~5-7 weeks — demonstrable native engine with aclGraph + CFG-batching lift, ≥2× baseline.
+**Total**: **~9-13 weeks agent-wall** (was 8-12; +1 week for Q1 widening, Q0.5 + Q2.5 fit in parallel slack).
+
+**First-value milestone** (Q0.5 + Q1 + Q2 + Q2.5 + Q4): ~6-8 weeks — native engine + aclGraph + CacheDIT-tuned + CFG-batching, ≥2× baseline. **Q2.5 alone may hit 2× gate** before Q3/Q4/Q5 kernel work — re-evaluate scope at Q2.5 landing.
 
 ## 9. Host rules
 
