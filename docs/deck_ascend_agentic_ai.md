@@ -180,7 +180,7 @@ flowchart TB
     class OPR stock
 
     QKV -. "FO-audit no fused QKV in CANN 8.3 PENDING" .-> QKV
-    ROPE -. "A.2 V2 RoPE CLOSED (GQA packed-UB incompat)" .-> ROPE
+    ROPE -. "A.2 V2 RoPE REOPEN-PENDING (initial close wrong; probe reopened after MoYoYoTech 4:1 GQA success)" .-> ROPE
     TAIL1 -. "W3b AddRmsNorm LANDED +0.66 fps" .-> TAIL1
     TAIL1 -. "A.1 Inplace LANDED +0.3 fps" .-> TAIL1
     TAIL2 -. "W3b + A.1 same fusion" .-> TAIL2
@@ -204,12 +204,12 @@ flowchart TB
 | 6 | M3 group-collapse | 15-group autoregressive loop | CLOSED | RVQ strict |
 | 7 | Path C W4.1 attn | CP attn sublayer | CLOSED | 1949 drift |
 | 8 | M1.B FFNV3 | CP FFN sublayer | CLOSED | non-MoE rejected |
-| 9 | A.2 V2 RoPE | CP RoPE Q+K | CLOSED | GQA packed-UB |
+| 9 | A.2 V2 RoPE | CP RoPE Q+K | **REOPEN-PENDING** | initial GQA-packed-UB hypothesis falsified by MoYoYoTech's 4:1 GQA success; likely cos/sin half-duplicated vs half-half mismatch on our side |
 | 10 | CannFusion | CP FFN Mm+epilogue | PARKED | A16W8 upstream |
 | 11 | M2 Talker aclGraph | Talker 28-layer forward | PENDING | +0.4-0.8 proj |
 | 12 | W4 quant | All W8 matmuls | PENDING | +2-5 (risky) |
 
-**Speaker notes**: Three dense stages — Talker 2024 ms, CP 1732 ms (biggest slice), codec decode (vocoder, separate story). CP is the target: 80-op aclnn chain runs 15× per frame × N frames — max amortisation surface. Walk the green nodes. W1 sits *between* CP forwards, not inside the layer — that's why it's +8.3 standalone: CPU-to-NPU migration of a 9.72 ms/frame cost, not an aclnn-chain optimisation. W3b and A.1 hit the same per-layer tails at different granularities; they compose because inplace bypasses a memcpy AddRmsNorm alone still pays. G2 captures the entire `forward_one_token_launch`, and the captured graph already contains W3b + A.1's fused nodes — aclGraph amortises dispatch *after* fusion collapses ops. M3N batches positions 0+1 at frame start — different axis from G2 (G2 amortises per-dispatch launch; M3N amortises prefill). Red nodes: every CLOSED track aimed further inside the CP layer, each failed for a **different** reason — Path C was 1949 drift, FFNV3 non-MoE runtime rejection, V2 RoPE GQA packed-UB, M3 RVQ strict dep. That variety validates probe-first: no single root cause to plan around. M2 Talker aclGraph and W4 quant are the two remaining structural levers; everything else hit a wall, cleanly.
+**Speaker notes**: Three dense stages — Talker 2024 ms, CP 1732 ms (biggest slice), codec decode (vocoder, separate story). CP is the target: 80-op aclnn chain runs 15× per frame × N frames — max amortisation surface. Walk the green nodes. W1 sits *between* CP forwards, not inside the layer — that's why it's +8.3 standalone: CPU-to-NPU migration of a 9.72 ms/frame cost, not an aclnn-chain optimisation. W3b and A.1 hit the same per-layer tails at different granularities; they compose because inplace bypasses a memcpy AddRmsNorm alone still pays. G2 captures the entire `forward_one_token_launch`, and the captured graph already contains W3b + A.1's fused nodes — aclGraph amortises dispatch *after* fusion collapses ops. M3N batches positions 0+1 at frame start — different axis from G2 (G2 amortises per-dispatch launch; M3N amortises prefill). Red nodes: every CLOSED track aimed further inside the CP layer, each failed for a **different** reason — Path C was 1949 drift, FFNV3 non-MoE runtime rejection, M3 RVQ strict dep. V2 RoPE was initially closed on a "GQA packed-UB" hypothesis that an adjacent MoE project on 16 × 910 gen1 has since falsified (they run V2 on 4:1 GQA successfully); we're reopening A.2 as a probe with cos/sin table prep as the leading reconciliation candidate. That variety validates probe-first: no single root cause to plan around, and the V2 RoPE reversal is itself a receipt for the orchestration mode "kill-cleanly-with-receipts — but stay open to new evidence". M2 Talker aclGraph and W4 quant are the two remaining structural levers; everything else hit a wall, cleanly.
 
 ---
 
@@ -336,7 +336,7 @@ The deepest agent-coding lever — on both NVIDIA and Apple — is the ability t
 3. **Gate-stop pattern** — agents stop at numeric gates; PM arbitrates before continuation. Receipt: W4.1.4 drift gate FAILED max_drift=1949; agent hard-stopped Path C right there. Zero silent continuation.
 4. **Patch-file review** — agent commits locally on remote host with no push creds; PM pulls patch + reviews + pushes from Mac. Receipt: every fork push this project (a3c9ebf1, d927758f, 9aada3e6, etc.) via `git format-patch + scp + git am + git push` from PM Mac.
 5. **Contract-per-track with umbrella** — each workstream is a contract doc with numeric milestones; umbrella contracts (40FPS_CONTRACT) subsume sub-contracts (FUSED_OP_LANDING) as milestones. Receipt: 6 contracts total, 5 sub-contract + 1 umbrella, clean hierarchy at `docs/contracts/`.
-6. **Kill-cleanly-with-receipts** — failed tracks get CLOSED contracts with root cause, not silent abandon. Receipts: Path C CLOSED with PC-tile structural finding; CannFusion CLOSED with dtype RED + upstream issue #26; V2 RoPE CLOSED with GQA packed-UB rootcause; FFNV3 CLOSED with no-MoE runtime rejection; M3 CLOSED with RVQ confirmation.
+6. **Kill-cleanly-with-receipts** — failed tracks get CLOSED contracts with root cause, not silent abandon; receipts also stay open to new evidence. Receipts: Path C CLOSED with PC-tile structural finding; CannFusion CLOSED with dtype RED + upstream issue #26; FFNV3 CLOSED with no-MoE runtime rejection; M3 CLOSED with RVQ confirmation; V2 RoPE initially CLOSED with GQA packed-UB rootcause → **REOPEN-PENDING** after MoYoYoTech 16×910 gen1 evidence falsified the hypothesis (their 4:1 GQA runs V2 cleanly; our likely delta is cos/sin table prep). Good receipts age honestly, including getting overturned.
 7. **Scaffold-probe-before-trust** — pre-existing env vars / scaffolds get probed before flipping as "easy wins". Receipt: `TALKER_CANN_GRAPH=1` existing scaffold probed this session, measured 30 → 18 fps regression in 25 min, disabled.
 8. **Projection discount** — apply 3-10× discount factor to agent estimates for planning. Receipts: G0 +6-10 fps projection vs +1.15 delivered (5-9×); M3N +1 fps vs +0.3 delivered (3×); Path C ~single-digit fps vs 0 (∞).
 9. **Noise-band characterization** — measure stock run-to-run variance before claiming sub-fps deltas. Receipt: this project established ~1 fps noise band on LONG 434-frame runs (29.9-32.2); A.1 +0.3 and M3N +0.3 now honestly framed as "within noise".
