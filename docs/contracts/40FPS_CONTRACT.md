@@ -139,6 +139,23 @@ group *i-1* to *i* makes batch=N impossible.
 M3 not dispatched. Fps ceiling without this lever = M1 + M2 + M3'new'
 = ~35-36 fps.
 
+### M1.B — aclnnFFNV3 — **CLOSED (A16W8 rejected at runtime)**
+
+Agent PB landed scaffolding (fork `9aada3e6`, env-gated off) but gates
+RED at runtime: `aclnnFFNV3`'s no-expert branch rejects `weight1=INT8`
+with error `EZ9999 161002: weight1 only support dtype float16 without
+expert tokens`. Vendor allows INT8 weight only when `expertTokens !=
+null` (MoE case). Qwen3-TTS CP is single-token, no MoE, so the
+no-expert branch is F16-only.
+
+Third vendor-op in a row to advertise A16W8 support and reject it at
+runtime (pattern: CannFusion validator whitelist, V2 RoPE packed-UB
+GQA incompat, FFNV3 no-MoE INT8 rejection). Generic Ascend fused-op
+APIs are A16W8-patchy; reliable A16W8 still only through
+`aclnnWeightQuantBatchMatmulV3`.
+
+Scaffolding preserved in-tree for future CANN-release unblock.
+
 ### M3'new' — Position 0+1 batching micro-opt (→ ~34.5 fps)
 
 Bonus finding from GD-audit: native CANN path issues 2 sequential
