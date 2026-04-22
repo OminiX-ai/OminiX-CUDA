@@ -244,6 +244,18 @@ private:
         void *gate_proj_scale = nullptr;
         void *up_proj_scale   = nullptr;
         void *down_proj_scale = nullptr;
+
+        // Phase B: gate||up concatenated INT8 weight + F16 scale, in the
+        // layout aclnnFFNV3 expects as its weight1 argument.
+        //   gate_up_w_i8: INT8 byte-concat of [gate_proj_w_i8, up_proj_w_i8]
+        //                 → row-major shape [2*inter, cp_hidden]. Viewed with
+        //                 strides [1, cp_hidden] this becomes the logical
+        //                 [K1, N1] = [cp_hidden, 2*inter] tensor FFNV3 reads.
+        //   gate_up_scale: F16 concat of [gate_proj_scale, up_proj_scale] →
+        //                  shape [2*inter]. Matches antiquantScale1 [N1].
+        // Allocated only when cp_ffn_v3_applied_. Null otherwise.
+        void *gate_up_w_i8  = nullptr;
+        void *gate_up_scale = nullptr;
     };
     std::vector<LayerWeights> layer_w_;
     void *final_norm_w_dev_ = nullptr;  // [cp_hidden] F32
@@ -445,6 +457,18 @@ private:
     bool cp_inplace_ars_enabled_ = false;
     bool cp_inplace_ars_applied_ = false;
 
+    // ---- Phase B: aclnnFFNV3 fused SwiGLU FFN (TALKER_CP_FFN_V3)
+    // When set AND g_cann.has_ffn_v3() AND w8_applied_, the 5-op FFN chain
+    // (gate-Mm + up-Mm + SiLU + mul + down-Mm) collapses into a single
+    // aclnnFFNV3 call with activation="swiglu". Requires the gate||up
+    // concatenated INT8 weight + F16 scale to be built at engine init (see
+    // build_ffn_v3_weights_). aclGraph capture is conservatively disabled
+    // when this flag is on — the FFN op-count changed (5→1) and the existing
+    // pos-keyed graphs must re-capture with FFNV3 in place; we let A.3-style
+    // composition verification handle that in a follow-up.
+    bool cp_ffn_v3_enabled_ = false;
+    bool cp_ffn_v3_applied_ = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -466,6 +490,26 @@ private:
     // TalkerCannEngine equivalent for the full shape contract.
     void w8_matmul_(const aclTensor *x, void *weight_dev, void *scale_dev,
                      int64_t out_n, int64_t in_k, const aclTensor *y);
+
+    // Phase B: at engine init under cp_ffn_v3_applied_, walk every layer_w_
+    // slot and build its gate||up concatenated INT8 weight blob +
+    // F16 scale blob (see LayerWeights.gate_up_w_i8 / .gate_up_scale). This
+    // is a device-to-device memcpy sequence — no host-side conversion. Must
+    // run AFTER w8_calibrate_weight_ has filled gate_proj_w_i8, up_proj_w_i8,
+    // gate_proj_scale, up_proj_scale on every layer.
+    bool build_ffn_v3_weights_();
+
+    // Phase B: fused SwiGLU FFN dispatch.
+    //   x_row:       F16 [1, cp_hidden] — post-RmsNorm input
+    //   y_row:       F16 [1, cp_hidden] — overwritten with down_proj output
+    //   gate_up_i8:  LayerWeights.gate_up_w_i8   (device buf)
+    //   gate_up_s:   LayerWeights.gate_up_scale  (device buf)
+    //   down_i8:     LayerWeights.down_proj_w_i8 (device buf)
+    //   down_s:      LayerWeights.down_proj_scale (device buf)
+    void ffn_v3_swiglu_(const aclTensor *x_row,
+                         void *gate_up_i8, void *gate_up_s,
+                         void *down_i8,    void *down_s,
+                         const aclTensor *y_row);
 
     // W1: upload per-group lm_head weights (F16) + allocate logits buffers.
     // No-op when already initialised. Caller provides the F32 host-side

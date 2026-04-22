@@ -185,6 +185,10 @@ CpCannEngine::~CpCannEngine() {
         free_dev(lw.gate_proj_scale);
         free_dev(lw.up_proj_scale);
         free_dev(lw.down_proj_scale);
+        // Phase B: fused FFN gate||up concat buffers (null unless
+        // cp_ffn_v3_applied_).
+        free_dev(lw.gate_up_w_i8);
+        free_dev(lw.gate_up_scale);
     }
     free_dev(final_norm_w_dev_);
     free_dev(final_norm_w_f16_dev_);
@@ -561,6 +565,212 @@ void CpCannEngine::w8_matmul_(const aclTensor *x,
     }
     g_cann.aclDestroyTensor(t_w);
     g_cann.aclDestroyTensor(t_scale);
+}
+
+// ============================================================================
+// Phase B: aclnnFFNV3 (fused SwiGLU FFN) — weight pack + dispatch
+// ============================================================================
+
+// Build per-layer gate||up concatenated INT8 weight + F16 scale blobs. The
+// two source buffers (gate_proj_w_i8, up_proj_w_i8) are row-major
+// [inter, cp_hidden] INT8, their scales are [inter] F16 (per-output-channel).
+// FFNV3 wants weight1 = [K1, N1] = [cp_hidden, 2*inter] logical; we keep the
+// physical storage as row-major [2*inter, cp_hidden] (byte-concat of the two
+// blobs) and view it with strides [1, cp_hidden] at dispatch time — the same
+// trick w8_matmul_ uses for single matmuls. Scales concat [inter]+[inter] →
+// [2*inter].
+//
+// SwiGLU convention: CANN's aclnnFFNV3 with activation="swiglu" appears to
+// treat the concatenation as [up || gate] with N1 split into halves where
+// first-half is the "up" (linear) branch and second-half is the "gate"
+// (silu-activated) branch. We pack as [gate || up] initially; if parity
+// fails, swap to [up || gate] (see TALKER_CP_FFN_V3_ORDER env).
+//
+// Default convention (gate-first): matches HF LLaMA/Qwen naming.
+// Alternate (up-first): matches some fused kernels — enable with
+// TALKER_CP_FFN_V3_ORDER=up_first.
+bool CpCannEngine::build_ffn_v3_weights_() {
+    if (!w8_applied_) return false;
+    if (layer_w_.empty()) return false;
+
+    // Determine concat order. Default is gate-first (matches HF naming).
+    // Override with TALKER_CP_FFN_V3_ORDER=up_first to swap branches.
+    bool up_first = false;
+    {
+        const char *env = getenv("TALKER_CP_FFN_V3_ORDER");
+        if (env && std::strcmp(env, "up_first") == 0) {
+            up_first = true;
+            printf("[cp_cann] Phase B: FFNV3 weight order = up_first "
+                   "(TALKER_CP_FFN_V3_ORDER=%s)\n", env);
+        } else {
+            printf("[cp_cann] Phase B: FFNV3 weight order = gate_first "
+                   "(default; set TALKER_CP_FFN_V3_ORDER=up_first to swap)\n");
+        }
+    }
+
+    const size_t per_proj_bytes   = (size_t)inter_ * cp_hidden_;         // INT8
+    const size_t per_scale_bytes  = (size_t)inter_ * sizeof(uint16_t);   // F16
+    const size_t concat_w_bytes   = per_proj_bytes * 2;
+    const size_t concat_s_bytes   = per_scale_bytes * 2;
+
+    for (int il = 0; il < (int)layer_w_.size(); ++il) {
+        auto &lw = layer_w_[il];
+        if (!lw.gate_proj_w_i8 || !lw.up_proj_w_i8 ||
+            !lw.gate_proj_scale || !lw.up_proj_scale) {
+            fprintf(stderr, "[cp_cann] build_ffn_v3_weights_: layer %d W8 "
+                            "buffers missing (gate/up not calibrated)\n", il);
+            return false;
+        }
+
+        void *first_w  = up_first ? lw.up_proj_w_i8  : lw.gate_proj_w_i8;
+        void *second_w = up_first ? lw.gate_proj_w_i8 : lw.up_proj_w_i8;
+        void *first_s  = up_first ? lw.up_proj_scale  : lw.gate_proj_scale;
+        void *second_s = up_first ? lw.gate_proj_scale : lw.up_proj_scale;
+
+        // Weight concat: [first | second] D2D → gate_up_w_i8.
+        void *w_dev = nullptr;
+        aclError err = g_cann.aclrtMalloc(&w_dev, concat_w_bytes,
+                                           ACL_MEM_MALLOC_HUGE_FIRST);
+        if (err != 0 || !w_dev) {
+            fprintf(stderr, "[cp_cann] build_ffn_v3_weights_: aclrtMalloc "
+                            "weight l=%d err=%d\n", il, (int)err);
+            return false;
+        }
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            w_dev, per_proj_bytes,
+            first_w, per_proj_bytes,
+            ACL_MEMCPY_DEVICE_TO_DEVICE));
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            (uint8_t *)w_dev + per_proj_bytes, per_proj_bytes,
+            second_w, per_proj_bytes,
+            ACL_MEMCPY_DEVICE_TO_DEVICE));
+
+        // Scale concat: [first | second] D2D → gate_up_scale.
+        void *s_dev = nullptr;
+        err = g_cann.aclrtMalloc(&s_dev, concat_s_bytes,
+                                  ACL_MEM_MALLOC_HUGE_FIRST);
+        if (err != 0 || !s_dev) {
+            fprintf(stderr, "[cp_cann] build_ffn_v3_weights_: aclrtMalloc "
+                            "scale l=%d err=%d\n", il, (int)err);
+            g_cann.aclrtFree(w_dev);
+            return false;
+        }
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            s_dev, per_scale_bytes,
+            first_s, per_scale_bytes,
+            ACL_MEMCPY_DEVICE_TO_DEVICE));
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            (uint8_t *)s_dev + per_scale_bytes, per_scale_bytes,
+            second_s, per_scale_bytes,
+            ACL_MEMCPY_DEVICE_TO_DEVICE));
+
+        lw.gate_up_w_i8  = w_dev;
+        lw.gate_up_scale = s_dev;
+    }
+
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    return true;
+}
+
+// Dispatch aclnnFFNV3 for one row. Caller provides the input + output F16
+// [1, cp_hidden] aclTensors plus the four device buffers (gate||up INT8 +
+// scale, down INT8 + scale). We build the weight/scale aclTensors fresh
+// each call — they're cheap aclTensor handles over persistent device mem.
+void CpCannEngine::ffn_v3_swiglu_(const aclTensor *x_row,
+                                    void *gate_up_i8, void *gate_up_s,
+                                    void *down_i8,    void *down_s,
+                                    const aclTensor *y_row) {
+    const int64_t two_inter = 2 * (int64_t)inter_;
+
+    // weight1: INT8 view as logical [K1, N1] = [cp_hidden, 2*inter]. The
+    // underlying storage is row-major [2*inter, cp_hidden] (byte-concat
+    // of the two per-out-channel INT8 blobs). Strides [1, cp_hidden] present
+    // the transposed view FFNV3 consumes. Same trick as w8_matmul_.
+    int64_t w1_shape[2]   = {cp_hidden_, two_inter};
+    int64_t w1_strides[2] = {1, cp_hidden_};
+    int64_t w1_storage    = two_inter * cp_hidden_;
+    aclTensor *t_w1 = g_cann.aclCreateTensor(
+        w1_shape, 2, ACL_INT8, w1_strides, 0, ACL_FORMAT_ND,
+        &w1_storage, 1, gate_up_i8);
+
+    // weight2: INT8 [K2, N2] = [inter, cp_hidden] (down_proj). Storage is
+    // row-major [cp_hidden, inter]; strides [1, inter] view as [inter, cp_hidden].
+    int64_t w2_shape[2]   = {inter_, cp_hidden_};
+    int64_t w2_strides[2] = {1, inter_};
+    int64_t w2_storage    = cp_hidden_ * inter_;
+    aclTensor *t_w2 = g_cann.aclCreateTensor(
+        w2_shape, 2, ACL_INT8, w2_strides, 0, ACL_FORMAT_ND,
+        &w2_storage, 1, down_i8);
+
+    // antiquantScale1: F16 [2*inter].
+    int64_t s1_shape[1]   = {two_inter};
+    int64_t s1_strides[1] = {1};
+    int64_t s1_storage    = two_inter;
+    aclTensor *t_aqs1 = g_cann.aclCreateTensor(
+        s1_shape, 1, ACL_FLOAT16, s1_strides, 0, ACL_FORMAT_ND,
+        &s1_storage, 1, gate_up_s);
+
+    // antiquantScale2: F16 [cp_hidden].
+    int64_t s2_shape[1]   = {cp_hidden_};
+    int64_t s2_strides[1] = {1};
+    int64_t s2_storage    = cp_hidden_;
+    aclTensor *t_aqs2 = g_cann.aclCreateTensor(
+        s2_shape, 1, ACL_FLOAT16, s2_strides, 0, ACL_FORMAT_ND,
+        &s2_storage, 1, down_s);
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    // innerPrecise=1 = high-performance (matches w8_matmul_'s choice; per the
+    // header, this flag only affects FLOAT16 paths — our x is F16 so it
+    // applies).
+    aclnnStatus s = g_cann.aclnnFFNV3GetWorkspaceSize(
+        /*x*/               x_row,
+        /*weight1*/         t_w1,
+        /*weight2*/         t_w2,
+        /*expertTokens*/    nullptr,
+        /*bias1*/           nullptr,
+        /*bias2*/           nullptr,
+        /*scale*/           nullptr,
+        /*offset*/          nullptr,
+        /*deqScale1*/       nullptr,
+        /*deqScale2*/       nullptr,
+        /*antiquantScale1*/ t_aqs1,
+        /*antiquantScale2*/ t_aqs2,
+        /*antiquantOffset1*/ nullptr,
+        /*antiquantOffset2*/ nullptr,
+        /*activation*/      "swiglu",
+        /*innerPrecise*/    1,
+        /*tokensIndexFlag*/ false,
+        /*y*/               y_row,
+        &ws_needed, &exec);
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] aclnnFFNV3GetWorkspaceSize status=%d msg=%s\n",
+                (int)s,
+                g_cann.aclGetRecentErrMsg ? g_cann.aclGetRecentErrMsg() : "?");
+        g_cann.aclDestroyTensor(t_w1);
+        g_cann.aclDestroyTensor(t_w2);
+        g_cann.aclDestroyTensor(t_aqs1);
+        g_cann.aclDestroyTensor(t_aqs2);
+        return;
+    }
+    if (ws_needed > workspace_size_) {
+        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        workspace_size_ = ws_needed;
+    }
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    s = g_cann.aclnnFFNV3(ws, ws_needed, exec, stream_);
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] aclnnFFNV3 launch status=%d msg=%s\n",
+                (int)s,
+                g_cann.aclGetRecentErrMsg ? g_cann.aclGetRecentErrMsg() : "?");
+    }
+
+    g_cann.aclDestroyTensor(t_w1);
+    g_cann.aclDestroyTensor(t_w2);
+    g_cann.aclDestroyTensor(t_aqs1);
+    g_cann.aclDestroyTensor(t_aqs2);
 }
 
 // ============================================================================
@@ -1160,6 +1370,38 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
                "replaces aclnnAddRmsNorm + residual-copy at each fused tail.\n");
     }
 
+    // Phase B: opt-in aclnnFFNV3. Requires w8_applied_ (the fused kernel
+    // consumes the A16W8 antiquant scale path) and the runtime symbol. Builds
+    // the gate||up concatenated INT8 + F16 scale blobs per layer at init.
+    {
+        const char *env = getenv("TALKER_CP_FFN_V3");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_ffn_v3_enabled_ = true;
+        }
+    }
+    cp_ffn_v3_applied_ = cp_ffn_v3_enabled_ &&
+                         w8_applied_ &&
+                         g_cann.has_ffn_v3();
+    if (cp_ffn_v3_enabled_ && !w8_applied_) {
+        printf("[cp_cann] TALKER_CP_FFN_V3 requested but A16W8 is not "
+               "active — aclnnFFNV3 requires INT8 weights + F16 antiquant "
+               "scales. Staying on stock 5-op FFN chain.\n");
+    }
+    if (cp_ffn_v3_enabled_ && w8_applied_ && !g_cann.has_ffn_v3()) {
+        printf("[cp_cann] TALKER_CP_FFN_V3 requested but aclnnFFNV3 symbol "
+               "absent — staying on stock 5-op FFN chain.\n");
+    }
+    if (cp_ffn_v3_applied_) {
+        if (!build_ffn_v3_weights_()) {
+            printf("[cp_cann] build_ffn_v3_weights_ failed — falling back to "
+                   "stock FFN chain.\n");
+            cp_ffn_v3_applied_ = false;
+        } else {
+            printf("[cp_cann] Phase B ENABLED: aclnnFFNV3 (swiglu) replaces "
+                   "the 5-op FFN chain (gate-Mm+up-Mm+SiLU+mul+down-Mm).\n");
+        }
+    }
+
     // W4.1: opt-in AscendC fused attention sublayer. Requires
     // QWEN_TTS_HAS_ASCENDC (build-time) AND w8_applied_ (weights in INT8
     // layout the kernel consumes) AND TALKER_CP_ASCENDC=1 (runtime gate).
@@ -1498,6 +1740,38 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     if (cp_inplace_ars_applied_) {
         printf("[cp_cann] Phase A.1 ENABLED: aclnnInplaceAddRmsNorm "
                "replaces aclnnAddRmsNorm + residual-copy at each fused tail.\n");
+    }
+
+    // Phase B: opt-in aclnnFFNV3. Requires w8_applied_ (the fused kernel
+    // consumes the A16W8 antiquant scale path) and the runtime symbol. Builds
+    // the gate||up concatenated INT8 + F16 scale blobs per layer at init.
+    {
+        const char *env = getenv("TALKER_CP_FFN_V3");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_ffn_v3_enabled_ = true;
+        }
+    }
+    cp_ffn_v3_applied_ = cp_ffn_v3_enabled_ &&
+                         w8_applied_ &&
+                         g_cann.has_ffn_v3();
+    if (cp_ffn_v3_enabled_ && !w8_applied_) {
+        printf("[cp_cann] TALKER_CP_FFN_V3 requested but A16W8 is not "
+               "active — aclnnFFNV3 requires INT8 weights + F16 antiquant "
+               "scales. Staying on stock 5-op FFN chain.\n");
+    }
+    if (cp_ffn_v3_enabled_ && w8_applied_ && !g_cann.has_ffn_v3()) {
+        printf("[cp_cann] TALKER_CP_FFN_V3 requested but aclnnFFNV3 symbol "
+               "absent — staying on stock 5-op FFN chain.\n");
+    }
+    if (cp_ffn_v3_applied_) {
+        if (!build_ffn_v3_weights_()) {
+            printf("[cp_cann] build_ffn_v3_weights_ failed — falling back to "
+                   "stock FFN chain.\n");
+            cp_ffn_v3_applied_ = false;
+        } else {
+            printf("[cp_cann] Phase B ENABLED: aclnnFFNV3 (swiglu) replaces "
+                   "the 5-op FFN chain (gate-Mm+up-Mm+SiLU+mul+down-Mm).\n");
+        }
     }
 
     // W4.1: opt-in AscendC fused attention sublayer. Same env+build-gate
@@ -1905,7 +2179,21 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
         // AddRmsNorm consumes it as the x2 addend).
         void *post_ffn_rhs_dev = cp_inplace_ars_applied_ ? normed_dev_
                                                          : ffn_out_dev_;
-        {
+        if (cp_ffn_v3_applied_) {
+            // Phase B: fused SwiGLU FFN — one op replaces gate-Mm+up-Mm+
+            // SiLU+mul+down-Mm. Intermediate gate/up buffers unused.
+            aclTensor *t_n_row   = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_ffn_row = tensor_2d(post_ffn_rhs_dev, 1, cp_hidden_,
+                                              ACL_FLOAT16);
+            ffn_v3_swiglu_(t_n_row,
+                           layer_w_[il].gate_up_w_i8,
+                           layer_w_[il].gate_up_scale,
+                           layer_w_[il].down_proj_w_i8,
+                           layer_w_[il].down_proj_scale,
+                           t_ffn_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else {
             aclTensor *t_n_row    = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
             aclTensor *t_gate_row = tensor_2d(gate_dev_, 1, inter_, ACL_FLOAT16);
             aclTensor *t_up_row   = tensor_2d(up_dev_,   1, inter_, ACL_FLOAT16);
@@ -2023,6 +2311,18 @@ void CpCannEngine::capture_aclgraph_forwards_() {
                         "TALKER_CP_INPLACE_ADDRMSNORM is also set — "
                         "aclgraph capture disabled for A.1/A.2 (re-enabled "
                         "in A.3 after parity verified).\n");
+        return;
+    }
+    // Phase B: disable aclGraph capture while FFN_V3 is on. The FFN op-count
+    // changed (5→1) so the captured pos-keyed graphs would need to re-capture
+    // with FFNV3 in place. Conservative choice: stay on eager FFNV3 for
+    // first landing; a follow-up (B.A.3-style) can re-enable after verifying
+    // the capture sees the fused op correctly.
+    if (cp_ffn_v3_applied_) {
+        fprintf(stderr, "[cp_cann] TALKER_CP_ACLGRAPH=1 but "
+                        "TALKER_CP_FFN_V3 is also set — aclgraph capture "
+                        "disabled for Phase B landing (re-enabled after "
+                        "FFNV3-captured parity verified).\n");
         return;
     }
 
@@ -2617,9 +2917,24 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         // FFN gate/up/down: W8 > NZ > ND. Phase A.1: when inplace is active,
         // route the down-proj output into normed_dev_ so the subsequent
         // InplaceAddRmsNorm's x1Ref already holds the FFN addend.
+        // Phase B: when FFN_V3 is active we collapse the 5-op chain into
+        // aclnnFFNV3; the capturable variant mirrors eager so aclGraph
+        // re-capture (when enabled post-B) picks up the fused op.
         void *post_ffn_rhs_dev = cp_inplace_ars_applied_ ? normed_dev_
                                                          : ffn_out_dev_;
-        if (w8_applied_) {
+        if (cp_ffn_v3_applied_) {
+            aclTensor *t_n_row   = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_ffn_row = tensor_2d(post_ffn_rhs_dev, 1, cp_hidden_,
+                                              ACL_FLOAT16);
+            ffn_v3_swiglu_(t_n_row,
+                           layer_w_[il].gate_up_w_i8,
+                           layer_w_[il].gate_up_scale,
+                           layer_w_[il].down_proj_w_i8,
+                           layer_w_[il].down_proj_scale,
+                           t_ffn_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else if (w8_applied_) {
             aclTensor *t_n_row    = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
             aclTensor *t_gate_row = tensor_2d(gate_dev_, 1, inter_, ACL_FLOAT16);
             aclTensor *t_up_row   = tensor_2d(up_dev_,   1, inter_, ACL_FLOAT16);
