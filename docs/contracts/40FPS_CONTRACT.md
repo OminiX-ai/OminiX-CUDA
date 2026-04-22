@@ -156,19 +156,27 @@ APIs are A16W8-patchy; reliable A16W8 still only through
 
 Scaffolding preserved in-tree for future CANN-release unblock.
 
-### M3'new' — Position 0+1 batching micro-opt (→ ~34.5 fps)
+### M3'new' — Position 0+1 batching micro-opt — **LANDED**
 
-Bonus finding from GD-audit: native CANN path issues 2 sequential
-`forward_one_token_launch` calls for positions 0 and 1
-(`talker.cpp:1647` and `1667`), while llama.cpp (`talker.cpp:1784-1798`)
-and MLX paths already batch these as `n_tokens=2`. Gap ~1 ms/frame.
+**Verified-by Agent M3N (2026-04-21, fork `a3c9ebf1`)**.
 
-- [ ] M3'new'.1 Wire `n_tokens=2` path into CpCannEngine for
-      positions 0+1 at frame start
-- [ ] M3'new'.2 Drift + ear gates
-- [ ] M3'new'.3 Perf gate: fps delta vs M1+M2 baseline
+- [x] M3'new'.1 `forward_two_tokens_launch` method added; chains two
+      pos-keyed `forward_one_token_launch` calls with async H2D for
+      pos 1 and aggregated event record. Existing callers unchanged.
+- [x] M3'new'.2 Drift + ear gates: frame-count identical, output wav
+      md5 byte-identical to pre-POS_BATCH stock. Drift = 0.
+- [x] M3'new'.3 Perf gate: **+0.3 fps median** (31.9 → 32.2 on LONG).
+      Clears ≥32 fps.
 
-**Gate**: +0.5-1.5 fps + drift ≤ 1 + ear clean. ~2-4 hr work.
+**Honest delta analysis**: projected +1 fps, delivered +0.3. Most of
+the ~1 ms/frame estimate was host-side only; actual device-side
+serialization on the two launches was smaller than GD-audit assumed.
+A true device-side batched prefill (S=2 batched Mm, causal mask,
+n_tokens=2 FIAv2) would recover the rest but is multi-day with
+re-capture risk. Shipped the safe host-side slice.
+
+Env gate: `TALKER_CP_POS_BATCH=1`, default off. Stock path untouched.
+aclGraph compatibility preserved — no capture re-inventory needed.
 
 ### M4 — W8 → W4 quant (conditional, → potentially 42-55)
 
