@@ -1,31 +1,55 @@
 // ============================================================================
-// ImageDiffusionEngine — Phase 2 body.
+// ImageDiffusionEngine — Phase 2.1 body (Q4-resident load path).
 //
-// Phase 1 (a50d0174) shipped the scaffold (constructor / dtor / device open).
-// Phase 2 fills `init_from_gguf` with real weight traversal + preload-dequant
-// to F16 + H2D upload for every DiT tensor the reference path in
-// tools/ominix_diffusion/src/qwen_image.hpp touches, plus the 3D-axial RoPE
-// pre-compute (Q0.5.3 MUST-HAVE). `forward` / `denoise` still stub out —
-// Phase 3 / 4 fill those.
+// Phase 1  (a50d0174): scaffold (constructor / dtor / device open).
+// Phase 2  (0f860c5b): preload-dequant to F16 — RED on ac03, OOM at 26.3 GiB
+//                      mid-upload (docs/qie_q2_p2_smoke.md). The published
+//                      Qwen-Image-Edit-2509-Q4_0 GGUF contains 1933 tensors
+//                      totalling 40.86 GB F16-equiv, not the ~13 GB the
+//                      contract originally budgeted.
+// Phase 2.1 (this file after Q2.1 rewrite): keep Q4_0 tensors COMPRESSED on
+//                      device. Each big Linear weight becomes a pair:
+//                        - INT4 packed buffer, shape [K, N] K-contiguous
+//                          (K*N/2 bytes), per `docs/qie_q2_q4resident_probe.md`
+//                          "transposeB-style view" expected by WQBMMv3.
+//                        - F16 per-group scale buffer, shape [K/32, N], with
+//                          group size 32 = Q4_0 block size exactly.
+//                      Forward-path matmul (Phase 2) dispatches via
+//                      aclnnWeightQuantBatchMatmulV3 with
+//                      antiquantGroupSize=32, same dispatch shape as TTS's
+//                      w8_matmul_ but per-group instead of per-channel.
 //
-// Preload-dequant rationale (primary NaN fix hypothesis per Q1 baseline):
-//   Q4_1 / Q5_K on-disk weights are dequantised ONCE at session start via
-//   ggml's type-traits `to_float`, then re-packed as F16 and uploaded to
-//   resident NPU buffers. Per-step forward then reads from resident F16 —
-//   no per-step D2H/H2D round-trip through ggml-cann. HBM budget per
-//   contract §Q2:  ~13 GB F16 DiT weights (up from 5 GB Q4 on disk) + 7 GB
-//   activations/workspace = 20 GB total → fits 32 GB with margin.
+// Offset compensation (probe doc §"First-run trap", Option 1 — nibble XOR):
+//   GGUF Q4_0 stores each nibble as an unsigned bias-8 integer in [0..15];
+//   the dequant formula is `(u - 8) * d`. WQBMMv3 with
+//   antiquantOffsetOptional=nullptr interprets the nibble as SIGNED
+//   two's-complement in [-8, +7]. Repacking does `s = u - 8`, encoded as
+//   `s & 0x0f`, equivalent to `u ^ 0x08`. The probe verified this path
+//   (cos_sim 0.999 vs CPU dequant reference); we must match that encoding
+//   here or we get the -0.56 cos_sim regression the probe documented.
 //
-// Tensor name convention: diffusers-style
+// HBM budget (probe doc §"Notes for Phase 1 scoping"):
+//   W4 weights: 40.86 GiB / 8 = 5.11 GiB resident
+//   Scales:     40.86 GiB / 16 = ~1.27 GiB worst case (F16 one per 32 elts)
+//               — but we only emit scales for tensors that arrive as Q4_0;
+//               non-Q4 tensors stay single-F16-buffer (no scale) so true
+//               scale total is strictly the DiT matmul subset
+//   Norms/biases F16: ~80 MiB
+//   Scratch: ~2 GiB
+//   Expected peak: < 9 GiB (Phase 1 smoke gate).
+//
+// Non-Q4 tensors (biases, 1D RMSNorm gammas, any test GGUF that ships
+// weights as F16/F32 instead of Q4_0) fall through to the existing
+// dequant-to-F16 upload path. The resulting buffer lives in the same
+// `_w_q4` pointer as its Q4 sibling would; its `_scale` companion stays
+// null so forward-path dispatch can detect F16-fallback via scale==null
+// and route to plain aclnnMm.
+//
+// Tensor name convention: diffusers-style (unchanged from Phase 2)
 //   "transformer_blocks.<i>.attn.to_q.weight"
-//   "transformer_blocks.<i>.img_mod.1.weight"
 //   "transformer_blocks.<i>.img_mlp.net.0.proj.weight"
 //   ...
-// Same names the ominix_diffusion CPU path uses — see qwen_image.hpp and
-// name_conversion.cpp. We do NOT use the llama-style "blk.<i>.*" scheme.
-//
-// LayerNorm affine=false on img_norm1/2 and txt_norm1/2 per qwen_image.hpp:
-// we try-upload gamma/beta but tolerate their absence (nullptr kept).
+// LayerNorm affine=false on img/txt_norm1/2 per qwen_image.hpp — tolerated.
 // ============================================================================
 
 #include "image_diffusion_engine.h"
@@ -229,6 +253,211 @@ bool try_dequant_upload_f16(ggml_context *ggml_ctx, const char *name,
 }
 
 // ---------------------------------------------------------------------------
+// Q2.1: Re-tile a Q4_0 GGUF tensor into WQBMMv3's weight-layout convention.
+//
+// GGUF Q4_0 row layout (per `block_q4_0` in ggml/src/ggml-common.h:170-174
+// and `dequantize_row_q4_0` in ggml/src/ggml-quants.c:307-325):
+//   A weight matrix of shape [N=ne[1], K=ne[0]] is stored row-by-row, one row
+//   per output channel. Each row of K elements is split into K/32 blocks; each
+//   block occupies 18 bytes — 2 bytes ggml_half scale `d` followed by 16 bytes
+//   of nibble quants `qs[0..15]`. Inside a block, `qs[j]` low nibble holds
+//   element at intra-block index `j` (range 0..15) and `qs[j]` high nibble
+//   holds the element at `j + 16`. Each nibble is an UNSIGNED bias-8 integer
+//   `u ∈ [0..15]`, dequantised as `(u - 8) * d`.
+//
+// WQBMMv3 weight view (per `docs/qie_q2_q4resident_probe.md` §"Probe spec"):
+//   shape [K, N], strides (1, K). Storage is `K*N` INT4 elements packed two
+//   per byte. For weight `w[k, n]`, the nibble's linear index is
+//   `lin = n * K + k`; `lin` even → low nibble of byte `lin/2`; `lin` odd →
+//   high nibble. Each nibble is SIGNED two's-complement 4-bit in [-8, +7] —
+//   symmetric quant with `antiquantOffsetOptional=nullptr`.
+//
+// Scale view (per probe): shape [K/32, N], strides (N, 1) row-major. One F16
+// scale per (block_index, output_column).
+//
+// This helper reads the GGUF tensor's raw bytes (NO ggml dequant pass), emits
+// two host buffers in the layouts above, and uploads both to fresh NPU
+// device allocations. The offset compensation (`u ^ 0x08`) is applied at
+// repack time — the probe RED'd its first run using the bias-8 encoding
+// directly with `antiquantOffsetOptional=nullptr` and got cos_sim = -0.556.
+// ---------------------------------------------------------------------------
+bool repack_q4_0_upload(ggml_tensor *t,
+                        int64_t expected_K, int64_t expected_N,
+                        void *&w_dev, void *&scale_dev,
+                        size_t &stats_w_bytes, size_t &stats_scale_bytes,
+                        int64_t &stats_q4_tensors,
+                        int64_t &stats_count,
+                        double &repack_ms) {
+    // Q4_0 per ggml-common.h:170
+    constexpr int64_t QK4_0 = 32;
+    if (t->type != GGML_TYPE_Q4_0) return false;
+
+    // ggml Q4_0 tensor layout: ne[0] is the blocked (K) dim — it's the dim
+    // `ggml_row_size` requires to be divisible by 32. ne[1] is the outer (N)
+    // dim stored row-by-row. Reject anything that doesn't match this contract.
+    const int64_t K = t->ne[0];
+    const int64_t N = t->ne[1];
+    if (K != expected_K || N != expected_N) {
+        QIE_LOG("%s: Q4_0 shape mismatch got [K=%lld, N=%lld] "
+                "expected [K=%lld, N=%lld]",
+                t->name, (long long)K, (long long)N,
+                (long long)expected_K, (long long)expected_N);
+        return false;
+    }
+    if (K % QK4_0 != 0) {
+        QIE_LOG("%s: Q4_0 K=%lld not divisible by 32", t->name, (long long)K);
+        return false;
+    }
+    const int64_t BLK = K / QK4_0;             // blocks per row
+    const size_t  BLK_BYTES = 2 /*scale*/ + 16 /*qs*/;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Host output: packed nibbles K*N/2 bytes + F16 scales [BLK, N].
+    std::vector<uint8_t>  out_w((size_t)K * N / 2, 0);
+    std::vector<uint16_t> out_s((size_t)BLK * N, 0);
+
+    const uint8_t *src = (const uint8_t *)t->data;
+
+    // Re-tile row-by-row. For each output-channel n:
+    //   for each block b:
+    //     scale_f16 = row[b].d
+    //     for each intra-block pair j (0..15):
+    //       u_lo = qs[j] & 0x0f    → element k0 = b*32 + j
+    //       u_hi = qs[j] >> 4      → element k1 = b*32 + j + 16
+    //       signed s_lo = u_lo - 8 → packed byte at (n*K + k0)/2
+    //       signed s_hi = u_hi - 8 → packed byte at (n*K + k1)/2
+    //
+    // We apply `u ^ 0x08` (≡ subtract 8 mod 16) to flip the bias-8 encoding
+    // into signed two's-complement 4-bit.
+    for (int64_t n = 0; n < N; ++n) {
+        const uint8_t *row_src = src + (size_t)n * BLK * BLK_BYTES;
+        uint8_t       *row_dst = out_w.data();       // packed output base
+        const size_t   n_base_nib = (size_t)n * K;   // linear index of w[0, n]
+
+        for (int64_t b = 0; b < BLK; ++b) {
+            const uint8_t *blk = row_src + (size_t)b * BLK_BYTES;
+
+            // Scale: little-endian ggml_half, two bytes at the start of block.
+            uint16_t d;
+            std::memcpy(&d, blk, sizeof(uint16_t));
+            out_s[(size_t)b * N + n] = d;
+
+            const uint8_t *qs = blk + 2;
+            const size_t block_nib_base = n_base_nib + (size_t)b * QK4_0;
+            for (int64_t j = 0; j < QK4_0 / 2; ++j) {
+                const uint8_t byte = qs[j];
+                // `u ^ 0x08`: bias-8 unsigned → signed two's-complement nibble.
+                const uint8_t s_lo = (uint8_t)((byte & 0x0f) ^ 0x08);
+                const uint8_t s_hi = (uint8_t)(((byte >> 4) & 0x0f) ^ 0x08);
+
+                // Element k0 = b*32 + j → linear index `block_nib_base + j`.
+                const size_t lin_lo = block_nib_base + (size_t)j;
+                // Element k1 = b*32 + j + 16.
+                const size_t lin_hi = block_nib_base + (size_t)j + (QK4_0 / 2);
+
+                auto write_nib = [&](size_t lin, uint8_t nib) {
+                    uint8_t &b_out = row_dst[lin / 2];
+                    if ((lin & 1u) == 0u) {
+                        b_out = (uint8_t)((b_out & 0xf0) | (nib & 0x0fu));
+                    } else {
+                        b_out = (uint8_t)((b_out & 0x0f) | (uint8_t)(nib << 4));
+                    }
+                };
+                write_nib(lin_lo, s_lo);
+                write_nib(lin_hi, s_hi);
+            }
+        }
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    repack_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Upload packed nibbles.
+    const size_t w_bytes = out_w.size();
+    aclError err = g_cann.aclrtMalloc(&w_dev, w_bytes,
+                                       ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0) {
+        QIE_LOG("%s: aclrtMalloc(q4 %zu) failed err=%d",
+                t->name, w_bytes, (int)err);
+        w_dev = nullptr;
+        return false;
+    }
+    err = g_cann.aclrtMemcpy(w_dev, w_bytes, out_w.data(), w_bytes,
+                             ACL_MEMCPY_HOST_TO_DEVICE);
+    if (err != 0) {
+        QIE_LOG("%s: aclrtMemcpy(q4 H2D %zu) failed err=%d",
+                t->name, w_bytes, (int)err);
+        g_cann.aclrtFree(w_dev); w_dev = nullptr;
+        return false;
+    }
+
+    // Upload per-group scales.
+    const size_t s_bytes = out_s.size() * sizeof(uint16_t);
+    err = g_cann.aclrtMalloc(&scale_dev, s_bytes,
+                              ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0) {
+        QIE_LOG("%s: aclrtMalloc(scale %zu) failed err=%d",
+                t->name, s_bytes, (int)err);
+        g_cann.aclrtFree(w_dev); w_dev = nullptr;
+        scale_dev = nullptr;
+        return false;
+    }
+    err = g_cann.aclrtMemcpy(scale_dev, s_bytes, out_s.data(), s_bytes,
+                             ACL_MEMCPY_HOST_TO_DEVICE);
+    if (err != 0) {
+        QIE_LOG("%s: aclrtMemcpy(scale H2D %zu) failed err=%d",
+                t->name, s_bytes, (int)err);
+        g_cann.aclrtFree(w_dev);     w_dev = nullptr;
+        g_cann.aclrtFree(scale_dev); scale_dev = nullptr;
+        return false;
+    }
+
+    stats_w_bytes     += w_bytes;
+    stats_scale_bytes += s_bytes;
+    stats_q4_tensors  += 1;
+    stats_count       += 1;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.1 matmul-weight entry point: if the GGUF tensor is Q4_0, keep it
+// compressed on device via repack_q4_0_upload(); otherwise fall back to the
+// existing dequant-to-F16 upload. Forward-path branches on `scale_dev != null`
+// to decide WQBMMv3 vs aclnnMm dispatch.
+//
+// Shape convention: caller passes logical (K=in_features, N=out_features).
+// Q4_0 tensors pack as [K, N] K-contiguous; F16 fallback keeps the original
+// N*K element count — the forward path handles dtype-specific layout itself.
+// ---------------------------------------------------------------------------
+bool load_matmul_weight_upload(ggml_context *ggml_ctx, const char *name,
+                               int64_t K, int64_t N,
+                               void *&w_dev, void *&scale_dev,
+                               DiTInitStats &stats,
+                               double &load_ms) {
+    ggml_tensor *t = get_gguf_tensor_flex(ggml_ctx, name);
+    if (!t) {
+        QIE_LOG("%s: not found in GGUF", name);
+        return false;
+    }
+    if (t->type == GGML_TYPE_Q4_0) {
+        return repack_q4_0_upload(t, K, N, w_dev, scale_dev,
+                                   stats.q4_weight_bytes,
+                                   stats.q4_scale_bytes,
+                                   stats.q4_tensors,
+                                   stats.tensors_uploaded,
+                                   load_ms);
+    }
+    // Fallback: dequant-to-F16 path. `scale_dev` stays null so forward can
+    // branch on scale-null → aclnnMm / scale-non-null → WQBMMv3.
+    scale_dev = nullptr;
+    const size_t expected = (size_t)K * N;
+    stats.f16_fallback_tensors += 1;
+    return dequant_upload_f16(ggml_ctx, name, expected, w_dev,
+                              stats.f16_weight_bytes,
+                              stats.tensors_uploaded, load_ms);
+}
+
+// ---------------------------------------------------------------------------
 // 3D axial RoPE pre-compute (Q0.5.3 verdict: retire V2 packed layout; MLX
 // numbers prefer pre-compute tables).
 //
@@ -390,37 +619,47 @@ ImageDiffusionEngine::~ImageDiffusionEngine() {
     };
 
     for (auto &lw : layer_w_) {
-        free_dev(lw.to_q_w);         free_dev(lw.to_q_b);
-        free_dev(lw.to_k_w);         free_dev(lw.to_k_b);
-        free_dev(lw.to_v_w);         free_dev(lw.to_v_b);
-        free_dev(lw.to_out_0_w);     free_dev(lw.to_out_0_b);
-        free_dev(lw.add_q_w);        free_dev(lw.add_q_b);
-        free_dev(lw.add_k_w);        free_dev(lw.add_k_b);
-        free_dev(lw.add_v_w);        free_dev(lw.add_v_b);
-        free_dev(lw.to_add_out_w);   free_dev(lw.to_add_out_b);
+        // Attention img-side: (w_q4, scale, b) per projection.
+        free_dev(lw.to_q_w_q4);      free_dev(lw.to_q_scale);      free_dev(lw.to_q_b);
+        free_dev(lw.to_k_w_q4);      free_dev(lw.to_k_scale);      free_dev(lw.to_k_b);
+        free_dev(lw.to_v_w_q4);      free_dev(lw.to_v_scale);      free_dev(lw.to_v_b);
+        free_dev(lw.to_out_0_w_q4);  free_dev(lw.to_out_0_scale);  free_dev(lw.to_out_0_b);
+        // Attention txt-side.
+        free_dev(lw.add_q_w_q4);     free_dev(lw.add_q_scale);     free_dev(lw.add_q_b);
+        free_dev(lw.add_k_w_q4);     free_dev(lw.add_k_scale);     free_dev(lw.add_k_b);
+        free_dev(lw.add_v_w_q4);     free_dev(lw.add_v_scale);     free_dev(lw.add_v_b);
+        free_dev(lw.to_add_out_w_q4); free_dev(lw.to_add_out_scale); free_dev(lw.to_add_out_b);
+        // Norm gammas (1D, no scale pair).
         free_dev(lw.norm_q_w);       free_dev(lw.norm_k_w);
         free_dev(lw.norm_added_q_w); free_dev(lw.norm_added_k_w);
         free_dev(lw.img_norm1_w);    free_dev(lw.img_norm1_b);
         free_dev(lw.img_norm2_w);    free_dev(lw.img_norm2_b);
         free_dev(lw.txt_norm1_w);    free_dev(lw.txt_norm1_b);
         free_dev(lw.txt_norm2_w);    free_dev(lw.txt_norm2_b);
-        free_dev(lw.img_mod_w);      free_dev(lw.img_mod_b);
-        free_dev(lw.txt_mod_w);      free_dev(lw.txt_mod_b);
-        free_dev(lw.img_ff_up_w);    free_dev(lw.img_ff_up_b);
-        free_dev(lw.img_ff_down_w);  free_dev(lw.img_ff_down_b);
-        free_dev(lw.txt_ff_up_w);    free_dev(lw.txt_ff_up_b);
-        free_dev(lw.txt_ff_down_w);  free_dev(lw.txt_ff_down_b);
-        free_dev(lw.to_q_w_i4);      free_dev(lw.to_q_scale_f16);
+        // Modulation heads.
+        free_dev(lw.img_mod_w_q4);   free_dev(lw.img_mod_scale);   free_dev(lw.img_mod_b);
+        free_dev(lw.txt_mod_w_q4);   free_dev(lw.txt_mod_scale);   free_dev(lw.txt_mod_b);
+        // FFN up/down.
+        free_dev(lw.img_ff_up_w_q4);   free_dev(lw.img_ff_up_scale);   free_dev(lw.img_ff_up_b);
+        free_dev(lw.img_ff_down_w_q4); free_dev(lw.img_ff_down_scale); free_dev(lw.img_ff_down_b);
+        free_dev(lw.txt_ff_up_w_q4);   free_dev(lw.txt_ff_up_scale);   free_dev(lw.txt_ff_up_b);
+        free_dev(lw.txt_ff_down_w_q4); free_dev(lw.txt_ff_down_scale); free_dev(lw.txt_ff_down_b);
     }
     layer_w_.clear();
 
-    free_dev(global_w_.time_linear1_w);    free_dev(global_w_.time_linear1_b);
-    free_dev(global_w_.time_linear2_w);    free_dev(global_w_.time_linear2_b);
-    free_dev(global_w_.img_in_w);          free_dev(global_w_.img_in_b);
-    free_dev(global_w_.txt_in_w);          free_dev(global_w_.txt_in_b);
+    free_dev(global_w_.time_linear1_w_q4);   free_dev(global_w_.time_linear1_scale);
+    free_dev(global_w_.time_linear1_b);
+    free_dev(global_w_.time_linear2_w_q4);   free_dev(global_w_.time_linear2_scale);
+    free_dev(global_w_.time_linear2_b);
+    free_dev(global_w_.img_in_w_q4);         free_dev(global_w_.img_in_scale);
+    free_dev(global_w_.img_in_b);
+    free_dev(global_w_.txt_in_w_q4);         free_dev(global_w_.txt_in_scale);
+    free_dev(global_w_.txt_in_b);
     free_dev(global_w_.txt_norm_w);
-    free_dev(global_w_.norm_out_linear_w); free_dev(global_w_.norm_out_linear_b);
-    free_dev(global_w_.proj_out_w);        free_dev(global_w_.proj_out_b);
+    free_dev(global_w_.norm_out_linear_w_q4); free_dev(global_w_.norm_out_linear_scale);
+    free_dev(global_w_.norm_out_linear_b);
+    free_dev(global_w_.proj_out_w_q4);        free_dev(global_w_.proj_out_scale);
+    free_dev(global_w_.proj_out_b);
     free_dev(global_w_.rope_pe_dev);
 
     free_dev(scratch_q_dev_);    free_dev(scratch_k_dev_);
@@ -494,11 +733,13 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
     // + name_conversion.cpp (no remapping: GGUF produced via the
     // ominix_diffusion exporter keeps diffusers names).
     //
-    // NOTE on `to_out.0` vs `to_out_0`: qwen_image.hpp:103 registers it as
-    // "to_out.0" (with a literal dot), matching HF diffusers. GGUF exports
-    // reproduce the dot. `img_mod.1` and `txt_mod.1` are similar — the
-    // leading `img_mod.0` / `txt_mod.0` slots are `nn.SiLU` activations
-    // (no params).
+    // Q2.1 Q4-resident: matmul weights route through
+    // load_matmul_weight_upload, which keeps Q4_0 tensors compressed on
+    // device (INT4 buffer + F16 per-group-32 scale) or falls back to an
+    // F16-dequant upload for non-Q4 source tensors. 1D tensors (biases,
+    // RMSNorm gammas) keep the original dequant_upload_{f16,f32} path.
+    //
+    // Logical weight shape for every Linear is (K=in_features, N=out_features).
     // ------------------------------------------------------------------
     char name[128];
 #define TNAME(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
@@ -507,53 +748,53 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
         auto &lw = layer_w_[il];
 
         // --- attn.to_{q,k,v} projections + biases (img side) ---
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_q.weight", il),
-                (size_t)H * H, lw.to_q_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.to_q_w_q4, lw.to_q_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_q.bias", il),
                 (size_t)H, lw.to_q_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_k.weight", il),
-                (size_t)H * H, lw.to_k_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.to_k_w_q4, lw.to_k_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_k.bias", il),
                 (size_t)H, lw.to_k_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_v.weight", il),
-                (size_t)H * H, lw.to_v_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.to_v_w_q4, lw.to_v_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_v.bias", il),
                 (size_t)H, lw.to_v_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_out.0.weight", il),
-                (size_t)H * H, lw.to_out_0_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.to_out_0_w_q4, lw.to_out_0_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_out.0.bias", il),
                 (size_t)H, lw.to_out_0_b, f16b, tc, dequant_ms)) goto fail;
 
         // --- attn.add_{q,k,v}_proj + to_add_out (txt side) ---
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_q_proj.weight", il),
-                (size_t)H * H, lw.add_q_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.add_q_w_q4, lw.add_q_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_q_proj.bias", il),
                 (size_t)H, lw.add_q_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_k_proj.weight", il),
-                (size_t)H * H, lw.add_k_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.add_k_w_q4, lw.add_k_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_k_proj.bias", il),
                 (size_t)H, lw.add_k_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_v_proj.weight", il),
-                (size_t)H * H, lw.add_v_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.add_v_w_q4, lw.add_v_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.add_v_proj.bias", il),
                 (size_t)H, lw.add_v_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_add_out.weight", il),
-                (size_t)H * H, lw.to_add_out_w, f16b, tc, dequant_ms)) goto fail;
+                H, H, lw.to_add_out_w_q4, lw.to_add_out_scale, stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.attn.to_add_out.bias", il),
                 (size_t)H, lw.to_add_out_b, f16b, tc, dequant_ms)) goto fail;
@@ -603,43 +844,50 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
                 (size_t)H, lw.txt_norm2_b, f16b, tc, dequant_ms)) goto fail;
 
         // --- img_mod.1 / txt_mod.1 modulation heads (hidden → 6·hidden) ---
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mod.1.weight", il),
-                (size_t)(6 * H) * H, lw.img_mod_w, f16b, tc, dequant_ms)) goto fail;
+                H, 6 * H, lw.img_mod_w_q4, lw.img_mod_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mod.1.bias", il),
                 (size_t)(6 * H), lw.img_mod_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mod.1.weight", il),
-                (size_t)(6 * H) * H, lw.txt_mod_w, f16b, tc, dequant_ms)) goto fail;
+                H, 6 * H, lw.txt_mod_w_q4, lw.txt_mod_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mod.1.bias", il),
                 (size_t)(6 * H), lw.txt_mod_b, f16b, tc, dequant_ms)) goto fail;
 
         // --- FFN (img_mlp + txt_mlp). FeedForward.net = [Linear, GELU,
-        // Linear] so .net.0.proj.* (up) and .net.2.* (down). NOT SwiGLU.
-        // GELU exact (not GELU-tanh) per contract §Q2 / Part-2 §3.8.
-        if (!dequant_upload_f16(ggml_ctx,
+        // Linear] so .net.0.proj.* (up: K=hidden, N=ff_dim) and .net.2.*
+        // (down: K=ff_dim, N=hidden). NOT SwiGLU. GELU exact (not GELU-tanh)
+        // per contract §Q2 / Part-2 §3.8.
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mlp.net.0.proj.weight", il),
-                (size_t)FF_DIM * H, lw.img_ff_up_w, f16b, tc, dequant_ms)) goto fail;
+                H, FF_DIM, lw.img_ff_up_w_q4, lw.img_ff_up_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mlp.net.0.proj.bias", il),
                 (size_t)FF_DIM, lw.img_ff_up_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mlp.net.2.weight", il),
-                (size_t)H * FF_DIM, lw.img_ff_down_w, f16b, tc, dequant_ms)) goto fail;
+                FF_DIM, H, lw.img_ff_down_w_q4, lw.img_ff_down_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.img_mlp.net.2.bias", il),
                 (size_t)H, lw.img_ff_down_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mlp.net.0.proj.weight", il),
-                (size_t)FF_DIM * H, lw.txt_ff_up_w, f16b, tc, dequant_ms)) goto fail;
+                H, FF_DIM, lw.txt_ff_up_w_q4, lw.txt_ff_up_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mlp.net.0.proj.bias", il),
                 (size_t)FF_DIM, lw.txt_ff_up_b, f16b, tc, dequant_ms)) goto fail;
-        if (!dequant_upload_f16(ggml_ctx,
+        if (!load_matmul_weight_upload(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mlp.net.2.weight", il),
-                (size_t)H * FF_DIM, lw.txt_ff_down_w, f16b, tc, dequant_ms)) goto fail;
+                FF_DIM, H, lw.txt_ff_down_w_q4, lw.txt_ff_down_scale,
+                stats_, dequant_ms)) goto fail;
         if (!dequant_upload_f16(ggml_ctx,
                 TNAME("transformer_blocks.%d.txt_mlp.net.2.bias", il),
                 (size_t)H, lw.txt_ff_down_b, f16b, tc, dequant_ms)) goto fail;
@@ -648,46 +896,53 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
     // ------------------------------------------------------------------
     // Global (non-per-layer) weights.
     // ------------------------------------------------------------------
-    // time_text_embed.timestep_embedder.linear_{1,2}
-    if (!dequant_upload_f16(ggml_ctx,
+    // time_text_embed.timestep_embedder.linear_1: Linear(256, hidden).
+    //   Note: with K=256 and group=32, K/32=8 scale groups per column.
+    if (!load_matmul_weight_upload(ggml_ctx,
             "time_text_embed.timestep_embedder.linear_1.weight",
-            (size_t)H * 256, global_w_.time_linear1_w, f16b, tc, dequant_ms)) goto fail;
+            256, H, global_w_.time_linear1_w_q4, global_w_.time_linear1_scale,
+            stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx,
             "time_text_embed.timestep_embedder.linear_1.bias",
             (size_t)H, global_w_.time_linear1_b, f16b, tc, dequant_ms)) goto fail;
-    if (!dequant_upload_f16(ggml_ctx,
+    if (!load_matmul_weight_upload(ggml_ctx,
             "time_text_embed.timestep_embedder.linear_2.weight",
-            (size_t)H * H, global_w_.time_linear2_w, f16b, tc, dequant_ms)) goto fail;
+            H, H, global_w_.time_linear2_w_q4, global_w_.time_linear2_scale,
+            stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx,
             "time_text_embed.timestep_embedder.linear_2.bias",
             (size_t)H, global_w_.time_linear2_b, f16b, tc, dequant_ms)) goto fail;
 
     // img_in / txt_in projections.
-    if (!dequant_upload_f16(ggml_ctx, "img_in.weight",
-            (size_t)H * PATCH_IN, global_w_.img_in_w, f16b, tc, dequant_ms)) goto fail;
+    //   img_in: Linear(patch_in=64, hidden)  → K=64 → only 2 scale groups/col.
+    //   txt_in: Linear(joint_dim=3584, hidden).
+    if (!load_matmul_weight_upload(ggml_ctx, "img_in.weight",
+            PATCH_IN, H, global_w_.img_in_w_q4, global_w_.img_in_scale,
+            stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx, "img_in.bias",
             (size_t)H, global_w_.img_in_b, f16b, tc, dequant_ms)) goto fail;
-    if (!dequant_upload_f16(ggml_ctx, "txt_in.weight",
-            (size_t)H * JD, global_w_.txt_in_w, f16b, tc, dequant_ms)) goto fail;
+    if (!load_matmul_weight_upload(ggml_ctx, "txt_in.weight",
+            JD, H, global_w_.txt_in_w_q4, global_w_.txt_in_scale,
+            stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx, "txt_in.bias",
             (size_t)H, global_w_.txt_in_b, f16b, tc, dequant_ms)) goto fail;
 
-    // txt_norm RMSNorm over joint_attention_dim.
+    // txt_norm RMSNorm over joint_attention_dim (1D, stays F32).
     if (!dequant_upload_f32(ggml_ctx, "txt_norm.weight",
             (size_t)JD, global_w_.txt_norm_w, f32b, tc, dequant_ms)) goto fail;
 
     // norm_out.linear (AdaLayerNormContinuous): Linear(hidden, 2·hidden).
-    if (!dequant_upload_f16(ggml_ctx, "norm_out.linear.weight",
-            (size_t)(2 * H) * H, global_w_.norm_out_linear_w,
-            f16b, tc, dequant_ms)) goto fail;
+    if (!load_matmul_weight_upload(ggml_ctx, "norm_out.linear.weight",
+            H, 2 * H, global_w_.norm_out_linear_w_q4,
+            global_w_.norm_out_linear_scale, stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx, "norm_out.linear.bias",
             (size_t)(2 * H), global_w_.norm_out_linear_b,
             f16b, tc, dequant_ms)) goto fail;
 
     // proj_out: Linear(hidden, patch_size² · out_channels).
-    if (!dequant_upload_f16(ggml_ctx, "proj_out.weight",
-            (size_t)PATCH_OUT * H, global_w_.proj_out_w,
-            f16b, tc, dequant_ms)) goto fail;
+    if (!load_matmul_weight_upload(ggml_ctx, "proj_out.weight",
+            H, PATCH_OUT, global_w_.proj_out_w_q4, global_w_.proj_out_scale,
+            stats_, dequant_ms)) goto fail;
     if (!dequant_upload_f16(ggml_ctx, "proj_out.bias",
             (size_t)PATCH_OUT, global_w_.proj_out_b,
             f16b, tc, dequant_ms)) goto fail;
@@ -776,24 +1031,36 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
             std::chrono::duration<double, std::milli>(t_init1 - t_init0).count();
 
         const size_t total_bytes =
+            stats_.q4_weight_bytes + stats_.q4_scale_bytes +
             stats_.f16_weight_bytes + stats_.f32_weight_bytes +
             stats_.rope_bytes + stats_.scratch_bytes;
 
-        QIE_LOG("Phase 2 init OK: device=%d gguf=%s",
+        QIE_LOG("Phase 2.1 init OK: device=%d gguf=%s",
                 device_, gguf_path.c_str());
-        QIE_LOG("  tensors uploaded: %lld", (long long)stats_.tensors_uploaded);
-        QIE_LOG("  F16 weight bytes: %zu (%.2f GiB)", stats_.f16_weight_bytes,
+        QIE_LOG("  tensors uploaded:   %lld "
+                "(Q4-resident=%lld, F16-fallback=%lld)",
+                (long long)stats_.tensors_uploaded,
+                (long long)stats_.q4_tensors,
+                (long long)stats_.f16_fallback_tensors);
+        QIE_LOG("  Q4 weight bytes:    %zu (%.2f GiB)", stats_.q4_weight_bytes,
+                stats_.q4_weight_bytes / (1024.0 * 1024.0 * 1024.0));
+        QIE_LOG("  Q4 scale  bytes:    %zu (%.2f GiB)", stats_.q4_scale_bytes,
+                stats_.q4_scale_bytes / (1024.0 * 1024.0 * 1024.0));
+        QIE_LOG("  F16 weight bytes:   %zu (%.2f GiB)  "
+                "[biases + F16-fallback weights]", stats_.f16_weight_bytes,
                 stats_.f16_weight_bytes / (1024.0 * 1024.0 * 1024.0));
-        QIE_LOG("  F32 weight bytes: %zu (%.2f MiB)", stats_.f32_weight_bytes,
+        QIE_LOG("  F32 weight bytes:   %zu (%.2f MiB)  "
+                "[RMSNorm gammas]", stats_.f32_weight_bytes,
                 stats_.f32_weight_bytes / (1024.0 * 1024.0));
-        QIE_LOG("  RoPE pe bytes:    %zu (%.2f MiB)", stats_.rope_bytes,
+        QIE_LOG("  RoPE pe bytes:      %zu (%.2f MiB)", stats_.rope_bytes,
                 stats_.rope_bytes / (1024.0 * 1024.0));
-        QIE_LOG("  Scratch bytes:    %zu (%.2f GiB)", stats_.scratch_bytes,
+        QIE_LOG("  Scratch bytes:      %zu (%.2f GiB)", stats_.scratch_bytes,
                 stats_.scratch_bytes / (1024.0 * 1024.0 * 1024.0));
-        QIE_LOG("  Peak init HBM:    %zu (%.2f GiB)", total_bytes,
+        QIE_LOG("  Peak init HBM:      %zu (%.2f GiB)  "
+                "[Q2.1 smoke gate: < 9 GiB]", total_bytes,
                 total_bytes / (1024.0 * 1024.0 * 1024.0));
-        QIE_LOG("  Dequant wall:     %.1f ms", stats_.dequant_wall_ms);
-        QIE_LOG("  Total init wall:  %.1f ms", stats_.load_wall_ms);
+        QIE_LOG("  Dequant/repack wall: %.1f ms", stats_.dequant_wall_ms);
+        QIE_LOG("  Total init wall:    %.1f ms", stats_.load_wall_ms);
     }
 
     // Mark ready. forward/denoise still stub (Phase 3/4) — callers that

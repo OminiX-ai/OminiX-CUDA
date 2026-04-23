@@ -81,8 +81,20 @@ namespace ominix_qie {
 // ---------------------------------------------------------------------------
 struct DiTInitStats {
     int64_t tensors_uploaded  = 0;
+    // F16 bytes covers small 1D tensors (biases, modulation biases) that
+    // never route through Q4-resident packing — biases are always small.
     size_t  f16_weight_bytes  = 0;
     size_t  f32_weight_bytes  = 0;
+    // Q2.1 Q4-resident load path: the big Linear-weight matrices are kept
+    // on device in INT4 + per-group-32 F16 scale form instead of expanding
+    // to F16. These counters surface the two contributions separately so
+    // smoke receipts can compare against the probe doc's budget
+    // (W4 ≈ 5.1 GiB, scale ≈ 0.6 GiB at full DiT).
+    size_t  q4_weight_bytes   = 0;
+    size_t  q4_scale_bytes    = 0;
+    int64_t q4_tensors        = 0;
+    int64_t f16_fallback_tensors = 0;  // non-Q4 GGUF tensors that fell back
+                                        // through the F16 upload path
     size_t  scratch_bytes     = 0;
     size_t  rope_bytes        = 0;
     double  load_wall_ms      = 0.0;
@@ -150,26 +162,49 @@ struct ImageDiffusionConfig {
 // matches the [out, in] convention `aclnnMm` consumes — see
 // TalkerCannEngine::LayerWeights for the same pattern.
 // ---------------------------------------------------------------------------
+// Q2.1 Q4-RESIDENT: every matmul-weight slot is a PAIR — a packed INT4
+// buffer (shape [K, N] contiguous-K, `K*N/2` bytes) and a per-group F16
+// scale buffer (shape [K/32, N], 2 bytes per scale entry). The pair is
+// designed to feed `aclnnWeightQuantBatchMatmulV3` with
+// `antiquantGroupSize=32` per `docs/qie_q2_q4resident_probe.md`. GGUF
+// tensors that arrive as F16/F32 (not Q4_0) fall back to an F16-only
+// upload (see load_matmul_weight_upload in image_diffusion_engine.cpp):
+// in that fallback the `_w_q4` pointer holds the F16 weight buffer
+// directly and `_scale` stays null so forward-path dispatch can
+// branch on scale==null → use aclnnMm, scale!=null → use WQBMMv3.
+//
+// Biases and RMSNorm gammas remain single-pointer (always small 1D).
 struct DiTLayerWeights {
     // --- Attention projections (img side) --------------------------------
-    void *to_q_w       = nullptr;  // F16 [hidden, hidden]        + bias
-    void *to_q_b       = nullptr;  // F16 [hidden]
-    void *to_k_w       = nullptr;  // F16 [hidden, hidden]        + bias
-    void *to_k_b       = nullptr;  // F16 [hidden]
-    void *to_v_w       = nullptr;  // F16 [hidden, hidden]        + bias
-    void *to_v_b       = nullptr;  // F16 [hidden]
-    void *to_out_0_w   = nullptr;  // F16 [hidden, hidden]        + bias
-    void *to_out_0_b   = nullptr;  // F16 [hidden]
+    // Each projection's weight matrix is `[hidden, hidden]` logically;
+    // stored as INT4 `[K=hidden, N=hidden]` K-contiguous + F16 scale
+    // `[K/32, N]`. Bias stays F16 `[hidden]`.
+    void *to_q_w_q4      = nullptr;  // INT4 packed  (K*N/2 bytes)
+    void *to_q_scale     = nullptr;  // F16 [K/32, N]
+    void *to_q_b         = nullptr;  // F16 [hidden]
+    void *to_k_w_q4      = nullptr;
+    void *to_k_scale     = nullptr;
+    void *to_k_b         = nullptr;
+    void *to_v_w_q4      = nullptr;
+    void *to_v_scale     = nullptr;
+    void *to_v_b         = nullptr;
+    void *to_out_0_w_q4  = nullptr;
+    void *to_out_0_scale = nullptr;
+    void *to_out_0_b     = nullptr;
 
     // --- Attention projections (txt side, "add_*") -----------------------
-    void *add_q_w      = nullptr;  // F16 [hidden, hidden]        + bias
-    void *add_q_b      = nullptr;
-    void *add_k_w      = nullptr;
-    void *add_k_b      = nullptr;
-    void *add_v_w      = nullptr;
-    void *add_v_b      = nullptr;
-    void *to_add_out_w = nullptr;  // F16 [hidden, hidden]        + bias
-    void *to_add_out_b = nullptr;
+    void *add_q_w_q4      = nullptr;
+    void *add_q_scale     = nullptr;
+    void *add_q_b         = nullptr;
+    void *add_k_w_q4      = nullptr;
+    void *add_k_scale     = nullptr;
+    void *add_k_b         = nullptr;
+    void *add_v_w_q4      = nullptr;
+    void *add_v_scale     = nullptr;
+    void *add_v_b         = nullptr;
+    void *to_add_out_w_q4 = nullptr;
+    void *to_add_out_scale = nullptr;
+    void *to_add_out_b    = nullptr;
 
     // --- RMSNorm gammas (Q/K-norm sites) --------------------------------
     // Per-head_dim gamma; input is post-projection [..., head_dim].
@@ -182,9 +217,7 @@ struct DiTLayerWeights {
     // Qwen-Image TransformerBlock uses `affine=false` on these — per
     // qwen_image.hpp:205-213. We leave these fields null; init_from_gguf
     // skips them if the GGUF has no entry, and the forward path runs
-    // the "normalize only, no gamma/beta" LayerNorm variant. If a future
-    // Qwen-Image revision flips affine on, populate these and have the
-    // forward path multiply/add.
+    // the "normalize only, no gamma/beta" LayerNorm variant.
     void *img_norm1_w = nullptr;  // F32 [hidden] (may stay null)
     void *img_norm1_b = nullptr;  // F32 [hidden] (may stay null)
     void *img_norm2_w = nullptr;
@@ -195,68 +228,65 @@ struct DiTLayerWeights {
     void *txt_norm2_b = nullptr;
 
     // --- Timestep modulation heads (img_mod.1 / txt_mod.1) --------------
-    // Both are Linear(dim → 6·dim, bias=true). We chunk the output into
-    // 6 pieces per stream per block inside `forward_block_`.
-    void *img_mod_w = nullptr;   // F16 [6·hidden, hidden] + bias
-    void *img_mod_b = nullptr;   // F16 [6·hidden]
-    void *txt_mod_w = nullptr;   // F16 [6·hidden, hidden] + bias
-    void *txt_mod_b = nullptr;
+    // Linear(hidden → 6·hidden, bias=true).
+    void *img_mod_w_q4   = nullptr;  // INT4 [K=hidden, N=6·hidden]
+    void *img_mod_scale  = nullptr;  // F16 [K/32, N]
+    void *img_mod_b      = nullptr;  // F16 [6·hidden]
+    void *txt_mod_w_q4   = nullptr;
+    void *txt_mod_scale  = nullptr;
+    void *txt_mod_b      = nullptr;
 
     // --- FFN (GELU, NOT SwiGLU, NOT MoE) --------------------------------
-    // FeedForward(dim → mult·dim, GELU, Linear(mult·dim → dim)). In
-    // diffusers / stable-diffusion.cpp naming this is stored under
-    // `ff.net.0.proj.{weight,bias}` + `ff.net.2.{weight,bias}`. `net.1`
-    // is the GELU activation (no params), `net.3` is a Dropout (no
-    // params).
-    void *img_ff_up_w   = nullptr;  // F16 [ff_dim, hidden] + bias
-    void *img_ff_up_b   = nullptr;  // F16 [ff_dim]
-    void *img_ff_down_w = nullptr;  // F16 [hidden, ff_dim] + bias
-    void *img_ff_down_b = nullptr;  // F16 [hidden]
-    void *txt_ff_up_w   = nullptr;
-    void *txt_ff_up_b   = nullptr;
-    void *txt_ff_down_w = nullptr;
-    void *txt_ff_down_b = nullptr;
-
-    // --- Q4 quant slots --------------------------------------------------
-    // Populated only when `cfg.use_q4_weights` AND CANN has the antiquant
-    // path at init. Mirrors TalkerCannEngine's A16W8 pattern but with
-    // group_size=32 instead of per-output-channel. Phase 2/late or Phase 4.
-    // For the scaffold they stay null.
-    void *to_q_w_i4        = nullptr;
-    void *to_q_scale_f16   = nullptr;
-    // ... (full set added in Phase 2 once Q1.1 confirms Q4_K path works.)
+    // FeedForward(dim → mult·dim, GELU, Linear(mult·dim → dim)). The
+    // "up" Linear has K=hidden, N=ff_dim; "down" has K=ff_dim, N=hidden.
+    void *img_ff_up_w_q4    = nullptr;  // INT4 [K=hidden, N=ff_dim]
+    void *img_ff_up_scale   = nullptr;
+    void *img_ff_up_b       = nullptr;  // F16 [ff_dim]
+    void *img_ff_down_w_q4  = nullptr;  // INT4 [K=ff_dim, N=hidden]
+    void *img_ff_down_scale = nullptr;
+    void *img_ff_down_b     = nullptr;  // F16 [hidden]
+    void *txt_ff_up_w_q4    = nullptr;
+    void *txt_ff_up_scale   = nullptr;
+    void *txt_ff_up_b       = nullptr;
+    void *txt_ff_down_w_q4  = nullptr;
+    void *txt_ff_down_scale = nullptr;
+    void *txt_ff_down_b     = nullptr;
 };
 
 // ---------------------------------------------------------------------------
 // Global (non-per-layer) weight handles.
 // ---------------------------------------------------------------------------
+// Same Q4-resident pairing convention as DiTLayerWeights (see comment above).
 struct DiTGlobalWeights {
     // time_text_embed.timestep_embedder.linear_{1,2}
-    void *time_linear1_w = nullptr;  // F16 [hidden, 256] + bias
-    void *time_linear1_b = nullptr;
-    void *time_linear2_w = nullptr;  // F16 [hidden, hidden] + bias
-    void *time_linear2_b = nullptr;
+    void *time_linear1_w_q4 = nullptr;  // INT4 [K=256, N=hidden] (or F16 fallback)
+    void *time_linear1_scale = nullptr;
+    void *time_linear1_b    = nullptr;
+    void *time_linear2_w_q4 = nullptr;  // INT4 [K=hidden, N=hidden]
+    void *time_linear2_scale = nullptr;
+    void *time_linear2_b    = nullptr;
 
     // img_in, txt_in — input projections onto `hidden`.
-    void *img_in_w = nullptr;  // F16 [hidden, in_channels · patch_size²]
-    void *img_in_b = nullptr;
-    void *txt_in_w = nullptr;  // F16 [hidden, joint_attention_dim]
-    void *txt_in_b = nullptr;
+    void *img_in_w_q4 = nullptr;  // INT4 [K=in_channels·patch_size², N=hidden]
+    void *img_in_scale = nullptr;
+    void *img_in_b    = nullptr;
+    void *txt_in_w_q4 = nullptr;  // INT4 [K=joint_attention_dim, N=hidden]
+    void *txt_in_scale = nullptr;
+    void *txt_in_b    = nullptr;
 
-    // txt_norm: RMSNorm over joint_attention_dim (F32 gamma).
+    // txt_norm: RMSNorm over joint_attention_dim (F32 gamma, 1D — stays F32).
     void *txt_norm_w = nullptr;   // F32 [joint_attention_dim]
 
-    // norm_out = AdaLayerNormContinuous(hidden, hidden, affine=false, eps=1e-6).
-    //   .norm   : LayerNorm(hidden, affine=false) — no params uploaded.
-    //   .linear : Linear(hidden, 2·hidden, bias=true) — emits (scale, shift)
-    //             from SiLU(t_emb).
-    void *norm_out_linear_w = nullptr;  // F16 [2·hidden, hidden] + bias
-    void *norm_out_linear_b = nullptr;
+    // norm_out = AdaLayerNormContinuous.
+    //   .linear : Linear(hidden, 2·hidden, bias=true).
+    void *norm_out_linear_w_q4 = nullptr;  // INT4 [K=hidden, N=2·hidden]
+    void *norm_out_linear_scale = nullptr;
+    void *norm_out_linear_b    = nullptr;
 
-    // Final patch-level projection out to pixel-space channels.
-    //   proj_out : Linear(hidden, patch_size² · out_channels, bias=true).
-    void *proj_out_w = nullptr;  // F16 [ps²·out_ch, hidden] + bias
-    void *proj_out_b = nullptr;
+    // proj_out : Linear(hidden, patch_size² · out_channels, bias=true).
+    void *proj_out_w_q4 = nullptr;  // INT4 [K=hidden, N=ps²·out_ch]
+    void *proj_out_scale = nullptr;
+    void *proj_out_b    = nullptr;
 
     // Pre-computed 3D axial RoPE tables (cos/sin). Populated by
     // `build_rope_tables_` during init when `cfg.precompute_rope`.
