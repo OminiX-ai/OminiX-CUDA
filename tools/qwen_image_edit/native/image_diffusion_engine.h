@@ -37,7 +37,13 @@
 //     added_k norms); LayerNorm is affine-off so no gamma/beta upload
 //     required for img_norm{1,2}/txt_norm{1,2}; norm_out (AdaLN) does
 //     compute its shift/scale from `t_emb` via a Linear head.
-//   - F16: matmuls, residual adds, RoPE, attention, FFN activations.
+//     Phase 4.4c: residual stream (img_hidden / txt_hidden) is ALSO F32.
+//     Per-block we cast F32 → F16 for LayerNorm entry and back F16 → F32
+//     at the gated residual add (see forward_block_ comments). F16
+//     residual overflowed at N≈35 on real Q4_0 weights — see docs/
+//     qie_q2_phase4_smoke.md §4.4b bisect data.
+//   - F16: matmuls, residual adds contributions (src * gate), RoPE,
+//     attention, FFN activations. The residual accumulator itself is F32.
 //   - Attention: `aclnnFusedInferAttentionScoreV2` at seq ≈ 4096 img tokens
 //     + 256 txt tokens ≈ 4352. Q0.5.2 verdict: LIKELY GREEN at this shape,
 //     confirm at Q3 runtime probe. Scaffold falls back to plain aclnnMm(QK),
@@ -364,8 +370,8 @@ public:
 
     // One DiT step (exposed for unit probing & parity with ggml-cann).
     // All tensors are on NPU; caller manages device pointers.
-    //   img_hidden        F16 [N, img_seq, hidden]   — in/out
-    //   txt_hidden        F16 [N, txt_seq, hidden]   — in/out
+    //   img_hidden        F32 [N, img_seq, hidden]   — in/out (Phase 4.4c)
+    //   txt_hidden        F32 [N, txt_seq, hidden]   — in/out (Phase 4.4c)
     //   t_emb             F16 [N, hidden]            — timestep MLP output
     //   pe                F16 [img_seq+txt_seq, hd/2, 2, 2]  — rope tables
     //
@@ -521,6 +527,21 @@ private:
     void *mean_dev_             = nullptr;  // F32 [max_seq]  (LayerNorm mean)
     void *ln_rstd_dev_          = nullptr;  // F32 [max_seq]  (LayerNorm rstd)
 
+    // Phase 4.4c: residual-stream F32 promotion. The DiT residual
+    // (img_hidden / txt_hidden) is caller-owned F32 now.
+    //   scratch_residual_tmp_f32 — shared F32 tmp reused by
+    //     layer_norm_f32_to_f16_ (F32 LN output before down-cast) and
+    //     gated_residual_add_f32_ (F32 Cast(src*gate) before the += into
+    //     the F32 residual). Sized for max(img_seq,txt_seq) × hidden so
+    //     either per-stream consumer fits. Serial within a block, so no
+    //     conflict between the two consumers.
+    //   scratch_{img,txt}_hidden_f16 — reserved / unused post-4.4c. Kept
+    //     for forward compatibility with future mixed-precision
+    //     experiments (trivial: max_*_seq × hidden × 2 bytes).
+    void *scratch_img_hidden_f16_dev_ = nullptr;  // F16 [img_seq, hidden] (reserved)
+    void *scratch_txt_hidden_f16_dev_ = nullptr;  // F16 [txt_seq, hidden] (reserved)
+    void *scratch_residual_tmp_f32_dev_ = nullptr; // F32 [max(img_seq,txt_seq), hidden]
+
     // Phase 4.1 on-device RoPE scratch. Three `[B, seq, NH, head_dim/2]` F16
     // buffers for the four-Mul + two-Add interleaved rotation. Sized for
     // max_seq × max_heads × head_dim/2 F16 each (worst case under joint-attn
@@ -576,8 +597,8 @@ private:
 
     // Run one full transformer block on NPU.
     //   lw          — per-layer weights (already uploaded)
-    //   img_hidden  — F16 [N, img_seq, hidden]   in-place update
-    //   txt_hidden  — F16 [N, txt_seq, hidden]   in-place update
+    //   img_hidden  — F32 [N, img_seq, hidden]   in-place update (4.4c)
+    //   txt_hidden  — F32 [N, txt_seq, hidden]   in-place update (4.4c)
     //   t_emb       — F16 [N, hidden]
     //   pe          — RoPE cos/sin tables on device
     //   img_seq, txt_seq — actual current sequence lengths
@@ -620,11 +641,37 @@ private:
                              const void *gate_f16_dev,
                              int64_t B, int64_t seq, int64_t hidden);
 
+    // Phase 4.4c: F32 residual accumulator variant. Computes
+    //   tmp_f16 = src_f16 * gate_f16          (broadcast over seq)
+    //   tmp_f32 = Cast(tmp_f16, F32)
+    //   x_f32 += tmp_f32
+    // Uses scratch_mlp_dev_ as tmp_f16 and scratch_residual_tmp_f32_dev_ as
+    // tmp_f32. In-place on x_f32.
+    bool gated_residual_add_f32_(void *x_f32_dev, const void *src_f16_dev,
+                                   const void *gate_f16_dev,
+                                   int64_t B, int64_t seq, int64_t hidden);
+
+    // Phase 4.4c: cast helpers. Thin wrapper around aclnnCast to reduce
+    // boilerplate at block entry (F32 residual → F16 for LayerNorm input).
+    // `n` is element count; tensor is viewed as a flat 1-D buffer.
+    bool cast_f32_to_f16_(const void *in_f32_dev, void *out_f16_dev,
+                            int64_t n);
+
     // aclnnLayerNorm dispatch: out = LayerNorm(x, normalizedShape=[hidden],
     // gamma=null, beta=null, eps=cfg_.layernorm_eps). Input/output are F16
     // [B, seq, hidden].
     bool layer_norm_(void *x_f16_dev, void *out_f16_dev,
                      int64_t B, int64_t seq, int64_t hidden);
+
+    // Phase 4.4c: F32 input, F16 output LayerNorm for the F32-residual
+    // pipeline. Normalization runs F32 throughout (where the full residual
+    // magnitude may exceed the F16 range) and the bounded ~1σ output is
+    // cast F32→F16 for downstream matmul consumption. Implemented as
+    // aclnnLayerNorm(F32 in, F32 out via scratch_residual_tmp_f32_dev_)
+    // followed by aclnnCast(F32→F16). Same eps and affine-off semantics
+    // as layer_norm_.
+    bool layer_norm_f32_to_f16_(const void *x_f32_dev, void *out_f16_dev,
+                                   int64_t B, int64_t seq, int64_t hidden);
 
     // aclnnRmsNorm dispatch over the last dim `head_dim`. Input/output are
     // F16 [B, seq, n_heads, head_dim]; gamma is F32 [head_dim]. For QIE Q2.3

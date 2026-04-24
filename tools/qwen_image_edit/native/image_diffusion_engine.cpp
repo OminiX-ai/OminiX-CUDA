@@ -694,6 +694,9 @@ ImageDiffusionEngine::~ImageDiffusionEngine() {
     free_dev(scratch_img_norm_dev_);  free_dev(scratch_txt_norm_dev_);
     free_dev(scratch_img_out_dev_);   free_dev(scratch_txt_out_dev_);
     free_dev(mean_dev_);              free_dev(ln_rstd_dev_);
+    free_dev(scratch_img_hidden_f16_dev_);
+    free_dev(scratch_txt_hidden_f16_dev_);
+    free_dev(scratch_residual_tmp_f32_dev_);
     free_dev(img_hidden_cond_dev_);   free_dev(img_hidden_uncond_dev_);
     free_dev(txt_hidden_cond_dev_);   free_dev(txt_hidden_uncond_dev_);
     free_dev(workspace_dev_);
@@ -1141,6 +1144,25 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
         if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) goto fail;
         if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) goto fail;
 
+        // Phase 4.4c F32-residual scratch:
+        //   scratch_img_hidden_f16 / scratch_txt_hidden_f16 — F16 mirror of
+        //     the caller's F32 residual, populated by a Cast at LayerNorm1/2
+        //     entry (reads F32 residual → writes F16).
+        //   scratch_residual_tmp_f32 — F32 tmp, sized for max(img,txt), used
+        //     by gated_residual_add_f32_ to hold Cast(src*gate, F32) before
+        //     the += into the F32 residual stream.
+        if (!try_alloc(&scratch_img_hidden_f16_dev_,
+                       (size_t)cfg_.max_img_seq * H * F16)) goto fail;
+        if (!try_alloc(&scratch_txt_hidden_f16_dev_,
+                       (size_t)cfg_.max_txt_seq * H * F16)) goto fail;
+        {
+            const int64_t max_stream_seq =
+                std::max(cfg_.max_img_seq, cfg_.max_txt_seq);
+            if (!try_alloc(&scratch_residual_tmp_f32_dev_,
+                           (size_t)max_stream_seq * H * sizeof(float)))
+                goto fail;
+        }
+
         // Phase 4.1 on-device RoPE scratch (three [seq, NH, head_dim/2] F16
         // buffers for the interleaved-rotation dispatch).
         {
@@ -1406,6 +1428,34 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
         return false;
     }
 
+    // Q2.4.4b precision knobs. Cached once: these control the matmul
+    // accumulator/numerical path. Defaults preserve the Phase 4.2 synthetic
+    // smoke behaviour (inner_precise=1 for WQBMMv3 → HIGH_PERFORMANCE F16
+    // accumulator; cube_math_type=0 for aclnnMm → KEEP_DTYPE F16 accumulator).
+    // Real-weight Phase 4.4 forward NaNs on the defaults because F16
+    // accumulation overflows once per-channel |x @ W| grows past F16 max
+    // (~65504) — set
+    //   QIE_MATMUL_INNER_PRECISE=0  → WQBMMv3 HIGH_PRECISION (F32 accum)
+    //   QIE_MATMUL_CUBE_MATH=1      → aclnnMm ALLOW_FP32_DOWN_PRECISION
+    //                                  (F32 accum, F16 inputs preserved)
+    // to route through the F32-accumulator paths.
+    static int s_inner_precise = -1;
+    static int s_cube_math     = -1;
+    if (s_inner_precise < 0) {
+        const char *v = std::getenv("QIE_MATMUL_INNER_PRECISE");
+        s_inner_precise = v ? std::atoi(v) : 1;
+        QIE_LOG("dispatch_matmul_: QIE_MATMUL_INNER_PRECISE=%d (WQBMMv3 "
+                "innerPrecise; 0=HIGH_PRECISION/F32-accum, "
+                "1=HIGH_PERFORMANCE/F16-accum)", s_inner_precise);
+    }
+    if (s_cube_math < 0) {
+        const char *v = std::getenv("QIE_MATMUL_CUBE_MATH");
+        s_cube_math = v ? std::atoi(v) : 0;
+        QIE_LOG("dispatch_matmul_: QIE_MATMUL_CUBE_MATH=%d (aclnnMm "
+                "cubeMathType; 0=KEEP_DTYPE, 1=ALLOW_FP32_DOWN_PRECISION, "
+                "2=USE_FP16, 3=USE_HF32)", s_cube_math);
+    }
+
     // Build activation tensor view [M, K] contig.
     int64_t x_shape[2]   = {M, K};
     int64_t x_strides[2] = {K, 1};
@@ -1443,7 +1493,7 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
                 /*quantOffsetOptional*/     nullptr,
                 /*biasOptional*/            nullptr,  // apply bias after
                 /*antiquantGroupSize*/      32,
-                /*innerPrecise*/            1,
+                /*innerPrecise*/            s_inner_precise,
                 t_y, &ws_needed, &exec);
             if (s == 0) {
                 ensure_workspace_(ws_needed);
@@ -1482,7 +1532,8 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
 
         uint64_t ws_needed = 0;
         aclOpExecutor *exec = nullptr;
-        s = g_cann.aclnnMmGetWorkspaceSize(t_x, t_w, t_y, (int8_t)0,
+        s = g_cann.aclnnMmGetWorkspaceSize(t_x, t_w, t_y,
+                                             (int8_t)s_cube_math,
                                              &ws_needed, &exec);
         if (s != 0) {
             QIE_LOG("dispatch_matmul_: Mm workspace status=%d", (int)s);
@@ -1678,6 +1729,160 @@ bool ImageDiffusionEngine::gated_residual_add_(void *x_f16_dev,
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.4c: generic aclnnCast wrapper. `in` is viewed as a flat 1-D tensor
+// of `n` elements; same for `out`. Cast follows CANN's standard dtype matrix
+// (F16 ↔ F32 both safe). Used to shuttle between the F32 residual accumulator
+// and the F16 matmul/LayerNorm entry/exit points.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::cast_f32_to_f16_(const void *in_f32_dev,
+                                               void *out_f16_dev,
+                                               int64_t n) {
+    if (!g_cann.aclnnCast || !g_cann.aclnnCastGetWorkspaceSize) {
+        QIE_LOG("cast_f32_to_f16_: aclnnCast symbol missing");
+        return false;
+    }
+    if (!in_f32_dev || !out_f16_dev) {
+        QIE_LOG("cast_f32_to_f16_: null buffer (in=%p out=%p)", in_f32_dev,
+                out_f16_dev);
+        return false;
+    }
+    int64_t shape[1]   = {n};
+    int64_t strides[1] = {1};
+    aclTensor *t_in  = tensor_nd_f32(const_cast<void *>(in_f32_dev),
+                                        1, shape, strides);
+    aclTensor *t_out = tensor_nd_f16(out_f16_dev, 1, shape, strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    // ACL_FLOAT16 is the target dtype enum. The Cast API takes the destination
+    // dtype as a plain int matching the aclDataType enum.
+    aclnnStatus s = g_cann.aclnnCastGetWorkspaceSize(
+        t_in, /*dtype=*/ ACL_FLOAT16, t_out, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                              compute_stream_);
+    }
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    if (s != 0) QIE_LOG("cast_f32_to_f16_: status=%d", (int)s);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.4c: gated residual add into an F32 accumulator.
+//
+//   x_f32 += Cast(src_f16 * gate_f16, F32)
+//
+// `src_f16_dev` is [B, seq, hidden] F16; `gate_f16_dev` is [B, 1, hidden] F16
+// broadcast along seq; `x_f32_dev` is [B, seq, hidden] F32.
+//
+// Staging:
+//   scratch_mlp_dev_                (F16, sized [max_seq, ff_dim]) → tmp_f16
+//     Large enough: hidden ≤ ff_dim so [seq, hidden] fits.
+//   scratch_residual_tmp_f32_dev_   (F32, sized [max(img,txt), hidden]) →
+//     tmp_f32
+//
+// Op trio: aclnnMul → aclnnCast(F16→F32) → aclnnInplaceAdd(F32+=F32).
+// This is the F16-overflow fix for the real-GGUF forward path
+// (see docs/qie_q2_phase4_smoke.md §4.4c).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::gated_residual_add_f32_(void *x_f32_dev,
+                                                     const void *src_f16_dev,
+                                                     const void *gate_f16_dev,
+                                                     int64_t B, int64_t seq,
+                                                     int64_t hidden) {
+    if (!x_f32_dev || !src_f16_dev || !gate_f16_dev) {
+        QIE_LOG("gate_add_f32_: null buffer (x=%p src=%p gate=%p)",
+                x_f32_dev, src_f16_dev, gate_f16_dev);
+        return false;
+    }
+    if (!g_cann.aclnnMul || !g_cann.aclnnCast ||
+        !g_cann.aclnnInplaceAdd) {
+        QIE_LOG("gate_add_f32_: missing aclnn symbols "
+                "(Mul=%p Cast=%p InplaceAdd=%p)",
+                (void *)g_cann.aclnnMul,
+                (void *)g_cann.aclnnCast,
+                (void *)g_cann.aclnnInplaceAdd);
+        return false;
+    }
+    if (!scratch_residual_tmp_f32_dev_) {
+        QIE_LOG("gate_add_f32_: scratch_residual_tmp_f32_dev_ not allocated");
+        return false;
+    }
+
+    int64_t x_shape[3]   = {B, seq, hidden};
+    int64_t x_strides[3];
+    make_contig_strides(3, x_shape, x_strides);
+    int64_t g_shape[3]   = {B, 1, hidden};
+    int64_t g_strides[3] = {hidden, hidden, 1};
+
+    aclTensor *t_x_f32  = tensor_nd_f32(x_f32_dev, 3, x_shape, x_strides);
+    aclTensor *t_src_f16 = tensor_nd_f16(const_cast<void *>(src_f16_dev),
+                                            3, x_shape, x_strides);
+    aclTensor *t_g_f16   = tensor_nd_f16(const_cast<void *>(gate_f16_dev),
+                                            3, g_shape, g_strides);
+    // tmp_f16 sits in scratch_mlp_dev_ (oversized for any per-stream [seq,H]).
+    aclTensor *t_tmp_f16 = tensor_nd_f16(scratch_mlp_dev_,
+                                            3, x_shape, x_strides);
+    aclTensor *t_tmp_f32 = tensor_nd_f32(scratch_residual_tmp_f32_dev_,
+                                            3, x_shape, x_strides);
+
+    aclnnStatus s = 0;
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+
+    // 1. tmp_f16 = src_f16 * gate_f16 (broadcast over seq).
+    s = g_cann.aclnnMulGetWorkspaceSize(t_src_f16, t_g_f16, t_tmp_f16,
+                                           &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnMul(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                             compute_stream_);
+    }
+    if (s != 0) {
+        QIE_LOG("gate_add_f32_: Mul status=%d", (int)s);
+    }
+
+    // 2. tmp_f32 = Cast(tmp_f16, F32).
+    if (s == 0) {
+        s = g_cann.aclnnCastGetWorkspaceSize(t_tmp_f16, ACL_FLOAT,
+                                                t_tmp_f32, &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                   compute_stream_);
+        }
+        if (s != 0) QIE_LOG("gate_add_f32_: Cast(F16->F32) status=%d",
+                              (int)s);
+    }
+
+    // 3. x_f32 += tmp_f32 (InplaceAdd with alpha=1.0 F32).
+    if (s == 0) {
+        float one = 1.0f;
+        aclScalar *alpha =
+            g_cann.aclCreateScalar(&one, ACL_FLOAT);
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x_f32, t_tmp_f32,
+                                                      alpha, &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnInplaceAdd(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+        }
+        if (alpha) g_cann.aclDestroyScalar(alpha);
+        if (s != 0) QIE_LOG("gate_add_f32_: InplaceAdd(F32) status=%d",
+                              (int)s);
+    }
+
+    g_cann.aclDestroyTensor(t_x_f32);
+    g_cann.aclDestroyTensor(t_src_f16);
+    g_cann.aclDestroyTensor(t_g_f16);
+    g_cann.aclDestroyTensor(t_tmp_f16);
+    g_cann.aclDestroyTensor(t_tmp_f32);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
 // Q2.3: affine-off LayerNorm via aclnnLayerNorm(gamma=null, beta=null).
 // Input / output F16 [B, seq, hidden]. Normalize over the last dim.
 // ---------------------------------------------------------------------------
@@ -1732,6 +1937,84 @@ bool ImageDiffusionEngine::layer_norm_(void *x_f16_dev, void *out_f16_dev,
     g_cann.aclDestroyTensor(t_mean);
     g_cann.aclDestroyTensor(t_rstd);
     return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.4c: F32 → F16 LayerNorm. Runs aclnnLayerNorm in F32 (input/output)
+// so the normalization denominator `sqrt(var + eps)` does not see Inf when
+// the F32 residual magnitude has grown past the F16 range (observed at
+// depth N ≥ ~35 on real Q4_0 weights). The normalized output has std ≈ 1
+// regardless of input scale, so down-casting to F16 afterward is safe.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::layer_norm_f32_to_f16_(const void *x_f32_dev,
+                                                     void *out_f16_dev,
+                                                     int64_t B, int64_t seq,
+                                                     int64_t hidden) {
+    if (!g_cann.aclnnLayerNorm || !g_cann.aclnnLayerNormGetWorkspaceSize) {
+        QIE_LOG("layer_norm_f32_to_f16_: aclnnLayerNorm symbol missing");
+        return false;
+    }
+    if (!g_cann.aclnnCast || !g_cann.aclnnCastGetWorkspaceSize) {
+        QIE_LOG("layer_norm_f32_to_f16_: aclnnCast symbol missing");
+        return false;
+    }
+    if (!g_cann.aclCreateIntArray) {
+        QIE_LOG("layer_norm_f32_to_f16_: aclCreateIntArray symbol missing");
+        return false;
+    }
+    if (!scratch_residual_tmp_f32_dev_) {
+        QIE_LOG("layer_norm_f32_to_f16_: scratch_residual_tmp_f32_dev_ null");
+        return false;
+    }
+
+    int64_t shape[3]   = {B, seq, hidden};
+    int64_t strides[3];
+    make_contig_strides(3, shape, strides);
+    aclTensor *t_in   = tensor_nd_f32(const_cast<void *>(x_f32_dev),
+                                        3, shape, strides);
+    aclTensor *t_tmp  = tensor_nd_f32(scratch_residual_tmp_f32_dev_,
+                                        3, shape, strides);
+
+    // Normalized shape = [hidden].
+    int64_t norm_shape_arr[1] = {hidden};
+    aclIntArray *norm_shape = g_cann.aclCreateIntArray(norm_shape_arr, 1);
+
+    // mean/rstd tensors: F32 [B, seq, 1] — reused from the F16 LayerNorm
+    // path (aclnnLayerNorm mandates F32 regardless of input dtype).
+    int64_t mr_shape[3]   = {B, seq, 1};
+    int64_t mr_strides[3];
+    make_contig_strides(3, mr_shape, mr_strides);
+    aclTensor *t_mean = tensor_nd_f32(mean_dev_,    3, mr_shape, mr_strides);
+    aclTensor *t_rstd = tensor_nd_f32(ln_rstd_dev_, 3, mr_shape, mr_strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnLayerNormGetWorkspaceSize(
+        t_in, norm_shape,
+        /*weight*/ nullptr, /*bias*/ nullptr,
+        (double)cfg_.layernorm_eps,
+        t_tmp, t_mean, t_rstd,
+        &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnLayerNorm(ws > 0 ? workspace_dev_ : nullptr,
+                                    ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("layer_norm_f32_to_f16_: LayerNorm(F32) status=%d",
+                          (int)s);
+
+    g_cann.aclDestroyIntArray(norm_shape);
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_tmp);
+    g_cann.aclDestroyTensor(t_mean);
+    g_cann.aclDestroyTensor(t_rstd);
+
+    if (s != 0) return false;
+
+    // Cast the normalized F32 output → F16 for downstream matmul/modulate.
+    // After normalization values are bounded ~1σ so the F16 cast is safe.
+    return cast_f32_to_f16_(scratch_residual_tmp_f32_dev_, out_f16_dev,
+                              B * seq * hidden);
 }
 
 // ---------------------------------------------------------------------------
@@ -2292,13 +2575,19 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
 
     // ------------------------------------------------------------------
     // 2. LayerNorm1 on img + txt, then modulate(scale1, shift1).
-    //    Outputs written to scratch_img_norm_dev_ / scratch_txt_norm_dev_.
+    //    Phase 4.4c: residual (img_hidden / txt_hidden) is F32 on-device.
+    //    layer_norm_f32_to_f16_ runs LayerNorm entirely in F32 (so the
+    //    normalization sees no Inf from F32→F16 down-cast of large-magnitude
+    //    residuals at deep layers) then casts the bounded ~1σ output to F16
+    //    for matmul/modulate consumption.
     // ------------------------------------------------------------------
-    if (!layer_norm_(img_hidden, scratch_img_norm_dev_, B, img_seq, H))
+    if (!layer_norm_f32_to_f16_(img_hidden, scratch_img_norm_dev_,
+                                  B, img_seq, H))
         return false;
     if (!modulate_(scratch_img_norm_dev_, img_scale1, img_shift1,
                    B, img_seq, H)) return false;
-    if (!layer_norm_(txt_hidden, scratch_txt_norm_dev_, B, txt_seq, H))
+    if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
+                                  B, txt_seq, H))
         return false;
     if (!modulate_(scratch_txt_norm_dev_, txt_scale1, txt_shift1,
                    B, txt_seq, H)) return false;
@@ -2443,20 +2732,25 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
 
     // ------------------------------------------------------------------
     // 8. Gated residual add: img += attn_out_img * gate1_img (and txt).
+    //    Phase 4.4c: residual is F32; gated_residual_add_f32_ casts the
+    //    (src_f16 * gate_f16) product up to F32 before the accumulator add.
     // ------------------------------------------------------------------
-    if (!gated_residual_add_(img_hidden, scratch_img_out_dev_,
-                             img_gate1, B, img_seq, H)) return false;
-    if (!gated_residual_add_(txt_hidden, scratch_txt_out_dev_,
-                             txt_gate1, B, txt_seq, H)) return false;
+    if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
+                                   img_gate1, B, img_seq, H)) return false;
+    if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
+                                   txt_gate1, B, txt_seq, H)) return false;
 
     // ------------------------------------------------------------------
-    // 9. LayerNorm2 + modulate(scale2, shift2) — output to scratch_*_norm.
+    // 9. LayerNorm2 + modulate(scale2, shift2) — Phase 4.4c F32-in path
+    //    (see step 2 for the full-F32 LN rationale).
     // ------------------------------------------------------------------
-    if (!layer_norm_(img_hidden, scratch_img_norm_dev_, B, img_seq, H))
+    if (!layer_norm_f32_to_f16_(img_hidden, scratch_img_norm_dev_,
+                                  B, img_seq, H))
         return false;
     if (!modulate_(scratch_img_norm_dev_, img_scale2, img_shift2,
                    B, img_seq, H)) return false;
-    if (!layer_norm_(txt_hidden, scratch_txt_norm_dev_, B, txt_seq, H))
+    if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
+                                  B, txt_seq, H))
         return false;
     if (!modulate_(scratch_txt_norm_dev_, txt_scale2, txt_shift2,
                    B, txt_seq, H)) return false;
@@ -2520,12 +2814,12 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           txt_seq, FF, H, scratch_txt_out_dev_)) return false;
 
     // ------------------------------------------------------------------
-    // 11. Gated residual add #2.
+    // 11. Gated residual add #2. Phase 4.4c: F32 accumulator (see step 8).
     // ------------------------------------------------------------------
-    if (!gated_residual_add_(img_hidden, scratch_img_out_dev_,
-                             img_gate2, B, img_seq, H)) return false;
-    if (!gated_residual_add_(txt_hidden, scratch_txt_out_dev_,
-                             txt_gate2, B, txt_seq, H)) return false;
+    if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
+                                   img_gate2, B, img_seq, H)) return false;
+    if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
+                                   txt_gate2, B, txt_seq, H)) return false;
 
     return true;
 }
@@ -2557,6 +2851,9 @@ void ImageDiffusionEngine::scheduler_step_(void * /*latent_dev*/,
 bool ImageDiffusionEngine::scheduler_step_test(void *x_f16_dev,
                                                  const void *eps_f16_dev,
                                                  int64_t n_elts, float dt) {
+    // Phase 4.4c: x and eps are F32 on-device (the latent/residual-stream
+    // promotion cascaded here from denoise_loop_test). Parameter names kept
+    // for source compatibility.
     if (!ready_) {
         QIE_LOG("scheduler_step_test: engine not ready");
         return false;
@@ -2572,14 +2869,14 @@ bool ImageDiffusionEngine::scheduler_step_test(void *x_f16_dev,
     int64_t shape[1]   = { n_elts };
     int64_t strides[1] = { 1 };
     int64_t storage    = n_elts;
-    aclTensor *t_x = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides,
+    aclTensor *t_x = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT, strides,
                                              0, ACL_FORMAT_ND, &storage, 1,
                                              x_f16_dev);
-    aclTensor *t_e = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides,
+    aclTensor *t_e = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT, strides,
                                              0, ACL_FORMAT_ND, &storage, 1,
                                              (void *)eps_f16_dev);
-    uint16_t dt_f16 = fp32_to_fp16(dt);
-    aclScalar *alpha = g_cann.aclCreateScalar(&dt_f16, ACL_FLOAT16);
+    float dt_f32 = dt;
+    aclScalar *alpha = g_cann.aclCreateScalar(&dt_f32, ACL_FLOAT);
 
     uint64_t ws_needed = 0;
     aclOpExecutor *exec = nullptr;
@@ -2641,6 +2938,11 @@ bool ImageDiffusionEngine::denoise_loop_test(void *x_f16_dev, int64_t img_seq,
                                                int n_steps,
                                                float cfg_scale,
                                                double *per_step_ms) {
+    // Phase 4.4c: `x_f16_dev`, `txt_hidden_*_f16_dev` are now F32 buffers
+    // (residual-stream promotion — see forward_block_). Parameter names are
+    // preserved for source compatibility with the 4.3 probe; ownership
+    // semantics are unchanged. Scheduler step and CFG composition use F32
+    // scalars / F32 InplaceAdd accordingly.
     if (!ready_) {
         QIE_LOG("denoise_loop_test: engine not ready");
         return false;
@@ -2652,9 +2954,9 @@ bool ImageDiffusionEngine::denoise_loop_test(void *x_f16_dev, int64_t img_seq,
     }
 
     const int64_t H    = cfg_.hidden_size;
-    const size_t  F16  = sizeof(uint16_t);
-    const size_t  img_bytes = (size_t)img_seq * H * F16;
-    const size_t  txt_bytes = (size_t)txt_seq * H * F16;
+    const size_t  F32  = sizeof(float);
+    const size_t  img_bytes = (size_t)img_seq * H * F32;
+    const size_t  txt_bytes = (size_t)txt_seq * H * F32;
 
     // Temporary D2D staging buffers for:
     //   * latent snapshot (so the second forward can re-read x)
@@ -2753,17 +3055,18 @@ bool ImageDiffusionEngine::denoise_loop_test(void *x_f16_dev, int64_t img_seq,
             int64_t strides1[1] = { 1 };
             int64_t storage1    = nE;
 
+            // Phase 4.4c: CFG tensors are F32 (residual stream promoted).
             aclTensor *t_u = g_cann.aclCreateTensor(
-                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                shape1, 1, ACL_FLOAT, strides1, 0, ACL_FORMAT_ND,
                 &storage1, 1, img_work_u_dev);
             aclTensor *t_c = g_cann.aclCreateTensor(
-                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                shape1, 1, ACL_FLOAT, strides1, 0, ACL_FORMAT_ND,
                 &storage1, 1, img_work_c_dev);
 
-            // Step 1: img_work_c_dev += (-1) * img_work_u_dev
-            uint16_t neg_one_f16 = fp32_to_fp16(-1.0f);
-            aclScalar *alpha_neg1 = g_cann.aclCreateScalar(&neg_one_f16,
-                                                              ACL_FLOAT16);
+            // Step 1: img_work_c_dev += (-1) * img_work_u_dev  (F32)
+            float neg_one_f32 = -1.0f;
+            aclScalar *alpha_neg1 = g_cann.aclCreateScalar(&neg_one_f32,
+                                                              ACL_FLOAT);
             uint64_t ws1 = 0;
             aclOpExecutor *ex1 = nullptr;
             aclnnStatus st = g_cann.aclnnInplaceAddGetWorkspaceSize(t_c, t_u,
@@ -2785,9 +3088,9 @@ bool ImageDiffusionEngine::denoise_loop_test(void *x_f16_dev, int64_t img_seq,
                            g_cann.aclDestroyTensor(t_c);
                            free_all(); return false; }
 
-            // Step 2: img_work_u_dev += cfg * img_work_c_dev (which is Δ)
-            uint16_t cfg16 = fp32_to_fp16(cfg_scale);
-            aclScalar *sc_cfg = g_cann.aclCreateScalar(&cfg16, ACL_FLOAT16);
+            // Step 2: img_work_u_dev += cfg * img_work_c_dev (which is Δ) — F32
+            float cfg_f32 = cfg_scale;
+            aclScalar *sc_cfg = g_cann.aclCreateScalar(&cfg_f32, ACL_FLOAT);
             uint64_t ws2 = 0;
             aclOpExecutor *ex2 = nullptr;
             st = g_cann.aclnnInplaceAddGetWorkspaceSize(t_u, t_c, sc_cfg,
@@ -3052,6 +3355,21 @@ bool ImageDiffusionEngine::init_for_smoke(const ImageDiffusionConfig &cfg,
                    (size_t)cfg_.max_txt_seq * H * F16)) return false;
     if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) return false;
     if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) return false;
+
+    // Phase 4.4c F32-residual scratch (mirrors init_from_gguf). Without
+    // these, layer_norm_f32_to_f16_ and gated_residual_add_f32_ RED at
+    // block 0 because scratch_residual_tmp_f32_dev_ is null.
+    if (!try_alloc(&scratch_img_hidden_f16_dev_,
+                   (size_t)cfg_.max_img_seq * H * F16)) return false;
+    if (!try_alloc(&scratch_txt_hidden_f16_dev_,
+                   (size_t)cfg_.max_txt_seq * H * F16)) return false;
+    {
+        const int64_t max_stream_seq =
+            std::max(cfg_.max_img_seq, cfg_.max_txt_seq);
+        if (!try_alloc(&scratch_residual_tmp_f32_dev_,
+                       (size_t)max_stream_seq * H * sizeof(float)))
+            return false;
+    }
 
     // Phase 4.1 on-device RoPE scratch — three [seq_max, NH, head_dim/2] F16.
     {

@@ -601,6 +601,31 @@ static StatsLine compare_f16_f32(const uint16_t *a, const float *b, size_t n) {
     return s;
 }
 
+// Phase 4.4c variant: NPU residual is F32 on-device now. CPU reference
+// already runs F32 throughout so this is a straight F32↔F32 comparison.
+static StatsLine compare_f32_f32(const float *a, const float *b, size_t n) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    float  mn = +1e30f, mx = -1e30f;
+    int64_t nanc = 0;
+    double mae = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        float av = a[i];
+        float bv = b[i];
+        if (std::isnan(av) || std::isinf(av)) nanc++;
+        mn = std::min(mn, av); mx = std::max(mx, av);
+        dot += (double)av * (double)bv;
+        na  += (double)av * (double)av;
+        nb  += (double)bv * (double)bv;
+        mae += std::fabs((double)av - (double)bv);
+    }
+    StatsLine s;
+    s.cos_sim = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-30);
+    s.min_npu = mn; s.max_npu = mx;
+    s.nan_count = nanc;
+    s.mae = mae / (double)n;
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // Main.
 // ---------------------------------------------------------------------------
@@ -678,15 +703,20 @@ int main(int /*argc*/, char ** /*argv*/) {
            cfg.num_layers);
     fflush(stdout);
 
-    // Activations: img_hidden, txt_hidden, t_emb (all F16). Keep amplitudes
-    // as in Phase 3 so the initial block sees the same input distribution.
+    // Activations: t_emb F16, img_hidden / txt_hidden F32 (Phase 4.4c: the
+    // residual stream is now F32 on-device). Host-side F16→F32 round-trip
+    // preserves the same RNG distribution as the pre-4.4c probe so the CPU
+    // reference (which always ran F32) sees a bit-identical initial input.
     std::vector<uint16_t> img_h_f16, txt_h_f16, t_emb_f16;
     fill_random_f16(img_h_f16, (size_t)img_seq * H, 0.1f, 0x1111ULL);
     fill_random_f16(txt_h_f16, (size_t)txt_seq * H, 0.1f, 0x2222ULL);
     fill_random_f16(t_emb_f16, (size_t)H,             0.1f, 0x3333ULL);
+    std::vector<float> img_h_f32(img_h_f16.size()), txt_h_f32(txt_h_f16.size());
+    for (size_t i = 0; i < img_h_f16.size(); ++i) img_h_f32[i] = f16_to_f32(img_h_f16[i]);
+    for (size_t i = 0; i < txt_h_f16.size(); ++i) txt_h_f32[i] = f16_to_f32(txt_h_f16[i]);
 
-    void *img_h_dev = upload_f16(img_h_f16.data(), img_h_f16.size());
-    void *txt_h_dev = upload_f16(txt_h_f16.data(), txt_h_f16.size());
+    void *img_h_dev = upload_f32(img_h_f32.data(), img_h_f32.size());
+    void *txt_h_dev = upload_f32(txt_h_f32.data(), txt_h_f32.size());
     void *t_emb_dev = upload_f16(t_emb_f16.data(), t_emb_f16.size());
 
     // Re-compute pe tables for CPU reference — same formula as init_for_smoke.
@@ -798,24 +828,26 @@ int main(int /*argc*/, char ** /*argv*/) {
            total_ms);
     fflush(stdout);
 
-    // D2H download of outputs.
-    std::vector<uint16_t> img_h_out_f16(img_h_f16.size());
-    std::vector<uint16_t> txt_h_out_f16(txt_h_f16.size());
-    g_cann.aclrtMemcpy(img_h_out_f16.data(),
-                        img_h_out_f16.size() * sizeof(uint16_t),
+    // D2H download of outputs. Phase 4.4c: residual is F32 — read back F32.
+    std::vector<float> img_h_out_f32(img_h_f32.size());
+    std::vector<float> txt_h_out_f32(txt_h_f32.size());
+    g_cann.aclrtMemcpy(img_h_out_f32.data(),
+                        img_h_out_f32.size() * sizeof(float),
                         img_h_dev,
-                        img_h_out_f16.size() * sizeof(uint16_t),
+                        img_h_out_f32.size() * sizeof(float),
                         ACL_MEMCPY_DEVICE_TO_HOST);
-    g_cann.aclrtMemcpy(txt_h_out_f16.data(),
-                        txt_h_out_f16.size() * sizeof(uint16_t),
+    g_cann.aclrtMemcpy(txt_h_out_f32.data(),
+                        txt_h_out_f32.size() * sizeof(float),
                         txt_h_dev,
-                        txt_h_out_f16.size() * sizeof(uint16_t),
+                        txt_h_out_f32.size() * sizeof(float),
                         ACL_MEMCPY_DEVICE_TO_HOST);
 
     // -------- CPU reference: n_blocks iterations of the same block --------
-    // We apply the F16 requantize step between blocks to model the NPU's
-    // F16 [img_seq, H] round-trip. Without it the CPU path keeps F32 precision
-    // across the full 60-block chain and over-reports NPU drift.
+    // Phase 4.4c: NPU residual is F32 on-device now, so the CPU reference
+    // also runs F32 end-to-end with NO inter-block F16 requantize (that
+    // round-trip existed only to mirror the F16 residual stream on NPU).
+    // The residual-stream F32 promotion is what this probe exists to
+    // validate against a numerically-faithful reference.
     std::vector<float> img_h_ref, txt_h_ref, t_emb_ref;
     f16_to_f32_vec(img_h_f16, img_h_ref);
     f16_to_f32_vec(txt_h_f16, txt_h_ref);
@@ -828,10 +860,7 @@ int main(int /*argc*/, char ** /*argv*/) {
         cpu_block_forward(cfg, hw,
                           img_h_ref, txt_h_ref, t_emb_ref,
                           pe_host, img_seq, txt_seq);
-        // Inter-block F16 quantization boundary — mirrors NPU's implicit
-        // F16 round-trip at the block output.
-        f32_requantize_via_f16(img_h_ref);
-        f32_requantize_via_f16(txt_h_ref);
+        // Phase 4.4c: no inter-block F16 requantize — NPU is F32 residual.
         if ((il + 1) % 10 == 0) {
             auto ref_tn = std::chrono::steady_clock::now();
             double ref_ms = std::chrono::duration<double, std::milli>(ref_tn - ref_t0).count();
@@ -841,13 +870,13 @@ int main(int /*argc*/, char ** /*argv*/) {
         }
     }
 
-    // -------- Compare --------
-    StatsLine img_s = compare_f16_f32(img_h_out_f16.data(),
+    // -------- Compare (Phase 4.4c: NPU residual is F32 end-to-end now) --------
+    StatsLine img_s = compare_f32_f32(img_h_out_f32.data(),
                                         img_h_ref.data(),
-                                        img_h_out_f16.size());
-    StatsLine txt_s = compare_f16_f32(txt_h_out_f16.data(),
+                                        img_h_out_f32.size());
+    StatsLine txt_s = compare_f32_f32(txt_h_out_f32.data(),
                                         txt_h_ref.data(),
-                                        txt_h_out_f16.size());
+                                        txt_h_out_f32.size());
 
     // Per-block wall stats.
     double min_block = 1e30, max_block = -1e30, sum_block = 0.0;

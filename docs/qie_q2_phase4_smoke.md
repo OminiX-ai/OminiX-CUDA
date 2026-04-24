@@ -560,3 +560,54 @@ Bisect at N={1, 5, 10, 30, 60} with default F16-accum AND F32-accum both reveal 
 Verdict: classical DiT precision issue — residual stream accumulates information layer-by-layer; F16 can't hold 60-layer depth. CPU reference runs F32 throughout; matches Phase 4.2 synthetic-weight GREEN where magnitudes happened to stay small.
 
 **Phase 4.4c fix**: promote residual stream (`img_hidden`, `txt_hidden`) to F32 on device. Keep per-block matmul inputs/outputs F16 for WQBMMv3 compatibility. Add F32→F16 Cast before matmul, F16→F32 Cast after residual add. Cost: +50 MiB HBM at production seq=4352 × H=3072; negligible vs 17.86 GiB peak.
+
+### §4.4d NaN fix landed — VERDICT: GREEN @ N=60
+
+**Probe:** 4.4c stash (F32-residual promotion + F32 LayerNorm entry +
+F32 gated residual add, all per the 4.4c design above) built + ran
+twice on ac03 at N=60 (full 60 blocks, real Q4_0 GGUF).
+
+**Real-GGUF gate (tools/probes/qie_q44_real_gguf_smoke):**
+
+| run | wall 60blk | mean   | std     | min/max          | NaN | inf | verdict |
+|-----|-----------|--------|---------|------------------|-----|-----|---------|
+| 1   | 1517.78ms | 18.48  | 1513.40 | -1766.7 / +81974 | 0   | 0   | GREEN   |
+| 2   | 1432.81ms | 18.48  | 1513.40 | -1766.7 / +81974 | 0   | 0   | GREEN   |
+
+Gate (NaN=0 AND inf=0 AND std > 0.001): **GREEN reproducibly**.
+
+Note: output magnitudes are large (max > F16 range) but no overflow
+since residual is F32 on-device — this is the exact design intent of
+4.4c. Downstream consumers (decoder, final projection) must read F32
+residual or cast down carefully.
+
+**Phase 4.2 regression (synthetic weights, CPU-ref parity)
+(tools/probes/qie_q42_60block_smoke):**
+
+| stream | cos_sim   | mae       | min/max         | NaN | verdict |
+|--------|-----------|-----------|-----------------|-----|---------|
+| img    | 1.000000  | 0.000010  | -0.345 / +0.283 | 0   | GREEN   |
+| txt    | 1.000000  | 0.000010  | -0.314 / +0.260 | 0   | GREEN   |
+
+Gate (cos_sim > 0.95 both streams @ layer 60, NaN=0): **GREEN**.
+4.4c residual-F32 refactor preserves bit-accurate numerical parity
+with CPU reference across all 60 blocks.
+
+**Fix summary (this dispatch):**
+- `ImageDiffusionEngine::init_for_smoke` was missing the 4.4c scratch
+  allocations (`scratch_{img,txt}_hidden_f16_dev_`,
+  `scratch_residual_tmp_f32_dev_`); added to mirror `init_from_gguf`.
+  Without this the Phase 4.2 probe REDd at block 0 with
+  `gate_add_f32_: scratch_residual_tmp_f32_dev_ not allocated`.
+
+**WQBMMv3 output dtype probe (Step 1 of workplan, closed on
+documentation):** the CANN op spec
+(`/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json`)
+enumerates WQBMMv2 (which v3 dispatches to) as supporting only
+`{F16, BF16}` for input/scale/output on 910b — F32 output is NOT
+accepted. If the residual-F32 approach had not been sufficient, the
+next step would have been BF16 pipeline conversion (the
+`GGML_CANN_QUANT_BF16=on` workaround ggml-cann ships for SD models,
+see `ggml/src/ggml-cann/aclnn_ops.cpp:2638`). Not needed.
+
+**Unblocks:** Phase 4.5 cat-edit smoke is now UNBLOCKED.

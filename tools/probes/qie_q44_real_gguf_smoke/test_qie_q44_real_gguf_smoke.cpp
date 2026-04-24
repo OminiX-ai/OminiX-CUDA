@@ -71,7 +71,7 @@ static inline float f16_to_f32(uint16_t bits) {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic random fill helper.
+// Deterministic random fill helpers.
 // ---------------------------------------------------------------------------
 static void fill_random_f16(std::vector<uint16_t> &out, size_t n,
                              float amp, uint64_t seed) {
@@ -79,6 +79,20 @@ static void fill_random_f16(std::vector<uint16_t> &out, size_t n,
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<float> dist(-amp, amp);
     for (size_t i = 0; i < n; ++i) out[i] = f32_to_f16(dist(rng));
+}
+// Phase 4.4c: residual stream is F32 on-device. Keep the F16-rounded RNG so
+// the smoke-input distribution is bit-identical to the Phase 4.4b probe
+// (i.e. F32 host values are the round-trip of the same F16 RNG samples) —
+// the F32 residual only matters as layers accumulate depth.
+static void fill_random_f32_via_f16(std::vector<float> &out, size_t n,
+                                      float amp, uint64_t seed) {
+    out.assign(n, 0.0f);
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-amp, amp);
+    for (size_t i = 0; i < n; ++i) {
+        uint16_t h = f32_to_f16(dist(rng));
+        out[i] = f16_to_f32(h);
+    }
 }
 
 static void *upload_f16(const uint16_t *host, size_t n) {
@@ -93,6 +107,24 @@ static void *upload_f16(const uint16_t *host, size_t n) {
                               ACL_MEMCPY_HOST_TO_DEVICE);
     if (err != 0) {
         fprintf(stderr, "[smoke44] H2D memcpy err=%d\n", (int)err);
+        g_cann.aclrtFree(dev);
+        return nullptr;
+    }
+    return dev;
+}
+
+static void *upload_f32(const float *host, size_t n) {
+    void *dev = nullptr;
+    size_t bytes = n * sizeof(float);
+    aclError err = g_cann.aclrtMalloc(&dev, bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0) {
+        fprintf(stderr, "[smoke44] aclrtMalloc(%zu) err=%d\n", bytes, (int)err);
+        return nullptr;
+    }
+    err = g_cann.aclrtMemcpy(dev, bytes, host, bytes,
+                              ACL_MEMCPY_HOST_TO_DEVICE);
+    if (err != 0) {
+        fprintf(stderr, "[smoke44] F32 H2D memcpy err=%d\n", (int)err);
         g_cann.aclrtFree(dev);
         return nullptr;
     }
@@ -117,6 +149,37 @@ static LatentStats compute_f16_stats(const uint16_t *data, size_t n) {
     int64_t nanc = 0, infc = 0;
     for (size_t i = 0; i < n; ++i) {
         float v = f16_to_f32(data[i]);
+        if (std::isnan(v)) { nanc++; continue; }
+        if (std::isinf(v)) { infc++; continue; }
+        sum   += v;
+        sumsq += (double)v * (double)v;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    LatentStats s;
+    int64_t valid = (int64_t)n - nanc - infc;
+    if (valid <= 0) {
+        s.mean = 0.0; s.std = 0.0;
+        s.min_v = 0.0f; s.max_v = 0.0f;
+    } else {
+        s.mean = sum / (double)valid;
+        double var = sumsq / (double)valid - s.mean * s.mean;
+        s.std = var > 0.0 ? std::sqrt(var) : 0.0;
+        s.min_v = mn; s.max_v = mx;
+    }
+    s.nan_count = nanc;
+    s.inf_count = infc;
+    return s;
+}
+
+// Phase 4.4c: residual stream is F32 — read back F32 values directly.
+// Same finite-filter / std-gate logic as the F16 path.
+static LatentStats compute_f32_stats(const float *data, size_t n) {
+    double sum = 0.0, sumsq = 0.0;
+    float  mn = +1e30f, mx = -1e30f;
+    int64_t nanc = 0, infc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        float v = data[i];
         if (std::isnan(v)) { nanc++; continue; }
         if (std::isinf(v)) { infc++; continue; }
         sum   += v;
@@ -262,13 +325,18 @@ int main(int /*argc*/, char ** /*argv*/) {
     }
 
     // ---- Dummy activations at smoke shape ----
-    std::vector<uint16_t> x_img_f16, x_txt_f16, t_emb_f16;
-    fill_random_f16(x_img_f16, (size_t)img_seq * H, 0.1f, 0x4411ULL);
-    fill_random_f16(x_txt_f16, (size_t)txt_seq * H, 0.1f, 0x4422ULL);
-    fill_random_f16(t_emb_f16, (size_t)H,            0.1f, 0x4433ULL);
+    // Phase 4.4c: residual stream is F32 on-device. Use fill_random_f32_via_f16
+    // so the numeric distribution matches the Phase 4.4b F16 smoke (same RNG
+    // samples, rounded through F16 then promoted to F32) — isolates the fix
+    // to the accumulator, not the input amplitude.
+    std::vector<float>    x_img_f32, x_txt_f32;
+    std::vector<uint16_t> t_emb_f16;
+    fill_random_f32_via_f16(x_img_f32, (size_t)img_seq * H, 0.1f, 0x4411ULL);
+    fill_random_f32_via_f16(x_txt_f32, (size_t)txt_seq * H, 0.1f, 0x4422ULL);
+    fill_random_f16         (t_emb_f16, (size_t)H,             0.1f, 0x4433ULL);
 
-    void *x_img_dev = upload_f16(x_img_f16.data(), x_img_f16.size());
-    void *x_txt_dev = upload_f16(x_txt_f16.data(), x_txt_f16.size());
+    void *x_img_dev = upload_f32(x_img_f32.data(), x_img_f32.size());
+    void *x_txt_dev = upload_f32(x_txt_f32.data(), x_txt_f32.size());
     void *t_emb_dev = upload_f16(t_emb_f16.data(), t_emb_f16.size());
     if (!x_img_dev || !x_txt_dev || !t_emb_dev) {
         fprintf(stderr, "[smoke44] activation upload failed\n");
@@ -288,18 +356,30 @@ int main(int /*argc*/, char ** /*argv*/) {
         return 1;
     }
 
-    // ---- Baseline stats on input x_img ----
-    LatentStats s0 = compute_f16_stats(x_img_f16.data(), x_img_f16.size());
+    // ---- Baseline stats on input x_img (F32 per Phase 4.4c contract) ----
+    LatentStats s0 = compute_f32_stats(x_img_f32.data(), x_img_f32.size());
     printf("\n[smoke44] x_img_init: mean=%.4f std=%.4f min=%.4f max=%.4f "
            "nan=%lld inf=%lld\n",
            s0.mean, s0.std, s0.min_v, s0.max_v,
            (long long)s0.nan_count, (long long)s0.inf_count);
     fflush(stdout);
 
-    // ---- Single forward: all 60 blocks ----
-    std::vector<double> per_block_ms((size_t)cfg.num_layers, 0.0);
+    // ---- Single forward: N blocks (env-gated for Phase 4.4b bisect) ----
+    int n_blocks_run = cfg.num_layers;
+    if (const char *nb = std::getenv("QIE_Q44_N_BLOCKS")) {
+        int v = std::atoi(nb);
+        if (v > 0 && v <= cfg.num_layers) {
+            n_blocks_run = v;
+            printf("[smoke44] QIE_Q44_N_BLOCKS=%d (bisect mode; clamped to %d)\n",
+                   v, n_blocks_run);
+        } else {
+            printf("[smoke44] QIE_Q44_N_BLOCKS='%s' ignored (out of range)\n", nb);
+        }
+    }
+    std::vector<double> per_block_ms((size_t)n_blocks_run, 0.0);
     printf("[smoke44] dispatching forward_all_blocks_test "
-           "(n_blocks=%d, per_block_ms requested)...\n", cfg.num_layers);
+           "(n_blocks=%d / %d, per_block_ms requested)...\n",
+           n_blocks_run, cfg.num_layers);
     fflush(stdout);
 
     auto t_fwd0 = std::chrono::steady_clock::now();
@@ -307,7 +387,7 @@ int main(int /*argc*/, char ** /*argv*/) {
                                                 x_txt_dev, txt_seq,
                                                 t_emb_dev, pe_dev,
                                                 per_block_ms.data(),
-                                                cfg.num_layers);
+                                                n_blocks_run);
     g_cann.aclrtSynchronizeStream(nullptr);
     auto t_fwd1 = std::chrono::steady_clock::now();
     double fwd_wall_ms =
@@ -323,18 +403,19 @@ int main(int /*argc*/, char ** /*argv*/) {
     fflush(stdout);
 
     // ---- D2H download + stats ----
-    std::vector<uint16_t> x_img_out_f16(x_img_f16.size());
-    aclError me = g_cann.aclrtMemcpy(x_img_out_f16.data(),
-                                       x_img_out_f16.size() * sizeof(uint16_t),
+    // Phase 4.4c: residual stream is F32 — read back F32 values directly.
+    std::vector<float> x_img_out_f32(x_img_f32.size());
+    aclError me = g_cann.aclrtMemcpy(x_img_out_f32.data(),
+                                       x_img_out_f32.size() * sizeof(float),
                                        x_img_dev,
-                                       x_img_out_f16.size() * sizeof(uint16_t),
+                                       x_img_out_f32.size() * sizeof(float),
                                        ACL_MEMCPY_DEVICE_TO_HOST);
     if (me != 0) {
-        fprintf(stderr, "[smoke44] D2H memcpy err=%d\n", (int)me);
+        fprintf(stderr, "[smoke44] F32 D2H memcpy err=%d\n", (int)me);
         return 1;
     }
-    LatentStats s1 = compute_f16_stats(x_img_out_f16.data(),
-                                         x_img_out_f16.size());
+    LatentStats s1 = compute_f32_stats(x_img_out_f32.data(),
+                                         x_img_out_f32.size());
 
     // Per-block stats.
     double min_b = 1e30, max_b = -1e30, sum_b = 0.0;
@@ -364,14 +445,15 @@ int main(int /*argc*/, char ** /*argv*/) {
            peak_gib,
            (long long)st.q4_tensors,
            (long long)st.f16_fallback_tensors);
-    printf("wall:   init=%.1f ms  forward_60blk=%.2f ms   "
+    printf("wall:   init=%.1f ms  forward_%dblk=%.2f ms   "
            "per-block min=%.2f ms  median=%.2f ms  max=%.2f ms  sum=%.2f ms\n",
-           st.load_wall_ms, fwd_wall_ms, min_b, median_b, max_b, sum_b);
+           st.load_wall_ms, n_blocks_run, fwd_wall_ms,
+           min_b, median_b, max_b, sum_b);
     printf("per-block ms (first 5 / last 5):  ");
-    for (int i = 0; i < std::min(5, cfg.num_layers); ++i)
+    for (int i = 0; i < std::min(5, n_blocks_run); ++i)
         printf("%.2f ", per_block_ms[i]);
     printf("... ");
-    for (int i = std::max(0, cfg.num_layers - 5); i < cfg.num_layers; ++i)
+    for (int i = std::max(0, n_blocks_run - 5); i < n_blocks_run; ++i)
         printf("%.2f ", per_block_ms[i]);
     printf("\n");
 

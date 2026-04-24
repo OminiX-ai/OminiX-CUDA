@@ -380,6 +380,35 @@ static LatentStats compute_f16_stats(const uint16_t *data, size_t n) {
     return s;
 }
 
+static LatentStats compute_f32_stats(const float *data, size_t n) {
+    double sum = 0.0, sumsq = 0.0;
+    float  mn = +1e30f, mx = -1e30f;
+    int64_t nanc = 0, infc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        float v = data[i];
+        if (std::isnan(v)) { nanc++; continue; }
+        if (std::isinf(v)) { infc++; continue; }
+        sum   += v;
+        sumsq += (double)v * (double)v;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    LatentStats s;
+    int64_t valid = (int64_t)n - nanc - infc;
+    if (valid <= 0) {
+        s.mean = 0.0; s.std = 0.0;
+        s.min_v = 0.0f; s.max_v = 0.0f;
+    } else {
+        s.mean = sum / (double)valid;
+        double var = sumsq / (double)valid - s.mean * s.mean;
+        s.std = var > 0.0 ? std::sqrt(var) : 0.0;
+        s.min_v = mn; s.max_v = mx;
+    }
+    s.nan_count = nanc;
+    s.inf_count = infc;
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // Main.
 // ---------------------------------------------------------------------------
@@ -462,16 +491,25 @@ int main(int /*argc*/, char ** /*argv*/) {
         point_layer_at_shared(*lw, uw);
     }
 
-    // Activations.
+    // Activations. Phase 4.4c: latent x + txt streams are F32 on-device. Host
+    // draws are F16 samples promoted to F32 (same RNG distribution as the
+    // pre-4.4c probe — only the on-device dtype changed).
     std::vector<uint16_t> x_f16, txt_cond_f16, txt_uncond_f16, t_emb_f16;
     fill_random_f16(x_f16,           (size_t)img_seq * H, 0.1f, 0x1111ULL);
     fill_random_f16(txt_cond_f16,    (size_t)txt_seq * H, 0.1f, 0x2222ULL);
     fill_random_f16(txt_uncond_f16,  (size_t)txt_seq * H, 0.1f, 0xAAAAULL);
     fill_random_f16(t_emb_f16,       (size_t)H,             0.1f, 0x3333ULL);
 
-    void *x_dev          = upload_f16(x_f16.data(),          x_f16.size());
-    void *txt_cond_dev   = upload_f16(txt_cond_f16.data(),   txt_cond_f16.size());
-    void *txt_uncond_dev = upload_f16(txt_uncond_f16.data(), txt_uncond_f16.size());
+    std::vector<float> x_f32(x_f16.size());
+    std::vector<float> txt_cond_f32(txt_cond_f16.size());
+    std::vector<float> txt_uncond_f32(txt_uncond_f16.size());
+    for (size_t i = 0; i < x_f16.size(); ++i)          x_f32[i]          = f16_to_f32(x_f16[i]);
+    for (size_t i = 0; i < txt_cond_f16.size(); ++i)   txt_cond_f32[i]   = f16_to_f32(txt_cond_f16[i]);
+    for (size_t i = 0; i < txt_uncond_f16.size(); ++i) txt_uncond_f32[i] = f16_to_f32(txt_uncond_f16[i]);
+
+    void *x_dev          = upload_f32(x_f32.data(),          x_f32.size());
+    void *txt_cond_dev   = upload_f32(txt_cond_f32.data(),   txt_cond_f32.size());
+    void *txt_uncond_dev = upload_f32(txt_uncond_f32.data(), txt_uncond_f32.size());
     void *t_emb_dev      = upload_f16(t_emb_f16.data(),      t_emb_f16.size());
 
     // pe table.
@@ -487,8 +525,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     printf("... (last): %.4f\n", sigmas.back());
     fflush(stdout);
 
-    // Baseline stats of initial x.
-    LatentStats s0 = compute_f16_stats(x_f16.data(), x_f16.size());
+    // Baseline stats of initial x (F32 per Phase 4.4c contract).
+    LatentStats s0 = compute_f32_stats(x_f32.data(), x_f32.size());
     printf("[smoke43] x_init: mean=%.4f std=%.4f min=%.4f max=%.4f nan=%lld inf=%lld\n",
            s0.mean, s0.std, s0.min_v, s0.max_v,
            (long long)s0.nan_count, (long long)s0.inf_count);
@@ -518,19 +556,19 @@ int main(int /*argc*/, char ** /*argv*/) {
     printf("[smoke43] denoise_loop_test OK (%.2f ms total)\n", total_ms);
     fflush(stdout);
 
-    // D2H download of final x.
-    std::vector<uint16_t> x_out_f16(x_f16.size());
-    aclError me = g_cann.aclrtMemcpy(x_out_f16.data(),
-                                       x_out_f16.size() * sizeof(uint16_t),
+    // D2H download of final x (F32 per Phase 4.4c contract).
+    std::vector<float> x_out_f32(x_f32.size());
+    aclError me = g_cann.aclrtMemcpy(x_out_f32.data(),
+                                       x_out_f32.size() * sizeof(float),
                                        x_dev,
-                                       x_out_f16.size() * sizeof(uint16_t),
+                                       x_out_f32.size() * sizeof(float),
                                        ACL_MEMCPY_DEVICE_TO_HOST);
     if (me != 0) {
         fprintf(stderr, "[smoke43] D2H memcpy err=%d\n", (int)me);
         return 1;
     }
 
-    LatentStats s1 = compute_f16_stats(x_out_f16.data(), x_out_f16.size());
+    LatentStats s1 = compute_f32_stats(x_out_f32.data(), x_out_f32.size());
 
     // Per-step stats.
     double min_step = 1e30, max_step = -1e30, sum_step = 0.0;
