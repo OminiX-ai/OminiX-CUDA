@@ -1196,15 +1196,101 @@ eye-check, but must be addressed for full Q1 parity):**
 exercises init_from_gguf → init_from_dump → denoise_full → save final
 latent. Receipts (fill in post-run on ac03):
 
-| Measurement | Gate | Step 4 actual |
+| Measurement | Gate | Step 4 actual (ac03, HEAD `539f5778`) |
 |---|---|---|
-| NaN in final latent | =0 | (run on ac03) |
-| inf in final latent | =0 | (run on ac03) |
-| std(final latent) | > 0.001 | (run on ac03) |
-| min(final latent) | > -20 | (run on ac03) |
-| max(final latent) | < +20 | (run on ac03) |
-| denoise_full wall (20 steps, cfg=1 or 4) | < 1450 s target | (run on ac03) |
-| Output PNG eye-check | recognizable cat | Step 4d |
+| Build | clean | OK (`--- build OK ---`) |
+| init_from_gguf wall | < 600 s | 108.3 s |
+| init peak HBM | informational | 17.93 GiB |
+| init_from_dump txt_seq / has_ref / has_uncond | match dump | 214 / 1 / 0 |
+| effective cfg_scale | 1.0 (no uncond dump) | 1.00 (run_uncond=0) |
+| NaN in final latent | =0 | **16384 / 16384 (all-NaN)** |
+| inf in final latent | =0 | 0 |
+| std(final latent) | > 0.001 | 0.0 (all-NaN) |
+| min(final latent) | > -20 | -3.40e+38 (NaN sentinel) |
+| max(final latent) | < +20 | +3.40e+38 (NaN sentinel) |
+| denoise_full wall (20 steps, cfg=1) | < 1450 s target | **24.32 s** |
+| per-step wall (median / min / max) | informational | 1149.08 / 1147.91 / 1238.20 ms |
+| Output PNG eye-check | recognizable cat | **solid black** (NaN → 0) |
+
+### §5.5 Step 4c+4d smoke — RED (NaN gate fail; agent #62 surface)
+
+Run on ac03 against fork HEAD `539f5778` (this commit). HBM lock
+`/tmp/ac03_hbm_lock` taken; ac02 file-disjoint (Leak #2 bisect).
+
+**Build:** clean. `g++ -std=c++17 -O2` against
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp` +
+`tools/qwen_tts/cp_cann_symbols.cpp`, links `libascendcl libopapi
+libnnopbase libggml-base libggml libggml-cpu`. No diagnostics.
+
+**Init:** `init_from_gguf` 108.3 s wall, peak HBM 17.93 GiB, 1933
+tensors uploaded (Q4-resident=696, F16-fallback=150). Dequant/repack
+5.3 ms. `init_from_dump OK lat=[32,32,16,1] txt=[3584 x 214]
+has_ref=1 has_uncond=0`. Conditioning stats sane: `txt_cond mean
+-0.135 std 4.40 |.| ≤ 150.3`, `ref_latent mean -0.069 std 0.467 |.| ≤
+1.68`, `init_latent` zero-init (Step 4 starts from zero and adds
+scaled noise per sigma — expected).
+
+**Denoise:** `denoise_full` ran all 20 steps, total 24.32 s wall
+(median 1149 ms/step, min 1148, max 1238 on step 0). No early bail
+out, no spike — per-step wall is **flat across the 20 steps**, so
+NaN is not "blowing up over many steps"; it almost certainly emerges
+on step 0 or step 1 and just propagates uniformly thereafter. Final
+out_latent: **16384 / 16384 NaN, 0 inf**, with the F32-NaN sentinel
+encoded as ±3.4e+38 in the histogram.
+
+**Decode (Step 4d):** ran the decode-only short-circuit
+`OMINIX_QIE_DECODE_ONLY_LATENT=/tmp/qie_q45_step4_latent.f32.bin
+ominix-diffusion-cli ... -W 256 -H 256 --steps 20 --cfg-scale 1.0
+--seed 42`. CLI honored the env, skipped denoise, ran VAE decode in
+19.89 s. Both NaN-checks fired:
+`decode_only/x_latent_loaded: 16384 NaN` and
+`decode_only/decoded_image: 196608 NaN`. PNG saved at
+`/tmp/qie_q45_step4_native_cat.png` (256×256 RGB, 2.3 KB) — all
+pixels black (NaN clamped to 0 by the PNG encoder).
+
+**Eye-check:** `qie_q45_step4_native_cat.png` is solid black; Q1
+baseline `/tmp/qie_q45_host2step_baseline.png` is a clearly
+recognizable gray-and-white kitten on a warm background. Step 4 PNG
+is **not a recognizable cat**, so this is **not** the
+"RoPE-pe-layout drift / color-shifted but recognizable" failure mode
+the workplan warned about — this is a hard NaN failure inside
+denoise_full, distinct from the known-gap.
+
+**Verdict:** **RED** on the NaN gate.
+`denoise_full` runs to completion, dispatches all 20 flow-Euler
+steps, but produces a fully-NaN latent. Per workplan ("Don't fix
+bugs in denoise_full beyond trivial typos — agent #62 owns that
+surface"), no host-side debug attempted. Hand-off to agent #62.
+
+**Hand-off pointers for agent #62:**
+- per-step wall is flat (1148 ms median across all 20 steps), so
+  NaN almost certainly emerges by step 0 or 1 — recommend bisecting
+  by adding a single `nan_check` after the first DiT block on the
+  first step, then between block-rounds.
+- F16-fallback weight bytes = 9.51 GiB. If any of those participate
+  in matmul accumulation under `QIE_MATMUL_INNER_PRECISE=1`
+  (HIGH_PERFORMANCE / F16-accum), this is a top suspect — try
+  `QIE_MATMUL_INNER_PRECISE=0` (F32-accum) for the smoke before any
+  code changes.
+- Conditioning is sane on entry (no NaN in init_latent / ref_latent /
+  txt_cond). Sigmas first-5 = `1.0000 0.9828 0.9643 0.9444 0.9231`,
+  last `0.0000`, monotonic. So the NaN is generated *inside* the
+  step-0 forward, not from bad inputs / bad schedule.
+- `cfg_scale` was forced to 1.0 by `has_uncond=0` (Step 2 dumps
+  carry only cond, no uncond). Single forward per step, no
+  cond+uncond mix. Eliminates CFG combiner as a NaN source.
+
+**Wall summary (Step 4c+4d):** init 108.3 s + denoise_full 24.32 s
++ VAE decode 19.89 s = **152.5 s total wall**. denoise_full alone
+is 60× under the 1450 s target — but obviously moot until NaN gate
+goes green.
+
+Logs / artifacts (all on ac03 unless noted):
+- `/tmp/qie_q45_step4_smoke.log` (build + smoke, 47 lines)
+- `/tmp/qie_q45_step4_decode.log` (CLI VAE decode log)
+- `/tmp/qie_q45_step4_latent.f32.bin` (65536 B, 16384 F32, all-NaN)
+- `/tmp/qie_q45_step4_native_cat.png` (also on Mac, scp'd for record)
+- `/tmp/qie_q45_host2step_baseline.png` (Q1 reference, also on Mac)
 
 **Smoke command (ac03, SIGHUP-proof):**
 
