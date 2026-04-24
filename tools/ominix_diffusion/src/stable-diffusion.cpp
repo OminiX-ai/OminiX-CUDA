@@ -2122,6 +2122,34 @@ public:
             diffusion_params.vace_context       = vace_context;
             diffusion_params.vace_strength      = vace_strength;
 
+            // Q4 CFG batching gate. Default OFF preserves byte-identical sequential path.
+            // When set to 1, cond + uncond are stacked on ne[3]=2 and dispatched in a single
+            // diffusion-model compute, halving graph-build + mul-mat dispatch overhead per step.
+            // Eligibility: QIE-only (VERSION_QWEN_IMAGE), has_unconditioned && !has_img_cond
+            // && !has_skiplayer && no controlnet. Step 2 wires the actual batched path; Step 1
+            // scaffold emits a log on first step and falls through to sequential.
+            const char* cfg_batched_env        = getenv("OMINIX_CFG_BATCHED");
+            const bool cfg_batched_requested   = cfg_batched_env != nullptr && cfg_batched_env[0] == '1';
+            const bool cfg_batched_eligible    = cfg_batched_requested
+                                                && has_unconditioned
+                                                && !has_img_cond
+                                                && !has_skiplayer
+                                                && (control_hint == nullptr || control_net == nullptr)
+                                                && version == VERSION_QWEN_IMAGE;
+            static bool cfg_batched_logged_once = false;
+            if (cfg_batched_requested && !cfg_batched_logged_once) {
+                cfg_batched_logged_once = true;
+                if (cfg_batched_eligible) {
+                    LOG_INFO("OMINIX_CFG_BATCHED=1: CFG batching eligible (QIE + CFG on, no SLG/img_cond/ctrlnet). "
+                             "Step-1 scaffold active — sequential path still in use until Step-2 tensor plumbing lands.");
+                } else {
+                    LOG_WARN("OMINIX_CFG_BATCHED=1 requested but NOT eligible this run "
+                             "(need: VERSION_QWEN_IMAGE + has_unconditioned + !has_img_cond + !has_skiplayer + no controlnet). "
+                             "Falling back to sequential cond/uncond.");
+                }
+            }
+            (void)cfg_batched_eligible;  // reserved for Step 2
+
             const SDCondition* active_condition = nullptr;
             struct ggml_tensor** active_output  = &out_cond;
             if (start_merge_step == -1 || step <= start_merge_step) {
