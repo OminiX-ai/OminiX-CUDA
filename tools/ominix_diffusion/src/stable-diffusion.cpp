@@ -1,5 +1,8 @@
 #include "ggml_extend.hpp"
 
+#include <cstdlib>
+#include <filesystem>
+
 #include "model.h"
 #include "rng.hpp"
 #include "rng_mt19937.hpp"
@@ -3362,6 +3365,93 @@ static bool check_tensor_nan(struct ggml_tensor* t, const char* label) {
     return false;
 }
 
+// ============================================================================
+// [QIE Phase 4.5 Step 2] Optional tensor dump for native-engine hand-off.
+//
+// Gated entirely by env `OMINIX_QIE_DUMP_DIR=/path/to/outdir`. When unset the
+// code is a no-op and has zero runtime cost (only an environment lookup per
+// call). When set, each invocation writes:
+//   <dir>/<name>.f32.bin     — raw little-endian F32 flat buffer
+//   <dir>/<name>.meta.txt    — shape + ne0..3 + ggml_type
+// F16 tensors are up-cast to F32 on write. F32 tensors are copied as-is.
+// Unsupported tensor types warn and skip (we will never ask for Q* here).
+//
+// Rationale: this is the cleanest short-circuit for Phase 4.5 Step 2 — the
+// host runs the full ominix-diffusion stable-diffusion.cpp pipeline (text
+// encoder via ggml-cann, VAE encoder for the ref image) and dumps the
+// intermediate tensors at the same code sites where `check_tensor_nan`
+// already inspects them. The native engine then consumes these files for
+// denoise, bypassing the VAE/encoder port work (out-of-scope per the §5
+// workplan).
+// ============================================================================
+static void qie_dump_tensor(struct ggml_tensor* t, const char* name) {
+    if (t == nullptr) return;
+    const char* dir = std::getenv("OMINIX_QIE_DUMP_DIR");
+    if (dir == nullptr || dir[0] == '\0') return;
+    namespace fs = std::filesystem;
+    fs::path base = fs::path(dir);
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    if (ec) {
+        LOG_ERROR("[QIE dump] create_directories('%s') failed: %s",
+                  dir, ec.message().c_str());
+        return;
+    }
+
+    int64_t n = ggml_nelements(t);
+    // Write meta.
+    {
+        fs::path mp = base / (std::string(name) + ".meta.txt");
+        FILE* mf = std::fopen(mp.string().c_str(), "w");
+        if (mf) {
+            std::fprintf(mf,
+                         "name=%s\n"
+                         "ne0=%" PRId64 "\nne1=%" PRId64 "\nne2=%" PRId64 "\nne3=%" PRId64 "\n"
+                         "ggml_type=%d\n"
+                         "nelements=%" PRId64 "\n"
+                         "dump_dtype=f32\n",
+                         name,
+                         t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                         (int)t->type, n);
+            std::fclose(mf);
+        }
+    }
+
+    fs::path bp = base / (std::string(name) + ".f32.bin");
+    FILE* bf = std::fopen(bp.string().c_str(), "wb");
+    if (bf == nullptr) {
+        LOG_ERROR("[QIE dump] fopen('%s') failed", bp.string().c_str());
+        return;
+    }
+    if (t->type == GGML_TYPE_F32) {
+        size_t wrote = std::fwrite(t->data, sizeof(float), (size_t)n, bf);
+        std::fclose(bf);
+        if ((int64_t)wrote != n) {
+            LOG_ERROR("[QIE dump] partial write f32 %s: %zu/%" PRId64, name, wrote, n);
+        } else {
+            LOG_INFO("[QIE dump] %s -> %s (%" PRId64 " F32 elts, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "])",
+                     name, bp.string().c_str(), n,
+                     t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        }
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t* src = (const ggml_fp16_t*)t->data;
+        std::vector<float> buf((size_t)n, 0.0f);
+        for (int64_t i = 0; i < n; ++i) buf[i] = ggml_fp16_to_fp32(src[i]);
+        size_t wrote = std::fwrite(buf.data(), sizeof(float), (size_t)n, bf);
+        std::fclose(bf);
+        if ((int64_t)wrote != n) {
+            LOG_ERROR("[QIE dump] partial write f16->f32 %s: %zu/%" PRId64, name, wrote, n);
+        } else {
+            LOG_INFO("[QIE dump] %s (f16->f32) -> %s (%" PRId64 " elts)",
+                     name, bp.string().c_str(), n);
+        }
+    } else {
+        std::fclose(bf);
+        LOG_WARN("[QIE dump] %s: unsupported ggml_type=%d — skipping",
+                 name, (int)t->type);
+    }
+}
+
 sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                     struct ggml_context* work_ctx,
                                     ggml_tensor* init_latent,
@@ -3402,6 +3492,85 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
 
     int64_t t0 = ggml_time_ms();
 
+    // ========================================================================
+    // [QIE Phase 4.5 Step 3] Decode-only short-circuit.
+    //
+    // When env `OMINIX_QIE_DECODE_ONLY_LATENT=<path>` is set, skip text encode
+    // and diffusion sampling entirely: load the raw F32 latent from disk,
+    // shape it `[W/8, H/8, 16, 1]` (Qwen-Image VAE layout), and jump to the
+    // existing `decode_first_stage` path.
+    //
+    // Use case: Phase 4.5 Step 3 — the native engine dumps a final latent to
+    // disk, host reuses the `ominix-diffusion-cli` binary to VAE-decode it to
+    // a PNG, without reserving HBM for the DiT / text encoder.
+    //
+    // Note: for HBM hygiene, the caller should pass `--offload-to-cpu` or
+    // similar to keep the DiT/TE weights off HBM (or run in a separate
+    // process). This short-circuit does NOT free them here.
+    // ========================================================================
+    {
+        const char *decode_path = std::getenv("OMINIX_QIE_DECODE_ONLY_LATENT");
+        if (decode_path != nullptr && decode_path[0] != '\0') {
+            LOG_INFO("[QIE decode-only] reading latent from '%s'", decode_path);
+            int vae_scale_factor = sd_ctx->sd->get_vae_scale_factor();
+            int W_lat = width  / vae_scale_factor;
+            int H_lat = height / vae_scale_factor;
+            int C_lat = sd_ctx->sd->get_latent_channel();
+            LOG_INFO("[QIE decode-only] expected shape [%d, %d, %d, 1] F32 "
+                     "(W_lat x H_lat x C x 1) at WxH=%dx%d vae_scale=%d",
+                     W_lat, H_lat, C_lat, width, height, vae_scale_factor);
+
+            size_t expected_n = (size_t)W_lat * H_lat * C_lat * 1;
+            size_t expected_bytes = expected_n * sizeof(float);
+
+            FILE* f = std::fopen(decode_path, "rb");
+            if (f == nullptr) {
+                LOG_ERROR("[QIE decode-only] fopen('%s') failed", decode_path);
+                return nullptr;
+            }
+            std::fseek(f, 0, SEEK_END);
+            long fsize = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if ((size_t)fsize != expected_bytes) {
+                LOG_WARN("[QIE decode-only] file size %ld != expected %zu "
+                         "— will read min(file, expected)", fsize, expected_bytes);
+            }
+
+            ggml_tensor* x_latent = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32,
+                                                       W_lat, H_lat, C_lat, 1);
+            size_t to_read = std::min((size_t)fsize, expected_bytes);
+            size_t n_read = std::fread(x_latent->data, 1, to_read, f);
+            std::fclose(f);
+            if (n_read != to_read) {
+                LOG_ERROR("[QIE decode-only] fread %zu/%zu", n_read, to_read);
+                return nullptr;
+            }
+
+            check_tensor_nan(x_latent, "decode_only/x_latent_loaded");
+
+            // Run VAE decode using the existing path.
+            int64_t td0 = ggml_time_ms();
+            ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, x_latent);
+            if (img == nullptr) {
+                LOG_ERROR("[QIE decode-only] decode_first_stage returned null");
+                return nullptr;
+            }
+            int64_t td1 = ggml_time_ms();
+            LOG_INFO("[QIE decode-only] decode_first_stage took %.2fs",
+                     (td1 - td0) * 1.0f / 1000);
+            check_tensor_nan(img, "decode_only/decoded_image");
+
+            sd_image_t* result_images = (sd_image_t*)calloc(1, sizeof(sd_image_t));
+            if (result_images == nullptr) return nullptr;
+            result_images[0].width   = width;
+            result_images[0].height  = height;
+            result_images[0].channel = 3;
+            result_images[0].data    = ggml_tensor_to_sd_image(img);
+            LOG_INFO("[QIE decode-only] produced one %dx%d RGB image", width, height);
+            return result_images;
+        }
+    }
+
     ConditionerParams condition_params;
     condition_params.text            = prompt;
     condition_params.clip_skip       = clip_skip;
@@ -3439,6 +3608,22 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     check_tensor_nan(cond.c_crossattn, "encoder/cond.c_crossattn");
     check_tensor_nan(cond.c_vector, "encoder/cond.c_vector");
     if (uncond.c_crossattn) check_tensor_nan(uncond.c_crossattn, "encoder/uncond.c_crossattn");
+
+    // [QIE Phase 4.5 Step 2] Optional dump hand-off. No-op unless
+    // OMINIX_QIE_DUMP_DIR is set (see qie_dump_tensor comment).
+    qie_dump_tensor(cond.c_crossattn,  "cond_c_crossattn");
+    qie_dump_tensor(cond.c_vector,     "cond_c_vector");
+    qie_dump_tensor(cond.c_concat,     "cond_c_concat");
+    if (uncond.c_crossattn) qie_dump_tensor(uncond.c_crossattn, "uncond_c_crossattn");
+    if (uncond.c_vector)    qie_dump_tensor(uncond.c_vector,    "uncond_c_vector");
+    if (uncond.c_concat)    qie_dump_tensor(uncond.c_concat,    "uncond_c_concat");
+    // Initial noise / latent prior to sampling.
+    qie_dump_tensor(init_latent, "init_latent");
+    // Ref-image VAE latents (edit mode — there are typically 1 ref image).
+    for (size_t _ri = 0; _ri < ref_latents.size(); ++_ri) {
+        char buf[32]; std::snprintf(buf, sizeof(buf), "ref_latent_%zu", _ri);
+        qie_dump_tensor(ref_latents[_ri], buf);
+    }
 
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
@@ -3594,6 +3779,13 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
             LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
             // [Phase2] NaN check after diffusion sampling
             check_tensor_nan(x_0, "diffusion/x_0 (sampled latent)");
+            // [QIE Phase 4.5 Step 2] Dump the sampled latent (pre-VAE-decode).
+            // Useful as a reference: at 256x256 / 2-step / Q1-known-working
+            // config, decoding this yields the Q1 baseline cat PNG.
+            {
+                char buf[32]; std::snprintf(buf, sizeof(buf), "x0_sampled_%d", b);
+                qie_dump_tensor(x_0, buf);
+            }
             final_latents.push_back(x_0);
         } else {
             LOG_ERROR("sampling for image %d/%d failed after %.2fs", b + 1, batch_count, (sampling_end - sampling_start) * 1.0f / 1000);

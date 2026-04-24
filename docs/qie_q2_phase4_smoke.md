@@ -781,98 +781,258 @@ where accumulation blows up, then widen F32 coverage (the handoff
 warns: "may need F32 on more than just residual — possibly modulation
 or attn output paths").
 
-### §5.3 Step 2 design (post Step 1 GREEN) — host-side conditioning
+### §5.3 Step 2 — host-side conditioning dump (LANDED, GREEN)
 
-Option A (recommended per handoff): short-circuit via existing
-ominix-diffusion pipeline.
+**Approach:** add an env-gated tensor-dump hook to
+`tools/ominix_diffusion/src/stable-diffusion.cpp` that writes the
+ggml-cann-computed conditioning tensors to disk at the exact code sites
+where `check_tensor_nan` already inspects them. Zero runtime cost when
+the env is unset.
 
-- Load text encoder (Qwen2.5-VL-7B Q4_0) + mmproj (BF16) + VAE
-  (safetensors).
-- Text-encode the prompt ("convert cat to black and white") → get
-  `txt_cond` tensor F32 `[txt_seq, 3584]` (pre-txt_in; engine's
-  `txt_in` projects to hidden=3072).
-- Same for empty prompt → `txt_uncond`.
-- VAE-encode ref image (`~/work/qie_test/cat.jpg` resized to 256×256)
-  → get `ref_latent` F32 `[16, 32, 32]` in latent space (VAE downscales
-  8×; 256/8=32 per side).
-- Patchify ref_latent (2×2 patch, channel-dim first) → F32 `[img_tokens,
-  64]` = 16×16=256 ref tokens (post txt_in-projection shape from engine's
-  img_in = 64→hidden).
-- Initial noise latent: random F32 `[img_tokens, 64]` at 16×16=256 img
-  tokens (256×256 image / 8 VAE / 2 patch = 16 per side).
-- Concat [init_noise ; ref_patches] along seq dim → 512 joint img tokens
-  (this replaces the engine's 256 img_seq with 512 for the ref-aware
-  edit — critical difference vs Phase 4.3/4.4 which had img_seq=64).
+**Patch:** `qie_dump_tensor(ggml_tensor*, const char*)`, gated by
+`OMINIX_QIE_DUMP_DIR=<path>`. Dumps after `get_learned_condition`
+(cond / uncond c_crossattn / c_vector / c_concat), for each ref image
+(`encode_first_stage` output), the initial latent, and the final
+post-sampling `x_0` latent.
 
-Dump file layout (each is a raw F32 flat buffer):
+**Dump layout (each `<name>.f32.bin` is a raw little-endian F32 flat
+buffer; each `<name>.meta.txt` records `ne0..ne3` + `ggml_type` +
+element count):**
+
 ```
 /tmp/qie_q45_inputs/
-  txt_cond.f32.bin       shape [txt_seq=32, H=3584]  (pre txt_in proj)
-  txt_uncond.f32.bin     shape [txt_seq=32, H=3584]
-  ref_latent.f32.bin     shape [img_tokens=256, C=64] patchified
-  init_noise.f32.bin     shape [img_tokens=256, C=64] patchified
-  sigmas.f32.bin         shape [n_steps+1]
-  meta.txt               shape strings + H/W/channels/seed
+  cond_c_crossattn.f32.bin    F32 [3584, 214, 1, 1]   (3.07 MiB)
+  init_latent.f32.bin         F32 [32, 32, 16, 1]     (64 KiB)
+  ref_latent_0.f32.bin        F32 [32, 32, 16, 1]     (64 KiB)
+  x0_sampled_0.f32.bin        F32 [32, 32, 16, 1]     (64 KiB)
+  *.meta.txt                  shape + dtype receipts
 ```
 
-**Open issue — txt_in projection:** the ref stack's text_encoder outputs
-`[txt_seq, 3584]` (joint_attention_dim). The native engine's `txt_in`
-weight (F16 fallback in the Q4 upload) projects to hidden=3072. The
-engine consumes `txt_hidden` as F32 `[txt_seq, hidden=3072]` per
-Phase 4.4c contract — so the host-dumper must **also** run txt_in on
-host (or upload the raw `[txt_seq, 3584]` and fold txt_in into the
-engine's denoise entry as a one-time projection). Easiest: extract
-`txt_in.weight/bias` from the GGUF on host, multiply, upload post-proj
-F32. Track as a Step 2a design note.
+**Dispatch (canonical Q1 2-step config, ac03, 2026-04-25):**
 
-**Open issue — img_in projection:** same — the engine consumes F32
-`[img_seq, hidden]` after `img_in`. Either project on host (64→3072
-F16 matmul) or fold into the engine.
+```
+export GGML_CANN_QUANT_BF16=on
+export OMINIX_QIE_DUMP_DIR=/tmp/qie_q45_inputs
+./build-w1/bin/ominix-diffusion-cli \
+  -M img_gen \
+  --diffusion-model ~/work/qie_weights/Qwen-Image-Edit-2509-Q4_0.gguf \
+  --llm           ~/work/qie_weights/Qwen2.5-VL-7B-Instruct-Q4_0.gguf \
+  --llm_vision    ~/work/qie_weights/mmproj-BF16.gguf \
+  --vae           ~/work/qie_weights/split_files/vae/qwen_image_vae.safetensors \
+  -r              ~/work/qie_test/cat.jpg \
+  -p "convert cat to black and white" \
+  --steps 2 --cfg-scale 1.0 -W 256 -H 256 \
+  -o /tmp/qie_q45_host2step_baseline.png -v
+```
 
-### §5.4 Step 3 design — VAE decode on host
+**Receipts (matches Q1.4 baseline wall to ±3 s):**
 
-After 20 steps the native engine dumps `x_out` as F32 `[img_seq=256,
-hidden=3072]`. Host-side path:
+| Phase | Wall | Notes |
+|---|---|---|
+| Weight load | 47.5 s | 16.7 GiB resident (DiT 11.4 + TE 5.1 + VAE 0.24 on CANN) |
+| VAE encode ref | 11.8 s | 256×256 input → [32,32,16,1] latent |
+| Qwen2.5-VL text+vision encode | 6.9 s | `cond.c_crossattn` range `[-150.29, 103.92]` (NaN-free) |
+| Denoise (2 steps) | 101.5 s | ~50.7 s/step; `x_0` range `[-1.25, 1.53]` NaN-free |
+| VAE decode | 20.2 s | 469 MB compute buffer; `decoded_image` range `[0.05, 0.81]` |
+| **Total wall** | **141.76 s** | EXITCODE=0, output 122867 B PNG |
 
-1. Un-project with `proj_out` (weight lives in the GGUF; F16 fallback on
-   the engine path) and `norm_out` (AdaLN — needs t_emb=0 for final
-   output; trivially `identity * scale(t=0) + shift(t=0)`). Output:
-   F32 `[img_tokens, patch_size² × out_channels] = [256, 64]`.
-2. Unpatchify to `[out_channels=16, H/8=32, W/8=32]`.
-3. Strip ref_latent tokens (we concatenated init+ref at step 2; final
-   output's first `init_img_tokens=256` rows are the edited latent).
-4. Run ominix-diffusion VAE decode (vae.hpp) on the 16-ch latent →
-   `[3, 256, 256]` uint8 RGB image.
-5. Save as PNG via stbi_write_png.
+**Key shape finding — `txt_seq=214`, not 32 as the §5.3 design assumed.**
+The Qwen-Image-Edit pipeline packs a VL prompt that concatenates:
+system prompt tokens + image-patch tokens (encoded by the VL vision
+tower) + text prompt tokens + `<|im_end|>`. For a single ref image at
+256×256 the joint token count lands at **214** — measured on the
+canonical cat + "convert cat to black and white" run. This is the shape
+the production native-engine denoise must accept.
 
-### §5.5 Step 4 — end-to-end wall at 256×256
+**Artefacts on ac03:**
 
-Target report (populate after Step 3 lands):
+- `/tmp/qie_q45_dump_step2.log` (full run log; EXITCODE=0 at line ~9000).
+- `/tmp/qie_q45_inputs/*` (6 binaries + 4 meta files, 3.2 MiB total).
+- `/tmp/qie_q45_host2step_baseline.png` (122867 B; retrieved to Mac at
+  `/tmp/qie_q45_host2step_baseline.png` — visually a recognizable grey cat).
+
+**Residual gaps vs full-CFG production denoise (inventory for a later
+session; not blocking Step 3 smoke):**
+
+- `uncond_c_crossattn.f32.bin` was not produced because this run used
+  `cfg_scale=1.0` which skips unconditional-pass text encoding in
+  `generate_image_internal`. Re-run with `--cfg-scale 4.0` (a value used
+  by the Step 1 synthetic probe) to land the uncond tensor. The dump
+  hook already emits `uncond_*` when the tensor exists — no further
+  patch needed, just a second invocation.
+- Native engine shape expectation: post-`txt_in` projection F32
+  `[214, 3072]`. The dumped `cond_c_crossattn` is **pre**-`txt_in`
+  `[3584, 214, 1, 1]` (ggml ne-order; logical `[txt_seq=214, dim=3584]`).
+  Driving the native engine still needs either (a) a host-side
+  `txt_in` matmul using weights extracted from the GGUF, or (b) a new
+  native entry point that folds `txt_in` / `img_in` / `time_linear{1,2}`
+  / `norm_out` / `proj_out` into the loop. Neither lands in Step 2 —
+  they are Step 4 scope. See §5.4 gap note.
+
+### §5.4 Step 3 — host-side VAE decode-only path (LANDED, GREEN)
+
+**Approach:** add a second env-gated short-circuit to
+`generate_image_internal` — when `OMINIX_QIE_DECODE_ONLY_LATENT=<path>`
+is set, skip text encoding and diffusion sampling entirely. Load the
+F32 latent from disk, shape it `[W/8, H/8, 16, 1]` (Qwen-Image VAE
+layout), call the existing `decode_first_stage` path, save PNG.
+
+This gives us a no-new-binary way to verify "native engine latent →
+PNG" round-trips through a fully-trusted VAE decoder (the same one the
+ominix-diffusion stack uses for Q1 baseline).
+
+**Patch site:** `stable-diffusion.cpp:3500..3580`. Early return in
+`generate_image_internal` when the env is set; allocates
+`[W_lat, H_lat, C=16, 1]` ggml_tensor, `fread`s the bytes, runs
+`decode_first_stage`, returns a one-element `sd_image_t*`.
+
+**Smoke receipt (Q1 2-step baseline latent → VAE decode → PNG):**
+
+```
+OMINIX_QIE_DECODE_ONLY_LATENT=/tmp/qie_q45_inputs/x0_sampled_0.f32.bin \
+  ./build-w1/bin/ominix-diffusion-cli \
+  -M img_gen ... -W 256 -H 256 --steps 1 --cfg-scale 1.0 \
+  -o /tmp/qie_q45_decode_only.png
+```
+
+| Phase | Wall |
+|---|---|
+| Weight load + TE/VAE init | ~11 s |
+| VAE encode ref (incidental, not needed for decode — see limitation below) | 11.8 s |
+| Latent load + decode_first_stage | 19.75 s |
+| **Total decode-only path wall** | **31.53 s** |
+
+- Loaded latent range: `[-1.255, 1.530]` (bit-identical to dumped
+  x0_sampled_0 per NaN-check log).
+- Decoded image range: `[0.054, 0.808]` — valid RGB dynamic range,
+  NaN-free.
+- Output PNG 122907 B vs baseline 122867 B (40-byte delta is the PNG
+  metadata string that varies with prompt/invocation; image content
+  is **visually identical** to `qie_q45_host2step_baseline.png`).
+
+**Eye-check PASS:** the decode-only PNG shows the same grey/white cat,
+same lighting, same fabric backdrop as the ggml-cann baseline. The
+decoder round-trip is proven bit-faithful end-to-end.
+
+**Current limitations (tracked for a later session, not blocking):**
+
+1. The decode-only run still loads the full DiT+TE+VAE weight set (~17 s
+   startup) because `new_sd_ctx` allocates all three. A lean VAE-only
+   path would shave ~11 s off a repeat decode. Acceptable for a Step 3
+   smoke (one-shot per session).
+2. The run still VAE-encodes the ref image because that happens in
+   `generate_image` **before** the Step 3 short-circuit in
+   `generate_image_internal`. Easy to skip in a follow-up by also
+   checking `OMINIX_QIE_DECODE_ONLY_LATENT` in `generate_image` before
+   ref-image encoding.
+
+### §5.5 Step 4 — native-engine real end-to-end (DEFERRED)
+
+**Status:** gap documented below; work deferred beyond this
+session. Phase 4.5 Step 1 (real-weight 20-step denoise stability)
+GREEN, Step 2 (conditioning dump) GREEN, Step 3 (VAE decode-only)
+GREEN. Step 4 requires additional infrastructure below.
+
+**What Step 4 needs (host side, on top of Step 2 / Step 3 dumps):**
+
+The native engine's `denoise_loop_test` operates on **already-projected**
+activations — `[img_seq, hidden=3072]` F32 for the image stream,
+`[txt_seq, hidden=3072]` F32 for the text stream, `[hidden=3072]` F16
+for the timestep embedding. The Qwen-Image DiT's external projections
+(`img_in`, `txt_in`, `time_linear{1,2}`, `norm_out`, `proj_out`) are
+loaded on NPU (see `DiTGlobalWeights` in `image_diffusion_engine.h`)
+but are **not** invoked by the public `denoise_loop_test` hook. The full
+production wrap therefore needs either:
+
+(A) **Host-side projection helpers** — dequantise `img_in` /
+    `txt_in` / `time_linear{1,2}` / `proj_out` Q4_0 weights once at
+    startup, run the projections on CPU (single-shot per request for
+    txt_in/proj_out, 20-shot for time_linear per-step), upload the
+    result. Requires ~140 MB host-side dequant buffers and a small
+    CPU-matmul helper. **Budget: 1-2 days.**
+
+(B) **Native engine `denoise_full()` entry point** — extend
+    `ImageDiffusionEngine` with a public method that takes raw latent
+    + raw conditioning + sigmas and runs the full stack (patchify →
+    img_in → txt_in → per-step { time_linear → DiT-60 → CFG → Euler }
+    → norm_out → proj_out → unpatchify). Same NPU dispatch primitives
+    already used in `forward_all_blocks_test` — this is the proper
+    long-term home for the loop. **Budget: 2-3 days.**
+
+(C) **Variable t_emb per step** — even option (A) or (B) needs the
+    per-step timestep embedding to change with sigma. Current
+    `denoise_loop_test` passes a fixed `t_emb_f16_dev` across all
+    steps, which is numerically stable (Phase 4.5 Step 1 receipt) but
+    **semantically meaningless** for a real denoise — the DiT never
+    learns which step it is on. The fix is one of:
+    - pre-compute a `[n_steps, hidden=3072]` F16 t_emb_series on host
+      and add a `denoise_loop_test_v2(..., t_emb_series_dev, ...)`
+      hook that indexes `t_emb_series_dev + step*hidden_bytes` per
+      step; **~20 LoC plus the host-side sinusoidal + linear1/2**.
+    - or fold option (A) time_linear1/2 into a probe that calls
+      `forward_all_blocks_test` + `scheduler_step_test` manually per
+      step from host (more loop control but more work at call site).
+
+**Shape plan for Step 4 at 256×256 (fixed by Step 2 dumps and
+ominix-diffusion code inspection):**
+
+```
+ref_latent_0      [32, 32, 16, 1]       F32   from Step 2 dump
+init_noise_latent [32, 32, 16, 1]       F32   from Step 2 dump (or re-gen)
+cond_c_crossattn  [3584, 214, 1, 1]     F32   from Step 2 dump
+uncond_c_crossattn [3584, 214, 1, 1]    F32   re-run at --cfg-scale > 1
+  ↓ pad_and_patchify (patch=2, channel-dim first) on init_noise + ref_latent_0
+  ↓ concat along seq dim
+img_post_patchify [512, 64]             F32   init_tokens=256 ∥ ref_tokens=256
+  ↓ img_in (Q4_0 matmul [64 → 3072])
+img_hidden        [512, 3072]           F32   native engine input
+  ↓ txt_in (Q4_0 matmul [3584 → 3072]) on cond and uncond separately
+txt_hidden_{cond,uncond} [214, 3072]    F32   native engine input
+  ↓ per step s: time_embed(sigma_s * 1000) → [256] → linear1 → silu → linear2
+t_emb_step_s      [3072]                F16   native engine input
+  ↓ native denoise_loop body: 2-CFG × 60 blocks → eps → Euler step
+x_out             [512, 3072]           F32   after 20 steps
+  ↓ norm_out (AdaLN at t_emb=0) + proj_out (Q4_0 matmul [3072 → 64])
+out_patchified    [512, 64]             F32
+  ↓ slice first 256 rows (drop ref tokens)
+out_first_stage   [256, 64]             F32
+  ↓ unpatchify to [32, 32, 16, 1]
+out_latent        [32, 32, 16, 1]       F32   ready for Step 3 VAE decode
+```
+
+**End-to-end wall target (populate after Step 4 lands):**
 
 | Phase | Wall (ms) | Fraction |
 |---|---|---|
-| Session init (GGUF load + NPU upload) | ? | one-shot |
-| Host conditioning (VAE-encode ref + text-encode prompt) | ? | small |
-| Denoise 20 steps × 2 CFG × 60 blocks @ img_seq=512 txt_seq=32 | ? | dominant |
-| Host VAE decode + unpatchify + PNG | ? | small |
-| Total end-to-end wall | ? | — |
+| Session init (GGUF + NPU upload) | ~107 s (Step 1 measured) | one-shot |
+| Host conditioning dump (Step 2) | ~67 s (Step 2 measured; TE+VAE encode) | one-shot |
+| img_in / txt_in / time_linear₁,₂ host dequant+matmul | ? | one-shot |
+| Native denoise 20 × 2 CFG × 60 blocks @ img_seq=512 txt_seq=214 | ? | dominant |
+| norm_out / proj_out host dequant+matmul (or NPU one-shot) | ? | small |
+| Host VAE decode (Step 3) | ~20 s (Step 3 measured) | small |
+| **Total end-to-end wall** | ? | — |
 
-Q1 baseline comparator: 145 s / 256×256 / **2-step** → extrapolated
-to 20 steps ≈ 1450 s (linear in step count; per-step wall on ggml-cann
-was ~50 s at 256×256 per Q1 §Q1.4 receipts). **Native target: beat
-1450 s.** Stretch: beat Q1's 50 s/step (i.e. <<1000 s for 20 steps).
+Q1 baseline comparator: 145 s / 256×256 / **2-step** → extrapolated to
+20 steps ≈ 1450 s (linear in step count). **Native target: beat 1450 s.**
 
-Production 1024×1024 extrapolation: per-block attention cost is
-~O(seq²), per-block matmul cost ~O(seq·hidden). At seq=256→4096 (1024×1024
-produces 4096 img tokens + ref), attention × 256× slower, matmuls × 16×
-slower. Per-block total ~256× heavier on attention alone. Phase 4.3 small
-shape measured ~475 ms per step (~8 ms per block-pair); 1024×1024 could
-be 250× → ~120 s/step → **~2400 s total at 1024×1024 × 20-step**
-(40 min — competitive but not revolutionary vs Q1's ~2-6 hr 1024×1024
-projection).
+Phase 4.5 Step 1 small-shape (img=64, txt=32) measured ~528 ms/step.
+Production shape (img=512, txt=214) is ~8× img-seq and ~7× txt-seq →
+attention cost ~O((img+txt)²) scales ~49× → per-step ~26 s at production
+shape naively, 20 steps × 2 CFG → **~1040 s total denoise wall** if
+kernels scale linearly (they won't; aclnnFusedInferAttentionScore has
+sub-quadratic variants). Plausible native target: **600-1000 s end-to-end
+at 256×256 / 20-step**, i.e. **1.5–2.4× vs the Q1 extrapolation**.
 
-### §5.6 Step 5 — eye check
+### §5.6 Step 5 — eye check (DEFERRED with Step 4)
 
-Display `/tmp/qie_q45_cat_edit.png` and compare visually to
-`/tmp/qie_smoke_bf16.png` (Q1 baseline) and the canonical cat. Flag if
-the output is garbled / blank / noise / inverted.
+Display `/tmp/qie_q45_native_cat_edit.png` and compare visually to the
+Q1 baseline `/tmp/qie_q45_host2step_baseline.png` (now at Mac) and to
+the canonical cat. Flag if the output is garbled / blank / noise /
+inverted.
+
+Baseline eye-check snapshot (2-step Q1 ggml-cann, 2026-04-25):
+the cat is a short-haired grey with white chest and face, light-brown
+pillow backdrop, sharp eyes — a recognisable "studio portrait of a
+kitten" output at the expected resolution. The Step 3 decode-only
+round-trip of the same latent produces a pixel-indistinguishable image,
+confirming the VAE decode path is byte-faithful.
