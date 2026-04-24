@@ -2301,11 +2301,23 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             use_cann_graph = false;
             break;
         }
-        // GET_ROWS for Q4_0/Q4_1 and MUL_MAT for Q4_1 / Q5_{0,1} / K-quants both take
-        // the CPU-dequant fallback inside aclnn_ops.cpp for lack of native INT4/K-quant
-        // cast support in CANN. Same sync-D2H / sync-H2D pattern → capture-incompatible.
-        if (node->op == GGML_OP_GET_ROWS && node->src[0] &&
-            (node->src[0]->type == GGML_TYPE_Q4_0 || node->src[0]->type == GGML_TYPE_Q4_1)) {
+        // GET_ROWS is capture-incompatible across the board:
+        //   - Q4_0/Q4_1 src0 takes the CPU-dequant fallback (D2H + CPU dequant + H2D into
+        //     a pool buffer) — blocking aclrtMemcpy is rejected inside a captured stream
+        //     (EE9999 107027, EH9999 107030) just like the sync-fix in commit 46b48723.
+        //   - F16/F32/BF16 src0 takes the aclnn_index_select_4d path on the captured
+        //     stream. The indices src1 is a GGML leaf populated via a sync
+        //     ggml_backend_tensor_set H2D before ggml_backend_graph_compute runs; the
+        //     graph allocator reuses the indices slot for later intermediates after the
+        //     GetRows op, so by the time aclmdlRIExecuteAsync replays, gather_v3 reads
+        //     float-bit-pattern garbage (seen as indices in the 1e9 magnitude range,
+        //     "Index ... out of range[0 196)" on the Qwen2.5-VL vision window_index
+        //     lookup). Same failure family as the Q4_0/Q4_1 pool-aliasing fix
+        //     (commit 61c52a34) — device-stream-ordered pool/leaf lifetimes do not
+        //     survive aclGraph capture. Route all GET_ROWS through eager mode until
+        //     we can either (a) pin GET_ROWS leaves in a non-recyclable slot or
+        //     (b) switch captured graphs to a stream-ordered allocator.
+        if (node->op == GGML_OP_GET_ROWS) {
             use_cann_graph = false;
             break;
         }

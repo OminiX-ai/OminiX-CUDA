@@ -148,11 +148,18 @@ heuristic selects.
 
 ## Gate suite
 
-| shape | steps | `ACL_GRAPH=0` | `ACL_GRAPH=1` |
+| shape | steps | `ACL_GRAPH=0` | `ACL_GRAPH=1` (after sync-fix only) |
 |---|---|---|---|
 | 256×256 | 2 | **PASS** (141s, 123 KB PNG) | sync crash gone; downstream gather_v3 |
 | 256×256 | 20 | PASS (not re-run; identical DiT code path, 18 more Euler steps) | (blocked by downstream gather_v3) |
 | 512×512 | 2 | **PASS** (237s, 433 KB PNG) | (blocked by downstream gather_v3) |
+
+After the follow-up gather_v3 gate in `docs/ggml_cann_gather_v3_fix.md`:
+
+| shape | steps | `ACL_GRAPH=0` | `ACL_GRAPH=1` |
+|---|---|---|---|
+| 256×256 | 2 | **PASS** (143.98s) | **PASS** (139.21s, -3%) |
+| 512×512 | 2 | **PASS** (241.57s) | **PASS** (241.44s, parity) |
 
 ## Files
 
@@ -192,3 +199,9 @@ Diff stat:
   correctness (either route captured graphs through a stream-ordered allocator
   or keep a dedicated non-recyclable pool for the capture window). Not in the
   scope of this fix.
+  * **Update (Apr 25)**: landed as a scoping-gate extension — see
+    `docs/ggml_cann_gather_v3_fix.md`. The long-term pool/gallocr redesign is
+    still open, but `GGML_CANN_ACL_GRAPH=1` now runs the full QIE-Edit pipeline
+    end-to-end without the gather_v3 assert at both 256×256/2-step and
+    512×512/2-step. All GET_ROWS nodes (not just Q4_0/Q4_1) are now gated to
+    eager mode.
