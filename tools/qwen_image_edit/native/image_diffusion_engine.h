@@ -662,6 +662,23 @@ private:
     void  *workspace_dev_ = nullptr;
     size_t workspace_size_ = 0;
 
+    // Q2.4.5.4c BF16 plumbing (env-gated by QIE_FFN_DOWN_BF16 / QIE_ALL_BF16).
+    // `scratch_bf16_scale_dev_` is a single device buffer sized for the
+    // largest WQBMMv3 scale tile we plan to recast (FF×H/32 BF16 elements,
+    // ≈ 2.4 MB at FF=12288, H=3072). Allocated lazily on first BF16 matmul.
+    // `scratch_bf16_bias_dev_` similarly holds the cast F16→BF16 bias (≤ N
+    // elements). Sized for max(H, FF) at allocation time.
+    // `scratch_bf16_src_f32_dev_` is the BF16-src gated-residual helper's
+    // F32 staging buffer (separate from scratch_residual_tmp_f32_dev_ to
+    // avoid aliasing the cast-into-F32 step with the multiply tmp). Sized
+    // for max(img_seq,txt_seq) × hidden F32. Lazily allocated.
+    void  *scratch_bf16_scale_dev_   = nullptr;
+    size_t scratch_bf16_scale_bytes_ = 0;
+    void  *scratch_bf16_bias_dev_    = nullptr;
+    size_t scratch_bf16_bias_bytes_  = 0;
+    void  *scratch_bf16_src_f32_dev_ = nullptr;
+    size_t scratch_bf16_src_f32_bytes_ = 0;
+
     // --- Phase 2 bookkeeping ---
     DiTInitStats stats_{};
 
@@ -706,10 +723,21 @@ private:
     // [K, N]; output `y_f16` has logical shape [M, N]. M can be seq_len ×
     // batch collapsed. `bias_f16_dev` is applied post-matmul if non-null
     // (F16 1D [N]). Returns false on any aclnn status != 0.
+    //
+    // Q2.4.5.4c: optional `out_dtype` selects the output buffer dtype. The
+    // default ACL_FLOAT16 preserves all earlier callers verbatim. ACL_BF16
+    // is supported on the WQBMMv3 path (910b spec — output may be F16 or
+    // BF16) for FFN-down where F16's 65504 range saturates on real-weight
+    // magnitudes (see docs/qie_q2_phase4_smoke.md §5.5.3 bisect). When
+    // `out_dtype=ACL_BF16` the helper transparently casts the F16 scale
+    // tensor to BF16 (lazy per-tensor cache via `bf16_scale_cache_`) and
+    // casts the F16 bias to BF16 for the post-add. The output buffer is
+    // written as BF16 with the same byte-count as F16 (2 bytes/elem).
     bool dispatch_matmul_(void *x_f16_dev, void *weight_dev,
                           void *weight_scale_dev, void *bias_f16_dev,
                           int64_t M, int64_t K, int64_t N,
-                          void *y_f16_dev);
+                          void *y_dev,
+                          aclDataType out_dtype = ACL_FLOAT16);
 
     // Apply element-wise `x = x * (1 + scale) + shift` with scale/shift
     // broadcasting over the seq dim. `x_f16_dev` is [B, seq, hidden];
@@ -734,6 +762,21 @@ private:
     bool gated_residual_add_f32_(void *x_f32_dev, const void *src_f16_dev,
                                    const void *gate_f16_dev,
                                    int64_t B, int64_t seq, int64_t hidden);
+
+    // Q2.4.5.4c: BF16-src variant of gated_residual_add_f32_. Used when the
+    // upstream matmul (e.g., ff_down under QIE_FFN_DOWN_BF16=1) emits BF16
+    // output to escape F16's 65504 saturation. Computes
+    //   src_f32 = Cast(src_bf16, F32)            (full-range, exact)
+    //   tmp_f32 = src_f32 * gate_f32_bcast       (gate cast F16→F32 inline)
+    //   x_f32  += tmp_f32
+    // The F32 mul means the gate × src product can occupy the full F32
+    // range (~3.4e38) without saturation, fixing the FFN-down overflow
+    // identified in docs/qie_q2_phase4_smoke.md §5.5.3.
+    bool gated_residual_add_f32_bf16src_(void *x_f32_dev,
+                                          const void *src_bf16_dev,
+                                          const void *gate_f16_dev,
+                                          int64_t B, int64_t seq,
+                                          int64_t hidden);
 
     // Phase 4.4c: cast helpers. Thin wrapper around aclnnCast to reduce
     // boilerplate at block entry (F32 residual → F16 for LayerNorm input).

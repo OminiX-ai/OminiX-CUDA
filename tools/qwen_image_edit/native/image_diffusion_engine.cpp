@@ -700,6 +700,10 @@ ImageDiffusionEngine::~ImageDiffusionEngine() {
     free_dev(img_hidden_cond_dev_);   free_dev(img_hidden_uncond_dev_);
     free_dev(txt_hidden_cond_dev_);   free_dev(txt_hidden_uncond_dev_);
     free_dev(workspace_dev_);
+    // Q2.4.5.4c BF16 plumbing scratch (lazy; may be null if env not set).
+    free_dev(scratch_bf16_scale_dev_);    scratch_bf16_scale_bytes_ = 0;
+    free_dev(scratch_bf16_bias_dev_);     scratch_bf16_bias_bytes_  = 0;
+    free_dev(scratch_bf16_src_f32_dev_);  scratch_bf16_src_f32_bytes_ = 0;
 
     if (primary_stream_) {
         g_cann.aclrtDestroyStream(primary_stream_);
@@ -1305,6 +1309,30 @@ void ImageDiffusionEngine::ensure_workspace_(size_t bytes) {
     workspace_size_ = bytes;
 }
 
+namespace {
+// Q2.4.5.4c: lazy device-buffer grow helper. Allocates / reallocates
+// `*ptr` so it holds at least `bytes` bytes. `cur_bytes` is updated to
+// the new size on success. Used by dispatch_matmul_'s BF16 path for
+// per-tensor scale/bias cast scratch and by gated_residual_add_f32_bf16src_
+// for its F32 staging buffer.
+inline bool ensure_dev_grow_(void **ptr, size_t *cur_bytes, size_t bytes) {
+    if (bytes <= *cur_bytes) return true;
+    if (*ptr) {
+        g_cann.aclrtFree(*ptr);
+        *ptr = nullptr;
+        *cur_bytes = 0;
+    }
+    aclError ae = g_cann.aclrtMalloc(ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ae != 0 || !*ptr) {
+        QIE_LOG("ensure_dev_grow_: aclrtMalloc(%zu) failed status=%d",
+                bytes, (int)ae);
+        return false;
+    }
+    *cur_bytes = bytes;
+    return true;
+}
+}  // namespace
+
 void ImageDiffusionEngine::build_rope_tables_() {
     // The meat of the table build lives in the namespace-scope
     // compute_qwen_rope_pe_host() used by init_from_gguf directly. Phase
@@ -1389,6 +1417,18 @@ inline aclTensor *tensor_nd_f32(void *dev, int ndim,
                                    &storage, 1, dev);
 }
 
+// Q2.4.5.4c: BF16 tensor builder. Same byte-size as F16 (2 bytes/elem) so
+// existing F16-sized scratch buffers fit BF16 tensors of the same shape.
+inline aclTensor *tensor_nd_bf16(void *dev, int ndim,
+                                  const int64_t *shape,
+                                  const int64_t *strides) {
+    int64_t storage = 1;
+    for (int i = 0; i < ndim; ++i) storage *= shape[i];
+    return g_cann.aclCreateTensor(shape, (uint64_t)ndim, ACL_BF16,
+                                   strides, 0, ACL_FORMAT_ND,
+                                   &storage, 1, dev);
+}
+
 // Row-major contiguous stride helper.
 inline void make_contig_strides(int ndim, const int64_t *shape,
                                  int64_t *out_strides) {
@@ -1421,12 +1461,31 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
                                               void *weight_scale_dev,
                                               void *bias_f16_dev,
                                               int64_t M, int64_t K, int64_t N,
-                                              void *y_f16_dev) {
-    if (!x_f16_dev || !weight_dev || !y_f16_dev) {
+                                              void *y_dev,
+                                              aclDataType out_dtype) {
+    if (!x_f16_dev || !weight_dev || !y_dev) {
         QIE_LOG("dispatch_matmul_: null buffer (x=%p w=%p y=%p)",
-                x_f16_dev, weight_dev, y_f16_dev);
+                x_f16_dev, weight_dev, y_dev);
         return false;
     }
+    // Q2.4.5.4c: BF16 output dispatch.
+    //   WQBMMv3 (Q4 + F16 scale) — cast scale F16→BF16 inline; BF16 output.
+    //   aclnnMm (F16 fallback)  — pre-cast input F16→BF16 and weight
+    //                              F16→BF16 to scratch buffers, then run
+    //                              aclnnMm with BF16/BF16/BF16 + cubeMathType
+    //                              ALLOW_FP32_DOWN_PRECISION (1) for F32
+    //                              accumulator. Weight cast is the expensive
+    //                              part (75 MB per FF→H matmul); amortised
+    //                              by caching a per-pointer BF16 mirror in
+    //                              scratch_bf16_weight_cache_ (a single-slot
+    //                              LRU keyed on weight_dev pointer; ff_down
+    //                              has 120 unique weights × 75 MB = 9 GB —
+    //                              too large to cache all, so under-budget
+    //                              we re-cast on every call. Optimisation
+    //                              for a follow-up: pre-convert all ff_down
+    //                              weights at init_from_gguf time when env
+    //                              is set, like ggml-cann's GGML_CANN_QUANT_BF16.
+    const bool use_bf16 = (out_dtype == ACL_BF16);
 
     // Q2.4.4b precision knobs. Cached once: these control the matmul
     // accumulator/numerical path. Defaults preserve the Phase 4.2 synthetic
@@ -1461,10 +1520,87 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
     int64_t x_strides[2] = {K, 1};
     aclTensor *t_x = tensor_nd_f16(x_f16_dev, 2, x_shape, x_strides);
 
-    // Build output tensor view [M, N] contig.
+    // Build output tensor view [M, N] contig. Q2.4.5.4c: BF16 when
+    // env-gated. Same byte-size as F16 (2 bytes/elem) so the caller's
+    // buffer sizing is unchanged.
     int64_t y_shape[2]   = {M, N};
     int64_t y_strides[2] = {N, 1};
-    aclTensor *t_y = tensor_nd_f16(y_f16_dev, 2, y_shape, y_strides);
+    aclTensor *t_y = use_bf16 ? tensor_nd_bf16(y_dev, 2, y_shape, y_strides)
+                              : tensor_nd_f16 (y_dev, 2, y_shape, y_strides);
+
+    // Q2.4.5.4c BF16 plumbing on aclnnMm fallback path: pre-cast input and
+    // weight F16→BF16 to local scratch buffers. Skipped for the WQBMMv3
+    // path (which is INT4 weight + F16-scale) and for non-BF16 callers.
+    void *bf16_x_dev = nullptr;   // pre-cast input scratch (M*K BF16)
+    void *bf16_w_dev = nullptr;   // pre-cast weight scratch (K*N BF16)
+    if (use_bf16 && weight_scale_dev == nullptr) {
+        const size_t x_bytes = (size_t)M * (size_t)K * 2;
+        const size_t w_bytes = (size_t)K * (size_t)N * 2;
+        // Reuse the BF16 scale slot for input (smaller buffer); allocate
+        // a separate weight cache. We grow scratch_bf16_scale_dev_ for x
+        // and scratch_bf16_bias_dev_ for the larger w (since on aclnnMm
+        // path neither original consumer is active for this call). On
+        // call exit they remain allocated for next-call reuse.
+        if (!ensure_dev_grow_(&scratch_bf16_scale_dev_,
+                               &scratch_bf16_scale_bytes_, x_bytes)) {
+            g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+            return false;
+        }
+        if (!ensure_dev_grow_(&scratch_bf16_src_f32_dev_,
+                               &scratch_bf16_src_f32_bytes_, w_bytes)) {
+            g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+            return false;
+        }
+        bf16_x_dev = scratch_bf16_scale_dev_;
+        bf16_w_dev = scratch_bf16_src_f32_dev_;
+
+        // Cast input F16 → BF16. Flat 1-D view (cast is shape-agnostic).
+        {
+            int64_t f_shape[1]   = {(int64_t)(M * K)};
+            int64_t f_strides[1] = {1};
+            aclTensor *t_xf16 = tensor_nd_f16 (x_f16_dev, 1, f_shape, f_strides);
+            aclTensor *t_xbf16 = tensor_nd_bf16(bf16_x_dev, 1, f_shape, f_strides);
+            uint64_t cw = 0; aclOpExecutor *cex = nullptr;
+            aclnnStatus cs_x = g_cann.aclnnCastGetWorkspaceSize(
+                t_xf16, ACL_BF16, t_xbf16, &cw, &cex);
+            if (cs_x == 0) {
+                ensure_workspace_(cw);
+                cs_x = g_cann.aclnnCast(cw > 0 ? workspace_dev_ : nullptr,
+                                          cw, cex, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_xf16);
+            g_cann.aclDestroyTensor(t_xbf16);
+            if (cs_x != 0) {
+                QIE_LOG("dispatch_matmul_: input F16->BF16 cast status=%d",
+                        (int)cs_x);
+                g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+        }
+        // Cast weight F16 → BF16. Flat 1-D view.
+        {
+            int64_t f_shape[1]   = {(int64_t)(K * N)};
+            int64_t f_strides[1] = {1};
+            aclTensor *t_wf16 = tensor_nd_f16 (weight_dev, 1, f_shape, f_strides);
+            aclTensor *t_wbf16 = tensor_nd_bf16(bf16_w_dev, 1, f_shape, f_strides);
+            uint64_t cw = 0; aclOpExecutor *cex = nullptr;
+            aclnnStatus cs_w = g_cann.aclnnCastGetWorkspaceSize(
+                t_wf16, ACL_BF16, t_wbf16, &cw, &cex);
+            if (cs_w == 0) {
+                ensure_workspace_(cw);
+                cs_w = g_cann.aclnnCast(cw > 0 ? workspace_dev_ : nullptr,
+                                          cw, cex, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_wf16);
+            g_cann.aclDestroyTensor(t_wbf16);
+            if (cs_w != 0) {
+                QIE_LOG("dispatch_matmul_: weight F16->BF16 cast status=%d",
+                        (int)cs_w);
+                g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+        }
+    }
 
     aclnnStatus s = 0;
     if (weight_scale_dev != nullptr) {
@@ -1480,7 +1616,56 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
 
         int64_t s_shape[2]   = {K / 32, N};
         int64_t s_strides[2] = {N, 1};
-        aclTensor *t_scale = tensor_nd_f16(weight_scale_dev, 2, s_shape, s_strides);
+        // Q2.4.5.4c: when output is BF16, WQBMMv3 requires the scale tensor
+        // in matching dtype (precedent: ggml-cann backend's GGML_CANN_QUANT_BF16
+        // path; see ggml/src/ggml-cann/aclnn_ops.cpp:2670-2686). Cast F16 →
+        // BF16 lazily into scratch_bf16_scale_dev_ on each call (the cast is
+        // a single Vec op on K/32 × N elements, cheap relative to the matmul).
+        aclTensor *t_scale = nullptr;
+        if (use_bf16) {
+            const size_t scale_elems = (size_t)(K / 32) * (size_t)N;
+            const size_t scale_bytes = scale_elems * 2;  // BF16 = 2 bytes
+            if (!ensure_dev_grow_(&scratch_bf16_scale_dev_,
+                                   &scratch_bf16_scale_bytes_,
+                                   scale_bytes)) {
+                g_cann.aclDestroyTensor(t_x);
+                g_cann.aclDestroyTensor(t_y);
+                g_cann.aclDestroyTensor(t_w);
+                return false;
+            }
+            int64_t flat_shape[1]   = {(int64_t)scale_elems};
+            int64_t flat_strides[1] = {1};
+            aclTensor *t_scale_f16 =
+                tensor_nd_f16(weight_scale_dev, 1, flat_shape, flat_strides);
+            aclTensor *t_scale_bf16 =
+                tensor_nd_bf16(scratch_bf16_scale_dev_, 1, flat_shape,
+                                flat_strides);
+            uint64_t cs_ws = 0;
+            aclOpExecutor *cs_exec = nullptr;
+            aclnnStatus cs_s = g_cann.aclnnCastGetWorkspaceSize(
+                t_scale_f16, ACL_BF16, t_scale_bf16, &cs_ws, &cs_exec);
+            if (cs_s == 0) {
+                ensure_workspace_(cs_ws);
+                cs_s = g_cann.aclnnCast(cs_ws > 0 ? workspace_dev_ : nullptr,
+                                          cs_ws, cs_exec, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_scale_f16);
+            if (cs_s != 0) {
+                QIE_LOG("dispatch_matmul_: scale F16->BF16 cast status=%d",
+                        (int)cs_s);
+                g_cann.aclDestroyTensor(t_scale_bf16);
+                g_cann.aclDestroyTensor(t_x);
+                g_cann.aclDestroyTensor(t_y);
+                g_cann.aclDestroyTensor(t_w);
+                return false;
+            }
+            // Re-view the BF16 scale buffer in [K/32, N] layout for WQBMMv3.
+            g_cann.aclDestroyTensor(t_scale_bf16);
+            t_scale = tensor_nd_bf16(scratch_bf16_scale_dev_, 2, s_shape,
+                                       s_strides);
+        } else {
+            t_scale = tensor_nd_f16(weight_scale_dev, 2, s_shape, s_strides);
+        }
 
         uint64_t ws_needed = 0;
         aclOpExecutor *exec = nullptr;
@@ -1523,17 +1708,42 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
         // --- F16 fallback path: plain aclnnMm ------------------------------
         // Weight stored as GGUF [N, K] row-major (K contig). Transposed view
         // into [K, N] with strides (1, K).
+        // Q2.4.5.4c: under BF16 output we already pre-cast input + weight
+        // F16 → BF16 above (bf16_x_dev / bf16_w_dev). Use BF16 views for
+        // the matmul inputs in that case; the output tensor is already
+        // BF16 by t_y dtype branch.
         int64_t w_shape[2]   = {K, N};
         int64_t w_strides[2] = {1, K};
         int64_t w_storage    = K * N;
-        aclTensor *t_w = g_cann.aclCreateTensor(
-            w_shape, 2, ACL_FLOAT16, w_strides, 0, ACL_FORMAT_ND,
-            &w_storage, 1, weight_dev);
+        aclTensor *t_w = nullptr;
+        aclTensor *t_x_eff = t_x;  // alias unless we need to re-view as BF16
+        aclTensor *t_x_local_bf16 = nullptr;
+        if (use_bf16) {
+            // Build BF16 views over the pre-cast scratch buffers.
+            int64_t x_shape_local[2]   = {M, K};
+            int64_t x_strides_local[2] = {K, 1};
+            t_x_local_bf16 = tensor_nd_bf16(bf16_x_dev, 2, x_shape_local,
+                                              x_strides_local);
+            t_x_eff = t_x_local_bf16;
+            t_w = g_cann.aclCreateTensor(
+                w_shape, 2, ACL_BF16, w_strides, 0, ACL_FORMAT_ND,
+                &w_storage, 1, bf16_w_dev);
+        } else {
+            t_w = g_cann.aclCreateTensor(
+                w_shape, 2, ACL_FLOAT16, w_strides, 0, ACL_FORMAT_ND,
+                &w_storage, 1, weight_dev);
+        }
+
+        // Q2.4.5.4c: under BF16 force cubeMathType=1
+        // (ALLOW_FP32_DOWN_PRECISION → F32 accumulator) so the inner sum
+        // can hold magnitudes > BF16 range; it down-casts to BF16 on store.
+        const int8_t cube_math_eff =
+            use_bf16 ? (int8_t)1 : (int8_t)s_cube_math;
 
         uint64_t ws_needed = 0;
         aclOpExecutor *exec = nullptr;
-        s = g_cann.aclnnMmGetWorkspaceSize(t_x, t_w, t_y,
-                                             (int8_t)s_cube_math,
+        s = g_cann.aclnnMmGetWorkspaceSize(t_x_eff, t_w, t_y,
+                                             cube_math_eff,
                                              &ws_needed, &exec);
         if (s != 0) {
             QIE_LOG("dispatch_matmul_: Mm workspace status=%d", (int)s);
@@ -1546,6 +1756,7 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
             }
         }
         g_cann.aclDestroyTensor(t_w);
+        if (t_x_local_bf16) g_cann.aclDestroyTensor(t_x_local_bf16);
         if (s != 0) {
             g_cann.aclDestroyTensor(t_x);
             g_cann.aclDestroyTensor(t_y);
@@ -1557,10 +1768,58 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
     if (bias_f16_dev) {
         int64_t b_shape[2]   = {1, N};
         int64_t b_strides[2] = {N, 1};
-        aclTensor *t_b = tensor_nd_f16(bias_f16_dev, 2, b_shape, b_strides);
+        // Q2.4.5.4c: when output is BF16 the bias must also be BF16
+        // (aclnnInplaceAdd dtype-strict). Cast F16 → BF16 lazily into
+        // scratch_bf16_bias_dev_ on each call.
+        aclTensor *t_b = nullptr;
+        if (use_bf16) {
+            const size_t bias_bytes = (size_t)N * 2;  // BF16 1D [N]
+            if (!ensure_dev_grow_(&scratch_bf16_bias_dev_,
+                                   &scratch_bf16_bias_bytes_,
+                                   bias_bytes)) {
+                g_cann.aclDestroyTensor(t_x);
+                g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+            int64_t f_shape[1]   = {N};
+            int64_t f_strides[1] = {1};
+            aclTensor *t_b_f16 =
+                tensor_nd_f16(bias_f16_dev, 1, f_shape, f_strides);
+            aclTensor *t_b_bf16_flat =
+                tensor_nd_bf16(scratch_bf16_bias_dev_, 1, f_shape, f_strides);
+            uint64_t cb_ws = 0;
+            aclOpExecutor *cb_exec = nullptr;
+            aclnnStatus cb_s = g_cann.aclnnCastGetWorkspaceSize(
+                t_b_f16, ACL_BF16, t_b_bf16_flat, &cb_ws, &cb_exec);
+            if (cb_s == 0) {
+                ensure_workspace_(cb_ws);
+                cb_s = g_cann.aclnnCast(cb_ws > 0 ? workspace_dev_ : nullptr,
+                                          cb_ws, cb_exec, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_b_f16);
+            g_cann.aclDestroyTensor(t_b_bf16_flat);
+            if (cb_s != 0) {
+                QIE_LOG("dispatch_matmul_: bias F16->BF16 cast status=%d",
+                        (int)cb_s);
+                g_cann.aclDestroyTensor(t_x);
+                g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+            t_b = tensor_nd_bf16(scratch_bf16_bias_dev_, 2, b_shape, b_strides);
+        } else {
+            t_b = tensor_nd_f16(bias_f16_dev, 2, b_shape, b_strides);
+        }
 
+        // alpha scalar dtype: F16 path keeps the historical F16 alpha (the
+        // safe pre-Q2.4.5.4c default). BF16 path uses F32 alpha which CANN
+        // ops broadly accept regardless of tensor dtype (avoids needing a
+        // BF16-typed scalar variant whose support across aclnn versions is
+        // less proven than F16/F32).
         aclScalar *alpha = nullptr;
-        {
+        if (use_bf16) {
+            float one_f32 = 1.0f;
+            alpha = g_cann.aclCreateScalar(&one_f32, ACL_FLOAT);
+        } else {
             uint16_t one = fp32_to_fp16(1.0f);
             alpha = g_cann.aclCreateScalar(&one, ACL_FLOAT16);
         }
@@ -1878,6 +2137,153 @@ bool ImageDiffusionEngine::gated_residual_add_f32_(void *x_f32_dev,
     g_cann.aclDestroyTensor(t_src_f16);
     g_cann.aclDestroyTensor(t_g_f16);
     g_cann.aclDestroyTensor(t_tmp_f16);
+    g_cann.aclDestroyTensor(t_tmp_f32);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.4.5.4c: BF16-source variant of gated_residual_add_f32_. Used when the
+// upstream matmul (FFN-down under QIE_FFN_DOWN_BF16=1) emits BF16 to escape
+// F16's 65504 saturation. Computes (all on device):
+//   src_f32  = Cast(src_bf16, F32)        — exact (BF16 range == F32 range)
+//   gate_f32 = Cast(gate_f16, F32)        — exact
+//   tmp_f32  = src_f32 * gate_f32_bcast   — F32 mul, no overflow path
+//   x_f32   += tmp_f32                    — F32 inplace add
+// Buffers:
+//   - scratch_bf16_src_f32_dev_  (F32 [B, seq, hidden]) for src_f32
+//   - scratch_residual_tmp_f32_dev_ (F32 [B, seq, hidden]) for tmp_f32 +
+//     for the gate F32 broadcast intermediate (the gate cast lives in the
+//     head of scratch_mlp_dev_ since aclnnMul wants its second operand
+//     persistently mapped during the launch — we use a small lazy F32
+//     gate-cast buffer carved from scratch_residual_tmp_f32_dev_'s tail
+//     IF the F32 tmp doesn't span the full [seq,H] region; for safety we
+//     just use scratch_bf16_src_f32_dev_ as src, scratch_residual_tmp_f32_
+//     as tmp, and a tiny separate tail buffer for the gate F32. To avoid
+//     introducing a fourth buffer, we sequence: cast src→f32 first, then
+//     cast gate→f32 over scratch_mlp_dev_ (which is scratch space — never
+//     read after gate use), then mul into scratch_residual_tmp_f32_dev_,
+//     then InplaceAdd into x_f32_dev). The aclnnMul second-operand stride
+//     pattern is broadcast-friendly so [B,1,hidden] gate × [B,seq,hidden]
+//     src works without materializing the full broadcast.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::gated_residual_add_f32_bf16src_(
+        void *x_f32_dev,
+        const void *src_bf16_dev,
+        const void *gate_f16_dev,
+        int64_t B, int64_t seq, int64_t hidden) {
+    if (!x_f32_dev || !src_bf16_dev || !gate_f16_dev) {
+        QIE_LOG("gate_add_f32_bf16src_: null buffer (x=%p src=%p gate=%p)",
+                x_f32_dev, (void *)src_bf16_dev, (void *)gate_f16_dev);
+        return false;
+    }
+    if (!g_cann.aclnnMul || !g_cann.aclnnCast || !g_cann.aclnnInplaceAdd) {
+        QIE_LOG("gate_add_f32_bf16src_: missing aclnn symbols");
+        return false;
+    }
+    if (!scratch_residual_tmp_f32_dev_) {
+        QIE_LOG("gate_add_f32_bf16src_: scratch_residual_tmp_f32_dev_ null");
+        return false;
+    }
+
+    // Lazy-allocate F32 src buffer sized [B, seq, hidden].
+    const size_t src_f32_bytes = (size_t)B * seq * hidden * sizeof(float);
+    if (!ensure_dev_grow_(&scratch_bf16_src_f32_dev_,
+                           &scratch_bf16_src_f32_bytes_,
+                           src_f32_bytes)) {
+        return false;
+    }
+
+    int64_t x_shape[3]   = {B, seq, hidden};
+    int64_t x_strides[3];
+    make_contig_strides(3, x_shape, x_strides);
+    int64_t g_shape[3]   = {B, 1, hidden};
+    int64_t g_strides[3] = {hidden, hidden, 1};
+
+    aclTensor *t_x_f32   = tensor_nd_f32(x_f32_dev, 3, x_shape, x_strides);
+    aclTensor *t_src_bf16 = tensor_nd_bf16(const_cast<void *>(src_bf16_dev),
+                                             3, x_shape, x_strides);
+    aclTensor *t_src_f32 = tensor_nd_f32(scratch_bf16_src_f32_dev_,
+                                            3, x_shape, x_strides);
+    aclTensor *t_g_f16   = tensor_nd_f16(const_cast<void *>(gate_f16_dev),
+                                            3, g_shape, g_strides);
+    // gate F32 broadcast tensor: tiny ([B, 1, hidden]) — reuse the head of
+    // scratch_residual_tmp_f32_dev_. After the F32 mul writes to a different
+    // region of the same buffer (we use scratch_mlp_dev_ for that), the gate
+    // is already consumed.
+    // Carve [B,1,hidden] F32 from scratch_residual_tmp_f32_dev_ tail. The
+    // tmp F32 ([B, seq, hidden]) sits at the head — safe because tail offset
+    // is past the head's reserved range. But the buffer is sized exactly
+    // for [max_seq, hidden] F32 — no slack. So we use scratch_mlp_dev_
+    // (sized [SEQ, FF_DIM] F16 = SEQ*FF_DIM*2 bytes ≈ 4×SEQ×H bytes; F32
+    // gate fits trivially).
+    aclTensor *t_g_f32   = tensor_nd_f32(scratch_mlp_dev_,
+                                            3, g_shape, g_strides);
+    aclTensor *t_tmp_f32 = tensor_nd_f32(scratch_residual_tmp_f32_dev_,
+                                            3, x_shape, x_strides);
+
+    aclnnStatus s = 0;
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+
+    // 1. src_f32 = Cast(src_bf16, F32). Exact, no overflow.
+    s = g_cann.aclnnCastGetWorkspaceSize(t_src_bf16, ACL_FLOAT, t_src_f32,
+                                           &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                               compute_stream_);
+    }
+    if (s != 0) QIE_LOG("gate_add_f32_bf16src_: Cast(BF16->F32) status=%d",
+                          (int)s);
+
+    // 2. gate_f32 = Cast(gate_f16, F32).
+    if (s == 0) {
+        s = g_cann.aclnnCastGetWorkspaceSize(t_g_f16, ACL_FLOAT, t_g_f32,
+                                               &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                   compute_stream_);
+        }
+        if (s != 0)
+            QIE_LOG("gate_add_f32_bf16src_: Cast(gate F16->F32) status=%d",
+                    (int)s);
+    }
+
+    // 3. tmp_f32 = src_f32 * gate_f32_bcast.
+    if (s == 0) {
+        s = g_cann.aclnnMulGetWorkspaceSize(t_src_f32, t_g_f32, t_tmp_f32,
+                                               &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnMul(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                  compute_stream_);
+        }
+        if (s != 0) QIE_LOG("gate_add_f32_bf16src_: Mul(F32) status=%d",
+                              (int)s);
+    }
+
+    // 4. x_f32 += tmp_f32.
+    if (s == 0) {
+        float one = 1.0f;
+        aclScalar *alpha = g_cann.aclCreateScalar(&one, ACL_FLOAT);
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x_f32, t_tmp_f32, alpha,
+                                                      &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnInplaceAdd(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+        }
+        if (alpha) g_cann.aclDestroyScalar(alpha);
+        if (s != 0)
+            QIE_LOG("gate_add_f32_bf16src_: InplaceAdd(F32) status=%d", (int)s);
+    }
+
+    g_cann.aclDestroyTensor(t_x_f32);
+    g_cann.aclDestroyTensor(t_src_bf16);
+    g_cann.aclDestroyTensor(t_src_f32);
+    g_cann.aclDestroyTensor(t_g_f16);
+    g_cann.aclDestroyTensor(t_g_f32);
     g_cann.aclDestroyTensor(t_tmp_f32);
     return s == 0;
 }
@@ -2604,11 +3010,36 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     const bool do_intra = s_intra && (s_intra_calls == 0);
     s_intra_calls++;
 
-    auto intra_probe = [&](const char *label, void *dev,
-                             int64_t n_elts, bool is_f16) -> void {
+    // Q2.4.5.4c BF16 plumbing for FFN-down. Cached once (one std::getenv per
+    // process). Defaults OFF so the synthetic-weight Step 1 denoise_loop_test
+    // path (cos_sim=1.0 against CPU reference) is byte-identical to before.
+    // QIE_FFN_DOWN_BF16=1 → emit BF16 from the ff_down WQBMMv3 dispatch and
+    // route the gated-residual #2 add through gated_residual_add_f32_bf16src_
+    // (cast BF16 src → F32 before the gate-mul, escaping F16 65504 saturation).
+    // QIE_ALL_BF16=1 (Step 7 widening) currently aliases to QIE_FFN_DOWN_BF16
+    // pending the broader audit (additional matmul outputs + their consumers
+    // need to be promoted in lockstep).
+    static int s_ffn_down_bf16 = -1;
+    if (s_ffn_down_bf16 < 0) {
+        const char *v_specific = std::getenv("QIE_FFN_DOWN_BF16");
+        const char *v_all      = std::getenv("QIE_ALL_BF16");
+        int specific = v_specific ? std::atoi(v_specific) : 0;
+        int all      = v_all      ? std::atoi(v_all)      : 0;
+        s_ffn_down_bf16 = specific || all;
+        QIE_LOG("forward_block_: QIE_FFN_DOWN_BF16=%d (BF16 ff_down output + "
+                "BF16-src gated-residual #2)", s_ffn_down_bf16);
+    }
+    const bool ffn_down_bf16 = s_ffn_down_bf16 != 0;
+
+    // Q2.4.5.4c: probe is dtype-aware via a 3-state enum-like overload set.
+    // The legacy bool overload (`is_f16`) is preserved verbatim; a new int
+    // overload accepts {0=F32, 1=F16, 2=BF16}.
+    enum ProbeDtype { PROBE_F32 = 0, PROBE_F16 = 1, PROBE_BF16 = 2 };
+    auto intra_probe_dt = [&](const char *label, void *dev,
+                                int64_t n_elts, ProbeDtype dt) -> void {
         if (!do_intra) return;
         g_cann.aclrtSynchronizeStream(compute_stream_);
-        const size_t bpe = is_f16 ? 2 : 4;
+        const size_t bpe = (dt == PROBE_F32) ? 4 : 2;
         std::vector<uint8_t> host((size_t)n_elts * bpe);
         aclError me = g_cann.aclrtMemcpy(host.data(), host.size(), dev,
                                            host.size(),
@@ -2618,10 +3049,18 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         int64_t nanc = 0, infc = 0;
         for (int64_t i = 0; i < n_elts; ++i) {
             float v;
-            if (is_f16) {
+            if (dt == PROBE_F16) {
                 __fp16 hh;
                 std::memcpy(&hh, host.data() + (size_t)i * 2, 2);
                 v = (float)hh;
+            } else if (dt == PROBE_BF16) {
+                // BF16 = upper 16 bits of an F32 (little-endian: low bytes
+                // are zero'd lsbs). Reconstruct by left-shifting into the
+                // upper half of an F32 bit pattern.
+                uint16_t bh;
+                std::memcpy(&bh, host.data() + (size_t)i * 2, 2);
+                uint32_t bits = ((uint32_t)bh) << 16;
+                std::memcpy(&v, &bits, 4);
             } else {
                 std::memcpy(&v, host.data() + (size_t)i * 4, 4);
             }
@@ -2633,10 +3072,18 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         }
         int64_t valid = n_elts - nanc - infc;
         double mean_abs = valid > 0 ? sum_abs / (double)valid : 0.0;
+        const char *dt_str = (dt == PROBE_F32)  ? "F32" :
+                              (dt == PROBE_F16) ? "F16" : "BF16";
         QIE_LOG("intra_b0[%s]: n=%lld %s mean_abs=%.4g max_abs=%.4g "
                 "NaN=%lld Inf=%lld",
-                label, (long long)n_elts, is_f16 ? "F16" : "F32",
+                label, (long long)n_elts, dt_str,
                 mean_abs, max_abs, (long long)nanc, (long long)infc);
+    };
+    // Backward-compat wrapper for the existing bool-flavoured callers.
+    auto intra_probe = [&](const char *label, void *dev,
+                             int64_t n_elts, bool is_f16) -> void {
+        intra_probe_dt(label, dev, n_elts,
+                        is_f16 ? PROBE_F16 : PROBE_F32);
     };
 
     intra_probe("00_img_hidden_in", img_hidden, img_seq * H, false);
@@ -2968,10 +3415,15 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, true);
     if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
     intra_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, true);
+    // Q2.4.5.4c: ff_down output dtype gated by QIE_FFN_DOWN_BF16. F16 by
+    // default (Step 1 synthetic regression invariant); BF16 escapes the
+    // ~65504 saturation observed in §5.5.3 bisect on real Q4 weights.
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.img_ff_down_w_q4,
                           lw.img_ff_down_scale, lw.img_ff_down_b,
-                          img_seq, FF, H, scratch_img_out_dev_)) return false;
-    intra_probe("20_img_ff_down", scratch_img_out_dev_, img_seq * H, true);
+                          img_seq, FF, H, scratch_img_out_dev_,
+                          ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
+    intra_probe_dt("20_img_ff_down", scratch_img_out_dev_, img_seq * H,
+                    ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // txt FFN.
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.txt_ff_up_w_q4,
@@ -2982,16 +3434,29 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, true);
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.txt_ff_down_w_q4,
                           lw.txt_ff_down_scale, lw.txt_ff_down_b,
-                          txt_seq, FF, H, scratch_txt_out_dev_)) return false;
-    intra_probe("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H, true);
+                          txt_seq, FF, H, scratch_txt_out_dev_,
+                          ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
+    intra_probe_dt("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H,
+                    ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // ------------------------------------------------------------------
     // 11. Gated residual add #2. Phase 4.4c: F32 accumulator (see step 8).
+    // Q2.4.5.4c: when ff_down emitted BF16, route through the BF16-src
+    // variant so the gate-mul happens in F32 (no F16 65504 saturation).
     // ------------------------------------------------------------------
-    if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
-                                   img_gate2, B, img_seq, H)) return false;
-    if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
-                                   txt_gate2, B, txt_seq, H)) return false;
+    if (ffn_down_bf16) {
+        if (!gated_residual_add_f32_bf16src_(img_hidden, scratch_img_out_dev_,
+                                              img_gate2, B, img_seq, H))
+            return false;
+        if (!gated_residual_add_f32_bf16src_(txt_hidden, scratch_txt_out_dev_,
+                                              txt_gate2, B, txt_seq, H))
+            return false;
+    } else {
+        if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
+                                       img_gate2, B, img_seq, H)) return false;
+        if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
+                                       txt_gate2, B, txt_seq, H)) return false;
+    }
     intra_probe("24_img_resid2", img_hidden, img_seq * H, false);
     intra_probe("24_txt_resid2", txt_hidden, txt_seq * H, false);
 

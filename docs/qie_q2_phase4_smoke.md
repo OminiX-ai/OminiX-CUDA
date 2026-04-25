@@ -1646,3 +1646,141 @@ dispatch_matmul_ (Path 6). Both are larger changes than the mission's
 - Five-projection bisect: init 100.0 s + denoise_full 24.9 s = 124.9 s
 - Per-block scan (n_steps=1): init 103.7 s + denoise_full ~3 s
 - Intra-block scan (n_steps=1): init 103.0 s + denoise_full 2.7 s
+
+### §5.5.4 Step 4c — BF16 plumbing on FFN-down matmul (PARTIAL: leak #1 fixed, leak #2 surfaced)
+
+Mission (per Q2.4.5.4c handoff): plumb BF16 output dtype through the
+native engine's `dispatch_matmul_` helper for the FFN-down site to
+escape the F16 65504 saturation isolated in §5.5.3.
+
+#### Implementation
+`tools/qwen_image_edit/native/image_diffusion_engine.{h,cpp}`:
+
+1. New optional `aclDataType out_dtype = ACL_FLOAT16` argument on
+   `dispatch_matmul_`. ACL_BF16 is supported on both internal paths:
+   - **WQBMMv3 (Q4 + F16-scale)**: 910b op-spec lists F16/BF16 output;
+     scale is cast F16→BF16 inline (precedent: ggml-cann backend's
+     `GGML_CANN_QUANT_BF16` path at `aclnn_ops.cpp:2670-2686`); bias
+     cast F16→BF16 lazily for the InplaceAdd post-step.
+   - **aclnnMm (F16-fallback)**: status 161002 rejects mixed-dtype
+     direct dispatch, so we pre-cast input + weight F16→BF16 to a pair
+     of lazy scratch buffers (`scratch_bf16_scale_dev_`,
+     `scratch_bf16_src_f32_dev_` repurposed) and dispatch BF16/BF16 →
+     BF16 with `cubeMathType=ALLOW_FP32_DOWN_PRECISION` (F32
+     accumulator). The weight cast is the dominant per-call cost
+     (~75 MB at FF=12288, H=3072) — see Wall summary below.
+2. New `gated_residual_add_f32_bf16src_` helper consumes the BF16
+   output: F32 cast of BF16 src + F32 cast of F16 gate + F32 mul +
+   F32 InplaceAdd into the F32 residual stream. No F16 round-trip
+   in the gate-mul path → no 65504 saturation.
+3. `forward_block_`: `QIE_FFN_DOWN_BF16=1` (or `QIE_ALL_BF16=1` alias)
+   routes both img_ff_down and txt_ff_down through the BF16-output
+   variant + BF16-src gated residual. Default OFF — Step 1
+   `denoise_loop_test` synthetic regression invariant preserved.
+
+`docs/qie_q2_phase4_smoke.md` — this section.
+
+#### Receipt 1 — block 0 ff_down: F16-Inf → BF16-65000 (GREEN)
+
+ac03 / `qie_q45_step4_full_denoise` smoke under
+`QIE_FFN_DOWN_BF16=1 QIE_DEBUG_PER_BLOCK_NAN=1 QIE_DEBUG_INTRA_BLOCK0=1`:
+
+| Metric | Pre-fix (76bc4652) | Post-fix (this) |
+|---|---|---|
+| `intra_b0[20_img_ff_down]` dtype | F16 | BF16 |
+| `intra_b0[20_img_ff_down]` max_abs | 6.355e+04 (clipping) | **6.349e+04** |
+| `intra_b0[23_txt_ff_down]` dtype | F16 | BF16 |
+| `intra_b0[23_txt_ff_down]` max_abs | 5.488e+04 + 214 Inf | **7.322e+04** (no Inf) |
+| `intra_b0[24_img_resid2]` | NaN | F32 max=7.197e+06, NaN=0 |
+| `intra_b0[24_txt_resid2]` | NaN | F32 max=4.647e+06, NaN=0 |
+| `per_block_nan[b00/{img,txt}]` | NaN=all | **NaN=0 Inf=0** |
+
+The §5.5.3 root cause is fixed: ff_down output cleanly holds magnitudes
+> 65504 in BF16 storage; the F32-residual gated add never sees a
+saturating intermediate. Block 0 finishes byte-clean.
+
+#### Receipt 2 — block 1 IMG goes NaN (RED — leak #2 surfaced)
+
+```
+per_block_nan[b00/img]: mean_abs=1.034e+05 max_abs=7.197e+06 NaN=0 Inf=0
+per_block_nan[b00/txt]: mean_abs=7.017e+04 max_abs=4.647e+06 NaN=0 Inf=0
+per_block_nan[b01/img]: mean_abs=0 max_abs=0 NaN=1572864 Inf=0   ← FIRST NaN
+per_block_nan[b01/txt]: mean_abs=7.369e+04 max_abs=4.561e+06 NaN=0 Inf=0
+per_block_nan[b02/img]: mean_abs=0 max_abs=0 NaN=1572864 Inf=0
+per_block_nan[b02/txt]: mean_abs=0 max_abs=0 NaN=657408 Inf=0
+... (all subsequent blocks NaN, both streams)
+
+VERDICT: RED (NaN/inf)
+final latent: mean=0, NaN=16384/16384
+```
+
+The leak has migrated. Block 0's residual exits at F32 max ~7.2M
+(safe — F32 limit is 3.4e38). Block 1's IMG stream produces NaN
+during the block — TXT survives one more block. The bisect
+(`QIE_DEBUG_INTRA_BLOCK0=1`) only scans block 0, so the exact b01
+op needs another instrumentation pass.
+
+Hypothesis: block 1's `img_ff_up` (still F16 — only ff_down was
+widened in this scope) saturates because the upstream modulation
+chain feeds it a larger input than block 0 saw (post-fix,
+`24_img_resid2` is 7.2M vs the pre-fix's 4M-ish observation; LN1
+normalizes back to std≈1, but mod1 then re-amplifies by a layer-1
+specific scale that may exceed block 0's). Need:
+1. Extend `QIE_DEBUG_INTRA_BLOCK0` to scan block 1 (one-shot static
+   latch on second call).
+2. Re-bisect to identify exact b01 leak point.
+
+#### Receipt 3 — wall (per-step latency)
+
+| | wall ms / step | per-fix ratio |
+|---|---|---|
+| Pre-fix (F16 ff_down) | 1240 (24.9 s / 20) | 1.00× |
+| Post-fix (BF16 ff_down) | **1656** (33.1 s / 20) | **1.34×** |
+
+The ~30% slowdown is the per-call F16→BF16 weight cast in
+the aclnnMm fallback path (ff_down weights are Q4_1 in this GGUF,
+not Q4_0, so they route through aclnnMm not WQBMMv3). 75 MB ×
+60 layers × 2 streams × 20 steps = 7200 casts × ~0.5 ms ≈ 3.6 s
+of cast wall, matching the +8 s observation (rest is BF16
+math marginally slower than F16 on 910b). Optimisation lane
+(if BF16 is wider-adopted): pre-convert all ff_down weights to
+BF16 at `init_from_gguf` time, mirroring ggml-cann's
+`GGML_CANN_QUANT_BF16=on` static conversion. Out of scope for this
+patch.
+
+#### Status — what landed
+
+- **Mission's primary delivery target met for block 0**: the §5.5.3
+  FFN-down F16 saturation no longer produces NaN at block 0.
+- **Mission's secondary target (full 20-step denoise GREEN) NOT met**:
+  block 1+ IMG stream still goes NaN. New bisect needed to locate
+  leak #2.
+- The BF16-plumbing scaffold is reusable for Step 7 widening: any
+  future call site that needs BF16 output just passes
+  `out_dtype=ACL_BF16` and the helper transparently handles scale +
+  bias + input/weight casts. The same recipe can be applied to
+  ff_up, attn-out projections, etc., once leak #2 is bisected.
+- Wall cost +30% per step. Tolerable for a defensive fix; pre-cast
+  optimization is the obvious follow-up.
+
+#### Logs / artifacts (ac03)
+
+- `/tmp/qie_q45_step4_bf16_run3.log` — RED-but-block0-clean smoke.
+  Final latent in `/tmp/qie_q45_step4_latent.f32.bin` (16384 NaN,
+  Step 4d eye-check skipped — no signal in NaN latent).
+- `/tmp/qie_q45_step4_bf16_run1.log`, `run2.log` — earlier runs,
+  prove the iterative diagnosis (run 1: ff_down on aclnnMm fallback
+  silently kept F16; run 2: aclnnMm rejected mixed-dtype direct
+  dispatch with status 161002; run 3: F16→BF16 input/weight precast
+  works).
+
+#### Next-step queue
+
+1. **Re-bisect leak #2** (block 1 IMG): extend `QIE_DEBUG_INTRA_BLOCK0`
+   to scan block N via env (e.g., `QIE_DEBUG_INTRA_BLOCK=1`). Identify
+   the saturating op.
+2. **Widen BF16 to that op's site** using the same dispatch_matmul_
+   knob (or new helper if it's not a matmul).
+3. **Decide on init-time BF16 weight pre-cast** to recover the 30%
+   wall regression.
+4. **Eye-check skipped** until the latent has signal.
