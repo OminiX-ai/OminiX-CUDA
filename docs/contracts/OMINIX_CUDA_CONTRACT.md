@@ -1,0 +1,203 @@
+# OminiX-CUDA Contract — Pure C++ + ggml-cuda Inference Stack
+
+**Status**: ACTIVE (drafted 2026-04-26, PM signed).
+**Repo target**: new repo `ominix-cuda` (forked from OminiX-Ascend, CANN code stripped, CUDA backend wired).
+**Mandate**: build a Python-free, vLLM-free, PyTorch-free C++ inference stack on NVIDIA Blackwell (GB10) leveraging llama.cpp + ggml-cuda backend + cuBLAS/cuDNN/CUTLASS direct dispatch.
+
+## 1. Why this exists
+
+The codex CUDA Phase 0-2 work delivered honest evidence:
+- **Qwen3-TTS via vLLM: 11.5 fps** end-to-end on GB10 — **3× SLOWER than Ascend ship (32.2 fps)**. Bottleneck: code-predictor feedback loop incompatible with vLLM batched generation.
+- **Qwen-Image-Edit via diffusers**: 141s baseline + torch.compile (-20%) + CacheDIT (-21%) = ~89s stacked on GB10 1024×1024/20-step.
+
+The Python/PyTorch path doesn't fit Qwen-family TTS architecture. Native direct-dispatch (the same pattern that took Ascend 1→32 fps) is the right play on CUDA too — and CUDA's mature toolchain (cuBLAS, cuDNN, CUTLASS, Flash Attention v3, CUDA Graphs) makes it structurally simpler than the Ascend native engine arc.
+
+## 2. Hardware
+
+| Host | Port | Hostname | GPU | Status |
+|---|---|---|---|---|
+| GB10 #1 | 6222 | zgx-3675 | NVIDIA GB10 (Blackwell, sm_121) | ssh key installed; codex Phase 0 done |
+| GB10 #2 | 6022 | zgx-5b44 | NVIDIA GB10 (Blackwell, sm_121) | ssh key installed; codex Phase 0+1+2 done |
+
+Both: 119 GB unified CPU+GPU memory (Grace ARM aarch64 + Blackwell), CUDA 13.0, Ubuntu 24.04.
+
+## 3. Goals
+
+| Workload | Target | Reference |
+|---|---|---|
+| Qwen3-TTS end-to-end audio | **80-150 fps on GB10** | Ascend ship 32.2 fps |
+| Qwen-Image-Edit 1024×1024/20-step | **30-50s end-to-end** | codex stacked 89s; MLX 80s |
+| Qwen3-ASR | **beat A1a RTF 0.142** | shipping reference |
+
+## 4. Scope
+
+**In scope**:
+- Pure C++ stack (NO Python anywhere in inference, NO vLLM, NO PyTorch, NO transformers)
+- Vendored llama.cpp/ggml + ggml-cuda backend
+- Native engines for TTS / QIE / ASR mirroring Ascend pattern
+- stable-diffusion.cpp port for QIE/SD/Flux baseline
+- CUDA Graphs at step level
+- FP8/BF16 matmul via cuBLAS direct (cuBLAS supports both natively on Blackwell)
+- Codec C++ via cuDNN
+
+**Out of scope**:
+- Python wrappers (anything `import` Python)
+- vLLM, sglang, TensorRT-LLM (PyTorch-based)
+- HuggingFace transformers
+- Step distillation training (separate workstream)
+- Multi-GPU tensor parallel (single-GPU ship target)
+
+## 5. Reusability map (from OminiX-Ascend)
+
+### Drop-in (build-flag flip)
+- `tools/ominix_diffusion/` — stable-diffusion.cpp port. Set `-DGGML_CUDA=ON` instead of `-DGGML_CANN=ON`.
+- GGUF parser, tokenizers, conditioner, scheduler, VAE — backend-agnostic at sd.cpp layer.
+
+### Architecture-port (1:1 design, swap dispatch layer)
+- `TalkerCannEngine` → `TalkerCudaEngine` (aclnn → cuBLAS/cuDNN)
+- `ImageDiffusionEngine` (post-attention-fix from #84) → `ImageDiffusionCudaEngine`
+- `AsrTextDecoderCannEngine` → `AsrTextDecoderCudaEngine`
+- W8 quant pattern → cuBLAS INT8/FP8 native
+- ACLGraph capture → CUDA Graphs (ggml-cuda has built-in support)
+- WSPOOL retain-list → CUDA stream-aware allocator
+
+### Code commits to port directly to ominix-cuda
+- `036047de` — CFG batching in stable-diffusion.cpp (sd.cpp level, backend-agnostic)
+- `fd7ab97a` — RoPE pre-compute in qwen_image.hpp (sd.cpp level)
+- `f0b51dc1` Q2.4.4d — F32 residual + LayerNorm + gated-add pattern (architecture portable)
+- `cf16f83e` — BF16 matmul out (NOT needed on CUDA — cuBLAS handles natively, but pattern reusable)
+- Native attention fix from #84 (in flight) — port once it lands
+
+### NOT to port
+- ggml-cann backend
+- aclnn dispatchers
+- Path C #1-#5 backend patches (CANN-specific bugs)
+- FRACTAL_NZ weight format
+- WQBMMv3 BF16-output workarounds
+
+### Lessons-portable (knowledge)
+- Substep cossim bisect methodology (commits 9a264391 / 96b67fb4)
+- Probe-first discipline
+- Defensive env-gate pattern
+- 3-10× projection discount rule
+
+## 6. Phase plan with gates
+
+### Phase 0 — Repo bootstrap (1 day, Mac + GB10 #2)
+
+- Fork OminiX-Ascend → new repo `ominix-cuda` (local + GitHub at `ymote/ominix-cuda`)
+- Strip CANN-specific code:
+  - Delete `ggml/src/ggml-cann/`
+  - Delete `tools/qwen_*/native/*cann*` files (will be re-ported in Phase 2/3/4)
+  - Delete `docs/qie_q2_phase4_smoke.md` Path-C-* sections (preserve in OminiX-Ascend)
+  - Keep all sd.cpp, stable-diffusion logic, tokenizer, GGUF parser
+- Add `ggml/src/ggml-cuda/` from llama.cpp upstream (vendored; commit reference)
+- Top-level CMake: `option(GGML_CUDA ON)`
+- Set up `.github/workflows/` for CI
+- README with phase status
+
+**Gate 0**: Repo builds on GB10 #2 via `cmake -B build -DGGML_CUDA=ON && cmake --build build`. `nvidia-smi` shows healthy. No CANN dependencies remain.
+
+### Phase 1 — ominix_diffusion CUDA baseline (2-3 days, GB10 #2)
+
+- Build `ominix-diffusion-cli` with CUDA backend
+- Run canonical cat-edit smoke at 1024×1024/20-step
+- **Apply commit `036047de` (CFG batching) → measure**
+- **Apply commit `fd7ab97a` (RoPE pre-compute) → measure**
+- Capture per-step wall + total wall + peak GPU memory + eye-check
+- Compare to codex's diffusers baseline (141s)
+
+**Gate 1**: 1024×1024/20-step produces recognizable B&W cat at <140s with CFG batching applied. Measurement committed to docs.
+
+### Phase 2 — Native TalkerCudaEngine (10-14 days, GB10 #1)
+
+This is the headline lever. Direct port of `TalkerCannEngine` architecture.
+
+- Phase 2.1: scaffold + GGUF parse (1-2 days)
+- Phase 2.2: per-token forward with cuBLAS dispatch (3-5 days)
+- Phase 2.3: KV cache + autoregressive loop (2-3 days)
+- Phase 2.4: codec C++ via cuDNN (2-3 days)
+- Phase 2.5: CUDA Graphs at per-pos capture (2-3 days)
+- Phase 2.6: FP8/INT8 quant via cuBLAS (1-2 days)
+
+Reference: `tools/qwen_tts/talker_cann_engine.cpp` (Ascend native engine that delivered 32 fps).
+
+**Gate 2**: Qwen3-TTS canonical synthesis at **≥ 80 fps end-to-end on GB10 #1**. Audio quality byte-identical or ear-PASS vs Ascend ship state. **No Python in process tree.**
+
+### Phase 3 — Native ImageDiffusionCudaEngine (14-21 days, GB10 #2)
+
+Gated on Ascend native attention fix (#84) landing. Once attention algorithm is correct on Ascend, port the corrected forward to CUDA.
+
+- Phase 3.1: scaffold + GGUF parse (1-2 days)
+- Phase 3.2: F32 residual stream pattern (2-3 days)
+- Phase 3.3: forward block with cuBLAS dispatch + corrected attention (3-5 days)
+- Phase 3.4: 60-block loop (2-3 days)
+- Phase 3.5: Euler-flow scheduler + 20-step denoise (2-3 days)
+- Phase 3.6: VAE decode C++ (already in stable-diffusion.cpp; reuse)
+- Phase 3.7: CUDA Graphs at step capture (2-3 days)
+
+**Gate 3**: 1024×1024/20-step canonical cat-edit at **≤ 50s end-to-end**, eye-check PASS. Beats codex's stacked 89s.
+
+### Phase 4 — Native ASR (5-7 days, GB10 #1 or #2 idle)
+
+Port `AsrTextDecoderCannEngine` to CUDA. Compose with TalkerCudaEngine pattern (Qwen3 decoder is shared architecture).
+
+**Gate 4**: Qwen3-ASR canonical Tier-1 13-clip CER=0, RTF ≤ 0.10 (beat Ascend A1a 0.142).
+
+### Phase 5 — Docs + ship (parallel to Phase 4)
+
+Author `docs/cuda_optimization_learnings.md` mirroring Ascend's `qwen_tts_optimization_learnings.md`. Push repo public.
+
+## 7. Workstream dependencies
+
+```
+Phase 0 (bootstrap)
+   ├── Phase 1 (sd.cpp baseline + CFG + RoPE)
+   │      └── Phase 5 (docs)
+   ├── Phase 2 (native TTS) — independent
+   └── Phase 3 (native QIE) — gated on Ascend #84 attention fix
+          └── Phase 4 (native ASR) — composes with Phase 2
+```
+
+## 8. Operating rules
+
+- **No Python in production stack.** Build tools (cmake, ninja) and one-shot scripts (e.g., gguf inspection) may use Python during dev only. Final ship is C++/CUDA only.
+- **No vLLM, no PyTorch, no transformers, no diffusers.** If a tool requires them at dev time (e.g., generate a reference latent for parity check), document the dev-only dependency clearly.
+- **GGUF is the only model format.** No safetensors loaded by Python.
+- **Codec must be C++.** ONNX Runtime via C++ API is acceptable; Python wrappers are not.
+- **No remote code push without explicit PM approval.** All commits to local fork; push to `ymote/ominix-cuda` when explicitly green-lit.
+- **No Claude/codex coauthor on commits.**
+- **SIGHUP-proof launches** for any long remote build: `nohup setsid bash -c '...' < /dev/null > log 2>&1 &`.
+- **Defensive env-gate discipline**: every new code path gated by env flag; default-off byte-identical to pre-patch.
+- **Probe-first**: every cuBLAS/cuDNN/CUTLASS substitution gets a 30-min standalone correctness probe before integration.
+
+## 9. Honest expectation framing
+
+Per OminiX-Ascend's lesson on optimistic projections:
+- Ascend native engine F32-projection extrapolation was 50× too pessimistic at toy shape.
+- Ascend native attention had a 2-week-undiscovered algorithm bug (mode collapse) hidden under "numerical green."
+- "2-3× stack" rule still holds; raw individual lever projections from one platform don't transfer linearly to another.
+
+**Realistic CUDA targets** (post-discount):
+- Qwen3-TTS: **80-150 fps** plausible (vs Ascend 32 fps; Blackwell tensor core 3-5× beats Ascend INT8)
+- QIE-Edit: **30-50s/image** plausible (vs codex stacked 89s; native bypass of PyTorch overhead)
+- ASR: **RTF ≤ 0.08** plausible (Blackwell + cuBLAS direct vs Ascend ggml-cann)
+
+If reality is 2× worse than these targets, that's still SOTA on CUDA for these workloads.
+
+## 10. Repo location
+
+- **Local mirror**: `/Users/yuechen/home/ominix-cuda/`
+- **GitHub fork**: `ymote/ominix-cuda` (private until ship)
+- **Build hosts**: GB10 #1 at `~/ominix-cuda/`, GB10 #2 at `~/ominix-cuda/`
+
+## 11. Acceptance
+
+- [ ] Phase 0 Gate: builds clean on GB10
+- [ ] Phase 1 Gate: 1024×1024/20-step cat at <140s with CFG batching, eye-PASS
+- [ ] Phase 2 Gate: TTS ≥80 fps end-to-end, no Python in process tree
+- [ ] Phase 3 Gate: QIE-Edit ≤50s/1024×1024/20-step, eye-PASS
+- [ ] Phase 4 Gate: ASR RTF ≤ 0.10, CER=0 Tier-1
+- [ ] Phase 5: docs published, repo at `ymote/ominix-cuda` ready for review
+
+Total: ~3-4 weeks agent-wall to all gates.
