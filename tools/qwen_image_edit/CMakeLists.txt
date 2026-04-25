@@ -13,12 +13,9 @@
 
 find_package(Threads REQUIRED)
 
-if(NOT (DEFINED ENV{ASCEND_TOOLKIT_HOME}
-        AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include/acl/acl.h"))
-    message(STATUS "qwen_image_edit: native engine disabled "
-                   "(ASCEND_TOOLKIT_HOME missing — non-Ascend host)")
-    return()
-endif()
+message(STATUS "qwen_image_edit: native engine disabled "
+               "(ominix-cuda Phase 3 CUDA port pending)")
+return()
 
 set(NATIVE_TARGET qwen_image_edit_native)
 set(NATIVE_SRC

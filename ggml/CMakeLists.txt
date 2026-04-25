@@ -193,6 +193,7 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+option(GGML_CANN                            "ggml: use CANN"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
@@ -203,6 +204,7 @@ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"  
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+option(GGML_CUDA_NCCL                       "ggml: use NCCL for multi-GPU collectives"        OFF)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
@@ -316,7 +318,6 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-blas.h
-    include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
     include/ggml-opt.h

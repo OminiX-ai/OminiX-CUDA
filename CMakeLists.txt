@@ -37,10 +37,24 @@ endif()
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 # ─── OminiX 扩展模块开关 ─────────────────────────────────────
 option(BUILD_SD  "Build Stable-Diffusion module (tools/ominix_diffusion)" ON)
+option(GGML_CUDA "Build with CUDA backend" ON)
+option(GGML_CANN "Build with CANN backend" OFF)
 # option(BUILD_ASR "Build ASR module (future, src-asr)"     OFF)
 # option(BUILD_TTS "Build TTS module (future, src-tts)"     OFF)
 # 新增模块在此处追加 option(BUILD_XXX ...)
 
+if (GGML_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if (CUDAToolkit_FOUND)
+        message(STATUS "CUDA Toolkit detected: ${CUDAToolkit_VERSION}")
+    else()
+        message(FATAL_ERROR "GGML_CUDA=ON but CUDAToolkit was not found")
+    endif()
+endif()
+
+if (GGML_CANN)
+    message(FATAL_ERROR "GGML_CANN is disabled for ominix-cuda")
+endif()
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -190,13 +204,8 @@ endif()
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
-    # SD_CANN → GGML_CANN: SD 的 CANN 后端由统一 ggml-cann 提供
-    if (BUILD_SD AND SD_CANN AND NOT GGML_CANN)
-        set(GGML_CANN ON CACHE BOOL "ggml: enable CANN backend (required by SD)" FORCE)
-    endif()
-    # 当 SD+CANN 启用时，统一编译 ACL Graph 支持（运行时由 GGML_CANN_ACL_GRAPH 环境变量控制）
-    if (BUILD_SD AND (SD_CANN OR GGML_CANN))
-        set(USE_ACL_GRAPH ON CACHE BOOL "ggml: enable ACL graph for SD inference" FORCE)
+    if (BUILD_SD AND GGML_CUDA)
+        set(SD_CUDA ON CACHE BOOL "sd: cuda backend" FORCE)
     endif()
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt

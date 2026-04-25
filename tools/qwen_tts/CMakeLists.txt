@@ -16,17 +16,11 @@ set(SRC_FILES
     stft.cpp
 )
 
-# Native CP CANN engine: optional, enabled on Ascend where CANN headers exist.
-# We dlopen the CANN libs at runtime (see cp_cann_symbols.cpp) so nothing
-# needs to be linked — just need the toolkit headers + libdl.
-option(QWEN_TTS_CP_CANN "Build native CP CANN engine (Ascend only)" OFF)
-if(DEFINED ENV{ASCEND_TOOLKIT_HOME} AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include/acl/acl.h")
-    set(QWEN_TTS_CP_CANN ON CACHE BOOL "" FORCE)
-endif()
+# Native CANN engines were stripped for ominix-cuda; Phase 2 will add the
+# CUDA-native talker path.
+option(QWEN_TTS_CP_CANN "Build native CP CANN engine (unavailable in ominix-cuda)" OFF)
 if(QWEN_TTS_CP_CANN)
-    list(APPEND SRC_FILES cp_cann_engine.cpp cp_cann_symbols.cpp
-                          talker_cann_engine.cpp)
-    message(STATUS "qwen_tts: CP CANN engine ENABLED (+ native Talker)")
+    message(FATAL_ERROR "QWEN_TTS_CP_CANN is not available in ominix-cuda")
 endif()
 
 # -----------------------------------------------------------------------------
@@ -45,19 +39,8 @@ endif()
 # host. Source file lives at tools/qwen_tts/ascendc/.
 # -----------------------------------------------------------------------------
 option(QWEN_TTS_ASCENDC "Build AscendC custom kernels (W4.1)" OFF)
-if(QWEN_TTS_CP_CANN
-   AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
-   AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin/ccec")
-    set(QWEN_TTS_ASCENDC ON CACHE BOOL "" FORCE)
-endif()
 if(QWEN_TTS_ASCENDC)
-    set(ASCEND_CANN_PACKAGE_PATH $ENV{ASCEND_TOOLKIT_HOME})
-    set(SOC_VERSION Ascend910B4)
-    set(RUN_MODE npu)
-    include(${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
-    ascendc_library(qwen_tts_ascendc_kernels STATIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/ascendc/fused_attn_sublayer.cpp)
-    message(STATUS "qwen_tts: AscendC kernels ENABLED (W4.1 fused_attn_sublayer)")
+    message(FATAL_ERROR "QWEN_TTS_ASCENDC is not available in ominix-cuda")
 endif()
 
 # llama.cpp fallback Talker path: optional, default OFF. When OFF, the
@@ -113,8 +96,7 @@ if(QWEN_TTS_ASCENDC)
     target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_ASCENDC=1)
 endif()
 target_include_directories(${TARGET} PUBLIC  .)
-target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR}
-    $ENV{ASCEND_TOOLKIT_HOME}/include)
+target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR})
 target_compile_features   (${TARGET} PRIVATE cxx_std_17)
 
 # Enable NEON F16 intrinsics for ARM
@@ -195,8 +177,7 @@ target_link_libraries     (${API_TARGET} PRIVATE Threads::Threads)
 target_include_directories(${API_TARGET} PUBLIC  .)
 target_include_directories(${API_TARGET} PRIVATE
     ${CMAKE_SOURCE_DIR}/include   # llama.h visible for talker.h (fallback types)
-    ../.. ../../vendor ${KISSFFT_DIR}
-    $ENV{ASCEND_TOOLKIT_HOME}/include)
+    ../.. ../../vendor ${KISSFFT_DIR})
 target_compile_features   (${API_TARGET} PRIVATE cxx_std_17)
 set_target_properties     (${API_TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -265,6 +246,7 @@ install(FILES qwen_tts_api.h DESTINATION include)
 set(TEST_CP_SRC
     test_code_predictor.cpp
     talker.cpp
+    tts_transformer.cpp
     model_defs.cpp
 )
 add_executable(test_code_predictor ${TEST_CP_SRC})
@@ -279,6 +261,7 @@ target_compile_features   (test_code_predictor PRIVATE cxx_std_17)
 set(TEST_TALKER_SRC
     test_talker.cpp
     talker.cpp
+    tts_transformer.cpp
     model_defs.cpp
 )
 add_executable(test_talker ${TEST_TALKER_SRC})
@@ -306,6 +289,7 @@ target_compile_features   (test_encoder PRIVATE cxx_std_17)
 set(TEST_CP_FLOW_SRC
     test_cp_flow.cpp
     talker.cpp
+    tts_transformer.cpp
     model_defs.cpp
 )
 add_executable(test_cp_flow ${TEST_CP_FLOW_SRC})

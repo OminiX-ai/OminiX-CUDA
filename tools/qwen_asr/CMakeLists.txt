@@ -77,7 +77,7 @@ target_compile_features   (${TEST_CONV_TARGET} PRIVATE cxx_std_17)
 # same condition that enables the CP-CANN engine in qwen_tts — if we're on
 # an Ascend host with acl.h available. Outside Ascend this target is skipped.
 # =============================================================================
-if(DEFINED ENV{ASCEND_TOOLKIT_HOME} AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include/acl/acl.h")
+if(FALSE)
     set(NATIVE_TARGET qwen_asr_native)
     set(NATIVE_SRC
         native/main_native.cpp
@@ -118,5 +118,5 @@ if(DEFINED ENV{ASCEND_TOOLKIT_HOME} AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/aarch6
     install(TARGETS ${NATIVE_TARGET} RUNTIME)
     message(STATUS "qwen_asr: native engine ENABLED (qwen_asr_native)")
 else()
-    message(STATUS "qwen_asr: native engine disabled (ASCEND_TOOLKIT_HOME missing)")
+    message(STATUS "qwen_asr: native engine disabled (ominix-cuda Phase 4 CUDA port pending)")
 endif()
