@@ -58,6 +58,18 @@ def summarize(values):
     }
 
 
+def clone_tensors(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(clone_tensors(item) for item in value)
+    if isinstance(value, list):
+        return [clone_tensors(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clone_tensors(item) for key, item in value.items()}
+    return value
+
+
 def parse_module_list(value):
     if value is None:
         return None
@@ -422,6 +434,15 @@ def main():
         default=None,
         help="Comma-separated module name substrings to leave unquantized for TorchAO FP8.",
     )
+    parser.add_argument("--torch-compile", action="store_true")
+    parser.add_argument("--torch-compile-mode", default="max-autotune")
+    parser.add_argument("--torch-compile-fullgraph", action="store_true")
+    parser.add_argument(
+        "--compile-warmup-runs",
+        type=int,
+        default=0,
+        help="Run same-shape generations before the measured run. Useful because torch.compile is lazy.",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser()
@@ -472,6 +493,23 @@ def main():
     t2 = time.perf_counter()
     pipe.set_progress_bar_config(disable=args.disable_progress)
 
+    compile_wrap_wall = None
+    if args.torch_compile:
+        compile_t0 = time.perf_counter()
+        pipe.transformer = torch.compile(
+            pipe.transformer,
+            mode=args.torch_compile_mode,
+            fullgraph=args.torch_compile_fullgraph,
+        )
+        compile_t1 = time.perf_counter()
+        compile_wrap_wall = compile_t1 - compile_t0
+        print(
+            "TORCH_COMPILE_WRAPPED "
+            f"mode={args.torch_compile_mode} fullgraph={args.torch_compile_fullgraph} "
+            f"wall_s={compile_wrap_wall:.6f}",
+            flush=True,
+        )
+
     metrics = {
         "model": args.model,
         "image": args.image,
@@ -487,6 +525,11 @@ def main():
         "fp8_backend": args.fp8_backend,
         "fp8_modules_to_not_convert": fp8_modules_to_not_convert,
         "fp8_transformer_load_wall_s": transformer_load_wall,
+        "torch_compile": args.torch_compile,
+        "torch_compile_mode": args.torch_compile_mode if args.torch_compile else None,
+        "torch_compile_fullgraph": args.torch_compile_fullgraph if args.torch_compile else None,
+        "torch_compile_wrap_wall_s": compile_wrap_wall,
+        "compile_warmup_runs": args.compile_warmup_runs,
         "seed": args.seed,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -511,8 +554,12 @@ def main():
 
     def timed_transformer_forward(*forward_args, **forward_kwargs):
         sync_cuda()
+        if args.torch_compile and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
         start = time.perf_counter()
         result = original_forward(*forward_args, **forward_kwargs)
+        if args.torch_compile:
+            result = clone_tensors(result)
         sync_cuda()
         elapsed = time.perf_counter() - start
         transformer_call_times.append(elapsed)
@@ -521,32 +568,32 @@ def main():
 
     pipe.transformer.forward = timed_transformer_forward
 
-    callback_step_times = []
-    callback_last = {"time": None}
-
-    def on_step_end(_pipe, step, timestep, callback_kwargs):
-        sync_cuda()
-        now = time.perf_counter()
-        if callback_last["time"] is None:
-            elapsed = now - infer_start
-        else:
-            elapsed = now - callback_last["time"]
-        callback_last["time"] = now
-        callback_step_times.append(elapsed)
-        timestep_value = timestep.item() if hasattr(timestep, "item") else timestep
-        print(
-            f"STEP_END {step + 1}/{args.steps} timestep={timestep_value} callback_delta_s={elapsed:.6f}",
-            flush=True,
-        )
-        return callback_kwargs
-
     image = Image.open(Path(args.image).expanduser()).convert("RGB")
-    generator = torch.Generator(device="cuda").manual_seed(args.seed)
 
-    torch.cuda.reset_peak_memory_stats()
-    sync_cuda()
-    infer_start = time.perf_counter()
-    with torch.inference_mode():
+    def run_generation(run_label, save_path=None):
+        callback_step_times = []
+        callback_last = {"time": None}
+        infer_start_holder = {"time": None}
+
+        def on_step_end(_pipe, step, timestep, callback_kwargs):
+            sync_cuda()
+            now = time.perf_counter()
+            infer_start = infer_start_holder["time"]
+            if callback_last["time"] is None:
+                elapsed = now - infer_start
+            else:
+                elapsed = now - callback_last["time"]
+            callback_last["time"] = now
+            callback_step_times.append(elapsed)
+            timestep_value = timestep.item() if hasattr(timestep, "item") else timestep
+            print(
+                f"{run_label}_STEP_END {step + 1}/{args.steps} timestep={timestep_value} "
+                f"callback_delta_s={elapsed:.6f}",
+                flush=True,
+            )
+            return callback_kwargs
+
+        generator = torch.Generator(device="cuda").manual_seed(args.seed)
         call = qwen_edit_plus_call_batched_cfg if args.cfg_batching else QwenImageEditPlusPipeline.__call__
         pipeline_kwargs = {
             "image": [image],
@@ -564,11 +611,36 @@ def main():
         }
         if args.cfg_batching:
             pipeline_kwargs["cfg_force_no_padding_mask"] = args.cfg_batching_no_mask_padding
-        result = call(pipe, **pipeline_kwargs)
-    sync_cuda()
-    infer_end = time.perf_counter()
 
-    result.images[0].save(output_path)
+        sync_cuda()
+        infer_start_holder["time"] = time.perf_counter()
+        with torch.inference_mode():
+            result = call(pipe, **pipeline_kwargs)
+        sync_cuda()
+        infer_end = time.perf_counter()
+        if save_path is not None:
+            result.images[0].save(save_path)
+        return infer_end - infer_start_holder["time"], callback_step_times
+
+    warmup_metrics = []
+    for warmup_index in range(args.compile_warmup_runs):
+        before_calls = len(transformer_call_times)
+        warmup_wall, warmup_callback_step_times = run_generation(f"WARMUP{warmup_index + 1}")
+        warmup_call_times = transformer_call_times[before_calls:]
+        warmup_metrics.append(
+            {
+                "run": warmup_index + 1,
+                "infer_wall_s": warmup_wall,
+                "transformer_call_times_s": warmup_call_times,
+                "transformer_calls": summarize(warmup_call_times),
+                "callback_step_deltas_s": warmup_callback_step_times,
+                "callback_steps": summarize(warmup_callback_step_times),
+            }
+        )
+        transformer_call_times.clear()
+
+    torch.cuda.reset_peak_memory_stats()
+    infer_wall, callback_step_times = run_generation("STEP", output_path)
 
     calls_per_step = 1 if args.cfg_batching else (2 if args.true_cfg_scale and args.true_cfg_scale > 1.0 else 1)
     grouped_transformer_steps = [
@@ -579,7 +651,8 @@ def main():
 
     metrics.update(
         {
-            "infer_wall_s": infer_end - infer_start,
+            "compile_warmups": warmup_metrics,
+            "infer_wall_s": infer_wall,
             "output": str(output_path),
             "transformer_call_times_s": transformer_call_times,
             "transformer_calls": summarize(transformer_call_times),

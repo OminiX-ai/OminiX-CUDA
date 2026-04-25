@@ -341,3 +341,60 @@ Interpretation:
 Next:
 
 - Proceed to `torch.compile` with BF16 first. If BF16 compile is green, optionally retest `torchao-float8dq + torch.compile` as an interaction check, but FP8 alone is red.
+
+### Step 3 - torch.compile
+
+Date: 2026-04-25 PDT
+
+Harness changes:
+
+- Added opt-in compile flags to `tools/qwen_image_edit/cuda/bench_qie_diffusers.py` / remote `~/qie_cuda/src/bench_qie_diffusers.py`.
+- Flags: `--torch-compile`, `--torch-compile-mode` defaulting to `max-autotune`, `--torch-compile-fullgraph`, and `--compile-warmup-runs`.
+- Compile is applied after `.to("cuda")`: `pipe.transformer = torch.compile(pipe.transformer, mode=..., fullgraph=...)`.
+- Because compile is lazy, warmup generations are run before the measured generation when `--compile-warmup-runs > 0`; only the post-warmup run is used for the primary latency metrics.
+- True CFG calls the transformer twice per denoise step. The compiled CUDA Graph output was overwritten between cond/uncond calls until the harness added `torch.compiler.cudagraph_mark_step_begin()` and cloned tensor outputs at the wrapper boundary.
+
+Troubleshooting receipts:
+
+- Failed compile smoke v1 log: `~/qie_cuda/logs/phase2_compile_smoke_256_2step.log`
+- Failed compile smoke v2 log: `~/qie_cuda/logs/phase2_compile_smoke_256_2step_v2.log`
+- Failure mode: `RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`.
+- Final smoke log: `~/qie_cuda/logs/phase2_compile_smoke_256_2step_v3.log`
+- Final smoke metrics: `~/qie_cuda/logs/phase2_compile_smoke_256_2step_v3_metrics.json`
+- Final smoke output: `~/qie_cuda/outputs/phase2_compile_smoke_256_2step_v3.png`
+
+256x256 / 2-step smoke:
+
+| Variant | Warmup inference | Measured inference | Transformer call mean | Grouped step mean | Peak allocated | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| Phase 0 BF16 smoke | N/A | 9.378 s | 1.808 s | 3.616 s | 55.859 GiB | Baseline smoke |
+| BF16 `torch.compile` | 27.382 s | 6.611 s | 1.447 s | 2.894 s | 55.860 GiB | PASS, -29.5% smoke wall |
+
+Canonical 1024x1024 / 20-step results:
+
+| Variant | True CFG? | Calls | Warmup inference | Measured inference | Step / grouped mean | Transformer call mean | Peak allocated | Eye check | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| Phase 1 BF16 baseline | Yes | 40 | N/A | 141.438 s | 6.926 s | 3.463 s | 57.970 GiB | PASS | Baseline |
+| BF16 `torch.compile` | Yes | 40 | 221.813 s | 113.425 s | 5.601 s | 2.801 s | 57.961 GiB | PASS | PASS, -19.8% wall |
+
+Canonical receipts:
+
+- Log: `~/qie_cuda/logs/phase2_compile_1024_20step.log`
+- Metrics: `~/qie_cuda/logs/phase2_compile_1024_20step_metrics.json`
+- Output: `~/qie_cuda/outputs/phase2_compile_1024_20step.png`
+- Compile warning: `Not enough SMs to use max_autotune_gemm mode`; despite this, Inductor still reduced post-warmup transformer call time.
+
+Visual gate:
+
+- `torch.compile` canonical output is a recognizable black-and-white cat and passes the eye check.
+- Pixel diff versus Phase 1: mean abs diff `[1.1923, 1.0827, 0.8258]`, RMSE `[1.6259, 1.5059, 1.1604]`.
+
+Interpretation:
+
+- `torch.compile` is the first clearly useful CUDA lever in Phase 2, but the gain is modest rather than dramatic: post-warmup canonical wall improves by `28.013 s`, or `19.8%`.
+- The denoise loop remains dominated by true-CFG sequential calls. Compile reduces each transformer call from `3.463 s` to `2.801 s`, but there are still 40 calls.
+- Compile warmup is expensive on first same-shape generation: `221.813 s` total for canonical, with the first step paying about `115 s`. Any production path needs a persistent compiled process, not one process per image.
+
+Next:
+
+- Proceed to CacheDIT. For the final stack, benchmark both `torch.compile` alone and `torch.compile + --cfg-batching --cfg-batching-no-mask-padding`; Step 1 no-mask may compound with compile even though it was small in eager mode.
