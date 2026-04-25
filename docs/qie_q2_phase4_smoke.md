@@ -1928,3 +1928,224 @@ unpatchify + pe alignment). NOT a third NaN leak.
    IF a future deep-block magnitude probe shows non-residual matmul
    outputs approaching F16 65504. Current data says they don't
    (max ≤ ~3700 at block 0).
+
+### §5.5.6 Step 4f — tile-pattern bisect: unpatchify GREEN, pe DRIFT (minor), missing noise PARTIAL, attention saturation RED
+
+Mission (Q2.4.5.4f handoff): the §5.5.5-d gate is GREEN numerically
+(no NaN through 20 steps × 60 blocks, sane final-latent F32 stats) but
+the VAE-decoded PNG renders as a regular blue tile pattern rather than
+a recognizable cat (`/tmp/qie_q45_step4d_allbf16_cat.png` on Mac).
+The §5.5.5 next-step queue called out unpatchify token layout and RoPE
+pe per-step offset as prime suspects. Step 4f tested both and found
+neither is the root cause; the actual cause is a per-token-variation
+collapse downstream of the 60-block forward (post-block cosine
+similarity between img tokens is 0.999 vs the pre-block 0.027). One
+contributing input bug was fixed (missing noise), but the
+post-block collapse persists with proper noise. The visual cat
+remains BLOCKED on a separate downstream defect.
+
+#### Diagnostic — latent inspection rules out unpatchify
+
+Pulled `qie_q45_step4_latent.f32.bin` (post-20-step output) to host as
+`[1, 16, 32, 32]` F32, computed per-channel block coherence:
+
+| channel | inblock σ (within 2×2) | cross-block σ (between 256 patches) |
+|---|---|---|
+| c=0  | 2.349 | **0.033** |
+| c=4  | 2.023 | **0.024** |
+| c=8  | 2.252 | 0.058 |
+| c=12 | 5.161 | 0.082 |
+| c=15 | 3.665 | 0.059 |
+
+The cross-block standard deviation is ≤ 0.08 across every channel —
+i.e. **every 2×2 patch has the same mean** to within ~1% of the
+inblock variance. Top-left 8×8 corner of channel 0 confirms visually:
+
+```
+[[6.246 1.174 6.176 1.112 6.168 1.135 6.207 1.161]
+ [2.967 6.93  2.936 6.875 2.922 6.875 2.879 6.871]
+ [6.137 1.242 6.168 1.237 6.203 1.269 6.148 1.26 ]
+ [2.914 6.965 2.896 6.98  2.916 6.984 2.902 6.953]
+ ...]
+```
+
+The single 2×2 pattern `[[6.2, 1.2], [2.9, 6.9]]` repeats across every
+block of the 32×32 latent. This is **not** an unpatchify ordering bug
+(which would scramble channels or transpose H↔W) and **not** a RoPE
+offset bug alone (which would produce different-but-wrong positions
+per token, not identical outputs). It is the signature of *every img
+token producing the same 64-d output vector*.
+
+#### Root cause — `init_latent.f32.bin` is pre-noise, all-zero
+
+Cross-checked the dump: `/tmp/qie_q45_inputs/init_latent.meta.txt`
+shape `[32, 32, 16, 1]` F32. Loaded host-side:
+
+```
+=== init_latent ===
+  mean=0.000 std=0.000 min=0.000 max=0.000
+```
+
+The dump is **all zeros**. Tracing
+`tools/ominix_diffusion/src/stable-diffusion.cpp`:
+
+- L2697-2715 `generate_init_latent` returns
+  `ggml_set_f32(init_latent, shift_factor)` — for Qwen-Image
+  `shift_factor=0` → tensor of zeros.
+- L3997-3999 (in the per-image sampling loop) generates a
+  fresh `noise = randn` tensor next to `init_latent`.
+- L2068 inside `sample()`: the actual starting `x` is
+  `denoiser->noise_scaling(sigmas[0], noise, x)` →
+  `(1 - σ_0) * latent_zero + σ_0 * noise` for DiscreteFlowDenoiser
+  (denoiser.hpp:700-705). With `latent_zero ≡ 0` and `σ_0 ≈ 1.0`
+  the trajectory starts from pure Gaussian noise.
+- L3886 (the dump call site): dumps `init_latent` **before** the
+  noise-scaling step. The probe driver
+  `tools/probes/qie_q45_step4_full_denoise/test_qie_q45_step4_full_denoise.cpp:219`
+  feeds that pre-scaling tensor (zeros) into
+  `eng.denoise_full(init_latent_host.data(), ...)` as the starting
+  point for Euler.
+
+With `x ≡ 0` at step 0, every img patch projects through `img_in`
+(Linear with bias) to the same hidden vector — the bias. RoPE applies
+position-dependent rotations to Q/K, so query-key scores differ
+per token, but **V is unchanged**. With identical V across every
+token, attention output is the same V regardless of attention pattern
+(`softmax(scores) @ V` collapses). Subsequent pointwise MLPs preserve
+the uniformity. After 60 blocks → 20 Euler steps the latent retains
+the all-tokens-identical structure → unpatchify emits the same 2×2
+tile to every block → blue-checkerboard PNG.
+
+#### Fix — dump post-noise-scaling x_t, prefer it in `init_from_dump`
+
+Two-line change:
+
+1. `tools/ominix_diffusion/src/stable-diffusion.cpp`: add a forward
+   declaration of `qie_dump_tensor` above the
+   `StableDiffusionGGML` class (so the dump can be called from
+   `sample()`), and emit `qie_dump_tensor(x, "noised_init_latent")`
+   immediately after the `noise_scaling` call (line 2068).
+
+2. `tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+   `init_from_dump` now prefers `noised_init_latent.f32.bin`; falls
+   back to legacy `init_latent.f32.bin` with a loud WARN that the
+   output will be uniform-pattern unless the dump is regenerated.
+
+The native unpatchify (host\_unpatchify\_latent at
+`image_diffusion_engine.cpp:4299`) was verified correct against
+`tools/ominix_diffusion/src/common_dit.hpp::unpatchify` and the MLX
+reference at
+`OminiX-MLX/qwen-image-mlx/src/transformer/transformer.rs:220` —
+both use channel-major then `(py, px)` per-token layout with
+row-major `(ty, tx)` token scan. **No layout fix needed.**
+
+The RoPE pe per-step offset gap noted in §5.5.1 is real and still
+worth follow-up (currently the pe table built at h=w=64 grid is
+sliced as 8 rows of 64 cols for the production 16×16+16×16 token
+sequence — incorrect positions but not catastrophic, as evidenced
+by the model still producing F32-finite output and DIFFERENT pe per
+token rather than identical pe).
+
+#### Re-probe with proper noise: still uniform output
+
+Re-ran the §5.5.5 Step-4 probe with the fix
+(`/tmp/qie_q45_step4f_rerun.log` on ac03). Loaded
+`noised_init_latent.f32.bin` (verified Gaussian: mean 0.003 std 0.997
+range ±3.93). Final out_latent stats:
+
+```
+mean=-2.4559 std=4.8611 min/max=-13.3203/7.6250 NaN=0 inf=0
+```
+
+Bit-pattern-near-identical (L2 diff 3.88, max abs diff 0.16) to the
+pre-fix run. Same uniform-tile structure (per-channel cross-block std
+0.03 vs inblock std 2.3). **The missing-noise input bug is real and
+necessary to fix, but is NOT sufficient — there's a deeper defect
+downstream.**
+
+#### Bisect — per-token variation collapse inside the 60-block forward
+
+Instrumented `denoise_full` (env-gated `QIE_DEBUG_DUMP_STEP0_TOKENS=1`)
+to dump four step-0 buffers:
+
+| File | Shape | What |
+|---|---|---|
+| `qie_step0_concat_tokens.f32.bin` | [seq=512, IN_CH=64] | Host patchify-output (model input) |
+| `qie_step0_pre_blocks_img_res.f32.bin` | [seq=512, H=3072] | Post-img_in F32 residual (just before the 60-block loop) |
+| `qie_step0_post_blocks_img_res.f32.bin` | [seq=512, H=3072] | Post-60-block F32 residual |
+| `qie_step0_out_tokens.f32.bin` | [init=256, PATCH_OUT=64] | Final proj_out output |
+
+Receipts:
+
+| Stage | per-row σ (within token) | cross-row σ (between tokens) | avg pairwise cossim |
+|---|---|---|---|
+| Pre-blocks img_res | 1.22 | 1.10 | **0.027** (independent) |
+| Post-blocks img_res | 1.24M | 20.2K | **0.9986** (collapsed!) |
+
+Per-row magnitudes also explode from O(1) to O(10⁶) across 60 blocks.
+The per-block trace from §5.5.5 receipts already showed mean_abs
+1e5 → 3e5 across blocks 0..59 with max_abs reaching 6.5e7 at block 59
+— magnitudes the model never saw during training. Reference engine's
+final latent (`x0_sampled_0.f32.bin` from the dump pipeline) has
+`std=0.36` vs the native engine's `std=4.86` (14× too big), so the
+amplification is real and systemic, not just a step-0 artifact.
+
+#### Likely deeper cause (NOT confirmed in Step 4f scope)
+
+Three candidates left on the table for the next agent:
+
+1. **Attention softmax saturation cascade.** Once `img_resid_2` enters
+   block 1 at mean_abs 1e5 (§5.5.4 Receipt 2), block 1's `LN1` does
+   normalize it back to std≈1 BUT the pre-block residual stream and
+   gated-residual contributions from block 1 onwards still ride on
+   the 1e5 base. Each block's `to_q`/`to_k` projection from
+   post-modulate input (max ~2400) produces O(2400 × √H) Q/K
+   magnitudes; their dot product saturates softmax at >50 (1e21
+   linear range). Saturated attention means every img query collapses
+   onto whichever K row scored highest → identical output rows →
+   the cosine 0.999 we measured. This explains the BOTH the
+   magnitude blow-up AND the per-token collapse with one
+   underlying defect: the residual stream is leaking magnitude that
+   the trained attention scale (`1/√head_dim`) can't compensate.
+   The reference engine — which produces `x0` at std=0.36 — must
+   keep the residual stream to single-digit magnitudes; native is
+   ~14× too big from block 0 onward, suggesting a missing or
+   wrong-direction normalization somewhere in the QKV / attention
+   /  modulation / gated-residual chain.
+2. **Q4_0 weight quantization-scale mishandling.** If WQBMMv3
+   antiquant scales are off by a constant factor (e.g.
+   F16-vs-FP32 cast that misses one of the per-32-element scaling
+   stages), every Q4 matmul output is uniformly amplified — which
+   would explain the 14× systemic amplification. The §5.5.4 BF16
+   widening saved the residual from F16 saturation but did not
+   address the underlying scale.
+3. **Modulation `gate1`/`gate2` magnitude drift.** AdaLN modulation
+   computes `scale = silu(t_emb) @ W_mod` and applies
+   `x = x * (1 + scale) + shift`. If `(1 + scale)` is consistently
+   >1 (rather than averaging near 1.0 as the reference does), every
+   block's residual is multiplied by some factor > 1 — exponential
+   growth. Probe: dump `img_scale1` / `img_scale2` magnitudes at
+   block 0 vs reference engine's same buffer.
+
+#### Verdict
+
+Step 4f delivers two committed fixes (noised-init dump + load) and
+one diagnostic probe (env-gated step-0 token dumps), but the visual
+cat remains **BLOCKED**. Native engine produces a numerically-finite
+but magnitude-blown-up, per-token-uniform latent that VAE-decodes
+into the original tile pattern. PNG receipts:
+
+- `/tmp/qie_q45_step4d_allbf16_cat.png` (Mac, pre-fix)
+- `/tmp/qie_q45_host2step_dump.png` (ac03, post-fix CLI dump 2-step,
+  visually equivalent — uniform texture, not a cat)
+- Reference: `/tmp/phase1_baseline_1024_20step.png` (Mac, codex CUDA
+  20-step, recognizable B&W cat)
+
+Next agent: start from candidate (1) or (3) above. Compare native
+engine's block-0 `to_out_0` magnitude (`70` mean_abs at the §5.5.3
+intra log, max 634) to the reference engine's same buffer — if
+native is consistently 10×+ off, walk back through QKV → modulation
+→ `txt_in` projection until the amplification source is isolated.
+The `qie_step0_pre_blocks_img_res.f32.bin` host dump already shows a
+sane post-img_in residual (max_abs 16) — so img_in itself is fine;
+the leak is somewhere inside the 60-block loop.

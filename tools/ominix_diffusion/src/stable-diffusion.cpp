@@ -288,6 +288,11 @@ __STATIC_INLINE__ int64_t cfg_count_non_text_tokens_qwen_image(struct ggml_tenso
 
 /*=============================================== StableDiffusionGGML ================================================*/
 
+// Forward declaration for [QIE Phase 4.5 Step 2/4f] tensor dumps invoked
+// from class members (definition lives at the bottom of this file alongside
+// the rest of the QIE-dump scaffolding).
+static void qie_dump_tensor(struct ggml_tensor* t, const char* name);
+
 class StableDiffusionGGML {
 public:
     ggml_backend_t backend             = nullptr;  // general backend
@@ -2067,6 +2072,15 @@ public:
         if (noise) {
             x = denoiser->noise_scaling(sigmas[0], noise, x);
         }
+
+        // [QIE Phase 4.5 Step 4f] Dump x_t (post-noise-scaling) so the
+        // native engine probe can resume from the same starting point as
+        // the reference. The pre-scaling `init_latent` dump above is just
+        // the shift_factor-filled prior — using it as the native engine's
+        // starting state produces a degenerate denoise trajectory (every
+        // img token sees identical input → identical output → tile-pattern
+        // PNG). See docs/qie_q2_phase4_smoke.md §5.5.6.
+        qie_dump_tensor(x, "noised_init_latent");
 
         struct ggml_tensor* noised_input = ggml_dup_tensor(work_ctx, x);
 

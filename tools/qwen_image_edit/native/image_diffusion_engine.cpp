@@ -4393,24 +4393,44 @@ bool ImageDiffusionEngine::init_from_dump(const std::string &dump_dir,
     const size_t latent_elems = (size_t)W_lat * H_lat * C_lat * B;
     const size_t latent_bytes = latent_elems * sizeof(float);
 
-    // Required: init_latent.f32.bin
+    // Required: starting latent for the Euler loop. Prefer
+    // `noised_init_latent.f32.bin` (post-noise-scaling x_t at sigmas[0])
+    // since that's what the reference engine actually feeds the model at
+    // step 0 — flow-matching scales `x = (1 - sigma_0) * latent_zero +
+    // sigma_0 * noise`, so without the noise the entire denoise trajectory
+    // is degenerate (every img token receives identical input → identical
+    // output → tile-pattern PNG, see §5.5.6 of qie_q2_phase4_smoke.md).
+    // Fall back to legacy `init_latent.f32.bin` only for back-compat dumps
+    // (those will produce the tile artifact and should be re-dumped).
     {
         std::vector<uint8_t> raw;
-        long fsize = slurp_file(dump_dir + "/init_latent.f32.bin", raw);
+        long fsize = slurp_file(dump_dir + "/noised_init_latent.f32.bin", raw);
+        const char *src_name = "noised_init_latent.f32.bin";
         if (fsize < 0) {
-            QIE_LOG("init_from_dump: missing %s/init_latent.f32.bin",
-                    dump_dir.c_str());
-            return false;
+            fsize = slurp_file(dump_dir + "/init_latent.f32.bin", raw);
+            src_name = "init_latent.f32.bin";
+            if (fsize < 0) {
+                QIE_LOG("init_from_dump: missing %s/{noised_init_latent,"
+                        "init_latent}.f32.bin",
+                        dump_dir.c_str());
+                return false;
+            }
+            QIE_LOG("init_from_dump: WARNING — using legacy init_latent.f32.bin "
+                    "(no noised_init_latent.f32.bin); output will be a "
+                    "uniform-pattern artifact unless the reference dump is "
+                    "regenerated post-noise-scaling.");
         }
         if ((size_t)fsize != latent_bytes) {
-            QIE_LOG("init_from_dump: init_latent size %ld != expected %zu "
+            QIE_LOG("init_from_dump: %s size %ld != expected %zu "
                     "(W=%lld H=%lld C=%lld B=%lld)",
-                    fsize, latent_bytes, (long long)W_lat, (long long)H_lat,
+                    src_name, fsize, latent_bytes,
+                    (long long)W_lat, (long long)H_lat,
                     (long long)C_lat, (long long)B);
             return false;
         }
         initial_latent_out.assign(latent_elems, 0.0f);
         std::memcpy(initial_latent_out.data(), raw.data(), latent_bytes);
+        QIE_LOG("init_from_dump: starting latent loaded from %s", src_name);
     }
 
     // Optional: ref_latent_0.f32.bin
@@ -4935,6 +4955,28 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                           img_in_f16.size())) {
                 free_owned(); return false;
             }
+            // Q2.4.5.4f tile-pattern bisect (env-gated): at step 0 only,
+            // dump concat_tokens_f32 → /tmp/qie_step0_concat_tokens.f32.bin.
+            // Used by the next agent to verify the patchified model input
+            // is per-token-varied vs the eventual post-block collapse.
+            // See docs/qie_q2_phase4_smoke.md §5.5.6.
+            if (step == 0) {
+                const char *dp =
+                    std::getenv("QIE_DEBUG_DUMP_STEP0_TOKENS");
+                if (dp && *dp && dp[0] != '0') {
+                    FILE *f = std::fopen("/tmp/qie_step0_concat_tokens.f32.bin",
+                                           "wb");
+                    if (f) {
+                        std::fwrite(concat_tokens_f32.data(), sizeof(float),
+                                     concat_tokens_f32.size(), f);
+                        std::fclose(f);
+                        QIE_LOG("step4f-bisect: dumped concat_tokens (%zu F32)"
+                                " seq=%lld IN_CH=%lld",
+                                concat_tokens_f32.size(),
+                                (long long)img_seq, (long long)IN_CH);
+                    }
+                }
+            }
         }
 
         // --- (3) img_in → F16 [img_seq, H] → Cast F32 into img_res_c_f32. ---
@@ -4970,6 +5012,34 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                              free_owned(); return false; }
         }
 
+        // Q2.4.5.4f tile-pattern bisect: dump img_res_c at step 0 BEFORE
+        // 60-block forward, to verify per-token variation survives the
+        // img_in projection.
+        if (step == 0) {
+            const char *dp = std::getenv("QIE_DEBUG_DUMP_STEP0_TOKENS");
+            if (dp && *dp && dp[0] != '0') {
+                std::vector<float> tmp((size_t)img_seq * H, 0.0f);
+                g_cann.aclrtSynchronizeStream(compute_stream_);
+                aclError em = g_cann.aclrtMemcpy(tmp.data(),
+                                                   tmp.size() * F32,
+                                                   img_res_c_f32,
+                                                   tmp.size() * F32,
+                                                   ACL_MEMCPY_DEVICE_TO_HOST);
+                if (em == 0) {
+                    FILE *f = std::fopen("/tmp/qie_step0_pre_blocks_img_res.f32.bin",
+                                           "wb");
+                    if (f) {
+                        std::fwrite(tmp.data(), sizeof(float),
+                                     tmp.size(), f);
+                        std::fclose(f);
+                        QIE_LOG("step4f-bisect: pre-blocks img_res dumped"
+                                " (%zu F32) seq=%lld H=%lld",
+                                tmp.size(), (long long)img_seq, (long long)H);
+                    }
+                }
+            }
+        }
+
         // --- (4) cond pass: txt_res_c → txt_work_c, run 60 blocks. ---
         aclError me = g_cann.aclrtMemcpy(txt_work_c_f32,
                                            (size_t)txt_seq * H * F32,
@@ -4990,6 +5060,31 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                     /*f16*/false, step);
         probe_stats("post_blocks.txt_work_c", txt_work_c_f32, txt_seq * H,
                     /*f16*/false, step);
+        // Q2.4.5.4f bisect: dump img_res_c AFTER 60-block forward, step 0.
+        if (step == 0) {
+            const char *dp = std::getenv("QIE_DEBUG_DUMP_STEP0_TOKENS");
+            if (dp && *dp && dp[0] != '0') {
+                std::vector<float> tmp((size_t)img_seq * H, 0.0f);
+                g_cann.aclrtSynchronizeStream(compute_stream_);
+                aclError em = g_cann.aclrtMemcpy(tmp.data(),
+                                                   tmp.size() * F32,
+                                                   img_res_c_f32,
+                                                   tmp.size() * F32,
+                                                   ACL_MEMCPY_DEVICE_TO_HOST);
+                if (em == 0) {
+                    FILE *f = std::fopen(
+                        "/tmp/qie_step0_post_blocks_img_res.f32.bin", "wb");
+                    if (f) {
+                        std::fwrite(tmp.data(), sizeof(float),
+                                     tmp.size(), f);
+                        std::fclose(f);
+                        QIE_LOG("step4f-bisect: post-blocks img_res dumped"
+                                " (%zu F32) seq=%lld H=%lld",
+                                tmp.size(), (long long)img_seq, (long long)H);
+                    }
+                }
+            }
+        }
 
         // --- (5) norm_out + proj_out on the cond img residual. ---
         //
@@ -5207,6 +5302,27 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             __fp16 hh;
             std::memcpy(&hh, &out_tokens_f16[i], sizeof(hh));
             out_tokens_f32[i] = (float)hh;
+        }
+        // Q2.4.5.4f tile-pattern bisect: at step 0, dump out_tokens_f32 so
+        // we can verify per-token variation in the model OUTPUT (i.e. did
+        // the 60-block forward + proj_out collapse all tokens to the same
+        // 64-d vector?).
+        if (step == 0) {
+            const char *dp = std::getenv("QIE_DEBUG_DUMP_STEP0_TOKENS");
+            if (dp && *dp && dp[0] != '0') {
+                FILE *f = std::fopen("/tmp/qie_step0_out_tokens.f32.bin",
+                                       "wb");
+                if (f) {
+                    std::fwrite(out_tokens_f32.data(), sizeof(float),
+                                 out_tokens_f32.size(), f);
+                    std::fclose(f);
+                    QIE_LOG("step4f-bisect: dumped out_tokens (%zu F32)"
+                            " init_tokens=%lld PATCH_OUT=%lld",
+                            out_tokens_f32.size(),
+                            (long long)init_img_tokens,
+                            (long long)PATCH_OUT);
+                }
+            }
         }
         // Unpatchify to `denoised_host` [W_lat, H_lat, C_out=16, B].
         host_unpatchify_latent(out_tokens_f32.data(),
