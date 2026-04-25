@@ -83,7 +83,64 @@ Build wall: ~3 min from cold cmake (most spent compiling ggml-cuda's
 
 Gate: PASS. Phase 2.2 cleared to start.
 
-### Phase 2.2 — Per-token forward (PENDING)
+### Phase 2.2 — Per-token forward (CODE LANDED, GB10 SMOKE PENDING)
+
+Per-token autoregressive `forward_decode` body wired up on the Mac side.
+
+Files added:
+- `tools/qwen_tts/native/cuda_kernels/cuda_kernels.h` — C-style launcher
+  signatures for the six custom kernels listed below.
+- `tools/qwen_tts/native/cuda_kernels/elementwise.cu` — F32<->F16 casts
+  and an F16 elementwise add (residual). Add does sum-in-F32 to match the
+  Ascend `aclnnAdd` precision contract.
+- `tools/qwen_tts/native/cuda_kernels/rmsnorm.cu` — block-per-row RmsNorm
+  with F16 input/output, F32 gamma. Single-pass mean-of-squares -> rstd ->
+  scaled write.
+- `tools/qwen_tts/native/cuda_kernels/rope_neox.cu` — NEOX-mode RoPE on a
+  `[n_heads, head_dim]` tile against a precomputed `cos[head_dim]` /
+  `sin[head_dim]` row. One block per head; one thread per pair-index.
+- `tools/qwen_tts/native/cuda_kernels/swiglu.cu` — fused SwiGLU
+  `y[i] = silu(gate[i]) * up[i]` in F32 compute.
+- `tools/qwen_tts/native/cuda_kernels/attn_gqa.cu` — single-token GQA
+  attention. One block per Q head (16 blocks for Talker). Loads
+  `q[h]` into shmem, dot-product against the live KV cache rows
+  (`pos+1` of them) with warp-stride dim accumulation, online softmax
+  with max-subtract numerical stabilization, then weighted sum into
+  the output. GQA ratio `n_heads / n_kv = 2` handled via
+  `h_kv = h / group`.
+- `tools/qwen_tts/native/test_talker_cuda_decode.cpp` — Phase 2.2 smoke
+  harness. Drives `forward_decode` for 10 sequential positions against a
+  deterministic sin-wave embedding, checks no NaN/inf and non-zero
+  magnitude per call, prints avg wall-clock per step.
+
+Files modified:
+- `tools/qwen_tts/native/talker_cuda_engine.cpp`:
+  - Added `load_gguf_tensor_f32` / `upload_tensor_f16` / `upload_tensor_f32`
+    helpers (mirror the Ascend reference).
+  - Wired the per-layer Q/K/V/O/gate/up/down F16 + attn_norm/ffn_norm/
+    q_norm/k_norm F32 + final `output_norm` upload into `init_from_gguf`.
+  - Replaced the `run_decode_ops_` and `forward_decode` stubs with the
+    real 28-layer body. Six `cublasGemmEx` calls per layer (op_A=T to
+    consume row-major `[out, in]` storage), interleaved with the custom
+    kernel launches above. Compute type FP32 / I/O FP16. KV cache slot
+    write happens by passing the cache slot pointer directly as the RoPE
+    output for K (avoids an extra D2D), and a tiny D2D for V.
+  - `forward_prefill` still aborts (Phase 2.3 deliverable).
+- `tools/qwen_tts/CMakeLists.txt`:
+  - New `qwen_tts_cuda_kernels` STATIC library bundling the five `.cu`
+    files; PIC ON; `CMAKE_CUDA_ARCHITECTURES` defaults to `121` (GB10
+    Blackwell sm_121a).
+  - Linked into `qwen_tts` exe, `qwen_tts_api` shared lib,
+    `test_talker_cuda_init`, and `test_talker_cuda_decode`.
+
+GB10 build/run is blocked on this dispatch: the GB10 #1 host
+(`zgx-3675:6222`) is not reachable from the Mac development environment
+(no `Host` entry in `~/.ssh/config`, hostname does not resolve, IP
+192.222.56.72 returns "Connection refused" on 6222). Code is ready; the
+rsync + `cmake --build build-phase21 --target test_talker_cuda_decode`
++ smoke-binary run is the only step gated on access. No git commit
+made — Mac local only, awaiting GB10 reachability.
+
 ### Phase 2.3 — KV cache + autoregressive loop (PENDING)
 ### Phase 2.4 — Codec C++ via cuDNN (PENDING)
 ### Phase 2.5 — CUDA Graphs at per-pos capture (PENDING)

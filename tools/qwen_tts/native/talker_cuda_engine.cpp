@@ -1,14 +1,22 @@
 // ============================================================================
-// Talker CUDA Engine — Phase 2.1 scaffold (GGUF parse + cuBLAS handle alloc)
+// Talker CUDA Engine — Phase 2.1 scaffold + Phase 2.2 forward decode body.
 //
-// This file lands the bones of the engine: header is full, ctor/dtor lifecycle,
-// init_from_gguf parses metadata + uploads F16 weights via the same key
-// schema as TalkerCannEngine on Ascend (qwen3 llama-style GGUF emitted by
-// `tools/qwen_tts/export_talker_llama.py`), and reset/setters work.
+// Phase 2.1 (LANDED): header full, ctor/dtor lifecycle, init_from_gguf
+// parses metadata, allocates per-layer KV cache + activation scratch,
+// builds NEOX RoPE tables. Reset/setters work.
 //
-// Per-token forward (run_decode_ops_) is intentionally a "not implemented"
-// stub here — it is the headline Phase 2.2 deliverable and lives in this
-// file in the next sub-phase. Same for forward_prefill.
+// Phase 2.2 (THIS): per-token autoregressive forward_decode body wired up.
+//   - GGUF weight upload: F16 matmul weights + F32 norm gammas, schema
+//     matching the TalkerCannEngine reference (`blk.<L>.attn_q.weight`,
+//     `blk.<L>.attn_norm.weight`, `output_norm.weight`, ...).
+//   - run_decode_ops_: 28-layer body (RmsNorm -> Q/K/V proj -> QK-norm
+//     -> RoPE -> KV write -> GQA attn -> O proj -> residual -> ffn_norm
+//     -> SwiGLU -> down -> residual), final RmsNorm + F16->F32 cast.
+//   - forward_decode: H2D input + cast + body + D2H + sync.
+//
+// Phase 2.3+ remain stubs:
+//   - forward_prefill (S>1) — std::abort with a clear message.
+//   - int8_calibrate_weight_ (Phase 2.6).
 //
 // CUDA error-handling macros are local (no global cuda_check.hpp yet to keep
 // the scaffold self-contained).
@@ -17,6 +25,7 @@
 #include "talker_cuda_engine.h"
 
 #include "../talker.h"  // TalkerConfig
+#include "cuda_kernels/cuda_kernels.h"
 
 // llama.cpp GGUF helpers (vendored in ominix-cuda).
 #include "ggml.h"
@@ -54,6 +63,85 @@
     } while (0)
 
 namespace ominix_cuda {
+
+namespace {
+
+// Pull a tensor out of GGUF as F32 vector (handles F32 / F16 sources).
+std::vector<float> load_gguf_tensor_f32(ggml_context *ggml_ctx,
+                                          const char *name,
+                                          size_t expected_elems) {
+    ggml_tensor *t = ggml_get_tensor(ggml_ctx, name);
+    if (!t) {
+        fprintf(stderr, "[talker_cuda] missing tensor: %s\n", name);
+        return {};
+    }
+    size_t n = ggml_nelements(t);
+    if (expected_elems > 0 && n != expected_elems) {
+        fprintf(stderr,
+                "[talker_cuda] %s: expected %zu elems, got %zu\n",
+                name, expected_elems, n);
+        return {};
+    }
+    std::vector<float> out(n);
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), t->data, n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t *src = (const ggml_fp16_t *)t->data;
+        for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(src[i]);
+    } else {
+        fprintf(stderr, "[talker_cuda] %s: unsupported dtype %d\n",
+                name, (int)t->type);
+        return {};
+    }
+    return out;
+}
+
+bool upload_tensor_f16(ggml_context *ggml_ctx, const char *name,
+                        size_t expected_elems, void *&dev) {
+    std::vector<float> host = load_gguf_tensor_f32(ggml_ctx, name,
+                                                    expected_elems);
+    if (host.empty()) return false;
+    std::vector<__half> f16(expected_elems);
+    for (size_t i = 0; i < expected_elems; ++i)
+        f16[i] = __float2half(host[i]);
+    cudaError_t err = cudaMalloc(&dev, expected_elems * sizeof(__half));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[talker_cuda] cudaMalloc(%s) failed: %s\n",
+                name, cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpy(dev, f16.data(), expected_elems * sizeof(__half),
+                      cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[talker_cuda] cudaMemcpy(%s) failed: %s\n",
+                name, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool upload_tensor_f32(ggml_context *ggml_ctx, const char *name,
+                        size_t expected_elems, void *&dev) {
+    std::vector<float> host = load_gguf_tensor_f32(ggml_ctx, name,
+                                                    expected_elems);
+    if (host.empty()) return false;
+    cudaError_t err = cudaMalloc(&dev, expected_elems * sizeof(float));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[talker_cuda] cudaMalloc(%s) failed: %s\n",
+                name, cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpy(dev, host.data(), expected_elems * sizeof(float),
+                      cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[talker_cuda] cudaMemcpy(%s) failed: %s\n",
+                name, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // dtor / setters
@@ -262,12 +350,52 @@ bool TalkerCudaEngine::init_from_gguf(const std::string &gguf_path,
         }
     }
 
-    // ---- Allocate per-layer weight slots; the actual cudaMemcpy of each
-    //      projection happens in Phase 2.2 once we wire ggml_get_tensor +
-    //      shape validation. This scaffold stops short of touching device
-    //      memory for the weights so a fresh build on GB10 can validate the
-    //      handle/stream/RoPE plumbing alone.
+    // ---- Per-layer weight upload (Phase 2.2). Mirrors the Ascend reference's
+    //      `load_proj_weight` / `upload_tensor_f32` two-helper pattern: every
+    //      matmul weight goes up as F16 (bit-cast on host, single
+    //      cudaMemcpy), every norm gamma goes up as F32. Tensor names
+    //      match the GGUF schema emitted by `tools/qwen_tts/export_talker_llama.py`.
     layer_w_.resize(n_layers_);
+    {
+        char name[128];
+        bool ok = true;
+        for (int il = 0; il < n_layers_ && ok; ++il) {
+            auto &lw = layer_w_[il];
+#define TFMT(fmt) (snprintf(name, sizeof(name), fmt, il), name)
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.attn_q.weight"),
+                                          (size_t)q_dim_  * n_embd_, lw.q_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.attn_k.weight"),
+                                          (size_t)kv_dim_ * n_embd_, lw.k_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.attn_v.weight"),
+                                          (size_t)kv_dim_ * n_embd_, lw.v_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.attn_output.weight"),
+                                          (size_t)n_embd_ * q_dim_,  lw.o_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.ffn_gate.weight"),
+                                          (size_t)inter_  * n_embd_, lw.gate_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.ffn_up.weight"),
+                                          (size_t)inter_  * n_embd_, lw.up_proj_w);
+            ok = ok && upload_tensor_f16(ggml_ctx, TFMT("blk.%d.ffn_down.weight"),
+                                          (size_t)n_embd_ * inter_,  lw.down_proj_w);
+
+            ok = ok && upload_tensor_f32(ggml_ctx, TFMT("blk.%d.attn_q_norm.weight"),
+                                          (size_t)head_dim_, lw.q_norm_w);
+            ok = ok && upload_tensor_f32(ggml_ctx, TFMT("blk.%d.attn_k_norm.weight"),
+                                          (size_t)head_dim_, lw.k_norm_w);
+            ok = ok && upload_tensor_f32(ggml_ctx, TFMT("blk.%d.attn_norm.weight"),
+                                          (size_t)n_embd_,   lw.input_ln_w);
+            ok = ok && upload_tensor_f32(ggml_ctx, TFMT("blk.%d.ffn_norm.weight"),
+                                          (size_t)n_embd_,   lw.post_ln_w);
+#undef TFMT
+        }
+        ok = ok && upload_tensor_f32(ggml_ctx, "output_norm.weight",
+                                      (size_t)n_embd_, final_norm_w_dev_);
+        if (!ok) {
+            fprintf(stderr, "[talker_cuda] weight upload FAILED\n");
+            gguf_free(gguf_ctx);
+            ggml_free(ggml_ctx);
+            return false;
+        }
+    }
 
     // ---- Pre-alloc activation scratch (S=1) ------------------------------
     const size_t f16_n_embd = (size_t)n_embd_ * sizeof(__half);
@@ -397,27 +525,228 @@ void TalkerCudaEngine::build_causal_mask_() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-token forward — Phase 2.2 deliverable. Stub for now.
+// Per-token forward — Phase 2.2 (S=1 decode body).
+//
+// The per-layer op sequence mirrors the Ascend reference (talker_cann_engine
+// run_decode_body_) one-for-one:
+//   pre_norm -> Q/K/V proj -> QK-norm -> RoPE Q/K -> KV cache write
+//     -> GQA attention -> O proj -> residual
+//   ffn_norm -> gate proj + up proj -> SwiGLU -> down proj -> residual
+// then a final RmsNorm and an F16->F32 cast into output_stage_f32_dev_.
+//
+// Shape conventions:
+//   weights are stored row-major [out, in] in the GGUF and uploaded
+//   bit-cast to F16. cuBLAS treats them as column-major [in, out] of the
+//   same bytes, so we use op_A = T (transpose) when computing y = W @ x:
+//     y_col[out,1] = (W_col[in,out])^T @ x_col[in,1]
+//
+// All ops issue on stream_; the inner loop has no host syncs.
 // ---------------------------------------------------------------------------
 
-void TalkerCudaEngine::run_decode_ops_(int /*pos*/) {
-    fprintf(stderr,
-            "[talker_cuda] run_decode_ops_ not yet implemented (Phase 2.2)\n");
-    std::abort();
+namespace {
+
+// Helper: y[out] = W[out, in] @ x[in], all F16. W is stored row-major
+// [out, in] which cuBLAS sees as column-major [in, out] -> we use op_A = T.
+// Compute type is F32 (alpha/beta MUST be float per cuBLAS doc); I/O F16.
+inline cublasStatus_t gemm_rowmajor_matvec_f16(cublasHandle_t cublas,
+                                                 const __half *W,
+                                                 const __half *x,
+                                                 __half *y,
+                                                 int out, int in_dim) {
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    // cuBLAS column-major:
+    //   C[out, 1] = alpha * op(A)[out, in] @ op(B)[in, 1] + beta * C
+    //   op(A) = T over A_storage [in, out] with lda = in.
+    //   B = x with ldb = in. C = y with ldc = out. m = out, n = 1, k = in.
+    return cublasGemmEx(
+        cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        /*m=*/out, /*n=*/1, /*k=*/in_dim,
+        &alpha,
+        W, CUDA_R_16F, /*lda=*/in_dim,
+        x, CUDA_R_16F, /*ldb=*/in_dim,
+        &beta,
+        y, CUDA_R_16F, /*ldc=*/out,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-void TalkerCudaEngine::forward_decode(const float * /*input_embed*/,
-                                       int /*pos*/, float * /*hidden_out*/) {
-    fprintf(stderr,
-            "[talker_cuda] forward_decode not yet implemented (Phase 2.2)\n");
-    std::abort();
+}  // namespace
+
+void TalkerCudaEngine::run_decode_ops_(int pos) {
+    // Per-position cos/sin row pointers into the precomputed RoPE table.
+    const __half *rope_cos_row = (const __half *)rope_cos_dev_ +
+                                  (size_t)pos * head_dim_;
+    const __half *rope_sin_row = (const __half *)rope_sin_dev_ +
+                                  (size_t)pos * head_dim_;
+
+    const int seq_len_total = pos + 1;
+    const float inv_sqrt_d  = 1.0f / std::sqrt((float)head_dim_);
+
+    for (int il = 0; il < n_layers_; ++il) {
+        const auto &lw = layer_w_[il];
+
+        // residual <- cur (D2D F16 copy).
+        cudaMemcpyAsync(residual_dev_, cur_dev_,
+                         (size_t)n_embd_ * sizeof(__half),
+                         cudaMemcpyDeviceToDevice, stream_);
+
+        // 1. Input RmsNorm (F16 x, F32 gamma) -> normed.
+        launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                                 (const float *)lw.input_ln_w,
+                                 (__half *)normed_dev_,
+                                 /*rows=*/1, /*cols=*/n_embd_, eps_, stream_);
+
+        // 2. Q/K/V projections.
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.q_proj_w, (const __half *)normed_dev_,
+            (__half *)q_dev_, q_dim_,  n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.k_proj_w, (const __half *)normed_dev_,
+            (__half *)k_dev_, kv_dim_, n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.v_proj_w, (const __half *)normed_dev_,
+            (__half *)v_dev_, kv_dim_, n_embd_);
+
+        // 3. QK-norm (per-head RmsNorm; shared gamma [head_dim]). In place.
+        launch_rmsnorm_f16_g32((const __half *)q_dev_,
+                                 (const float *)lw.q_norm_w,
+                                 (__half *)q_dev_,
+                                 /*rows=*/n_heads_, /*cols=*/head_dim_,
+                                 eps_, stream_);
+        launch_rmsnorm_f16_g32((const __half *)k_dev_,
+                                 (const float *)lw.k_norm_w,
+                                 (__half *)k_dev_,
+                                 /*rows=*/n_kv_, /*cols=*/head_dim_,
+                                 eps_, stream_);
+
+        // 4a. RoPE on Q (writes to attn_out_dev_ — non-aliasing).
+        launch_rope_neox_f16((const __half *)q_dev_,
+                              rope_cos_row, rope_sin_row,
+                              (__half *)attn_out_dev_,
+                              n_heads_, head_dim_, stream_);
+
+        // 4b. RoPE on K -> directly into KV cache slot at this `pos`.
+        __half *k_slot = (__half *)k_cache_dev_[il] + (size_t)pos * kv_dim_;
+        launch_rope_neox_f16((const __half *)k_dev_,
+                              rope_cos_row, rope_sin_row,
+                              k_slot,
+                              n_kv_, head_dim_, stream_);
+
+        // 5. V -> KV cache slot.
+        __half *v_slot = (__half *)v_cache_dev_[il] + (size_t)pos * kv_dim_;
+        cudaMemcpyAsync(v_slot, v_dev_, (size_t)kv_dim_ * sizeof(__half),
+                         cudaMemcpyDeviceToDevice, stream_);
+
+        // 6. GQA attention (S=1 decode). Q comes from attn_out_dev_ (post-RoPE);
+        //    output overwrites q_dev_ as a contiguous [n_heads, head_dim]
+        //    so the next O projection sees a tightly packed buffer.
+        launch_attn_decode_gqa_f16(
+            (const __half *)attn_out_dev_,
+            (const __half *)k_cache_dev_[il],
+            (const __half *)v_cache_dev_[il],
+            (__half *)q_dev_,
+            seq_len_total, n_heads_, n_kv_, head_dim_, inv_sqrt_d,
+            stream_);
+
+        // 7. O projection: o_out = W_o @ q_attn.
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.o_proj_w, (const __half *)q_dev_,
+            (__half *)o_out_dev_, n_embd_, q_dim_);
+
+        // 8. cur = residual + o_out.
+        launch_add_f16((const __half *)residual_dev_,
+                        (const __half *)o_out_dev_,
+                        (__half *)cur_dev_, n_embd_, stream_);
+
+        // residual <- cur (for FFN).
+        cudaMemcpyAsync(residual_dev_, cur_dev_,
+                         (size_t)n_embd_ * sizeof(__half),
+                         cudaMemcpyDeviceToDevice, stream_);
+
+        // 9. Post-attention RmsNorm.
+        launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                                 (const float *)lw.post_ln_w,
+                                 (__half *)normed_dev_,
+                                 /*rows=*/1, /*cols=*/n_embd_, eps_, stream_);
+
+        // 10. FFN gate + up projections (parallelizable; same input).
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.gate_proj_w, (const __half *)normed_dev_,
+            (__half *)gate_dev_, inter_, n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.up_proj_w, (const __half *)normed_dev_,
+            (__half *)up_dev_, inter_, n_embd_);
+
+        // SwiGLU: gate <- silu(gate) * up.
+        launch_swiglu_f16((const __half *)gate_dev_,
+                           (const __half *)up_dev_,
+                           (__half *)gate_dev_, inter_, stream_);
+
+        // 11. Down projection: ffn_out = W_down @ swiglu.
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.down_proj_w, (const __half *)gate_dev_,
+            (__half *)ffn_out_dev_, n_embd_, inter_);
+
+        // 12. cur = residual + ffn_out.
+        launch_add_f16((const __half *)residual_dev_,
+                        (const __half *)ffn_out_dev_,
+                        (__half *)cur_dev_, n_embd_, stream_);
+    }
+
+    // Final RmsNorm.
+    launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                             (const float *)final_norm_w_dev_,
+                             (__half *)normed_dev_,
+                             /*rows=*/1, /*cols=*/n_embd_, eps_, stream_);
+
+    // F16 normed -> F32 staging.
+    launch_cast_f16_to_f32((const __half *)normed_dev_,
+                             (float *)output_stage_f32_dev_,
+                             n_embd_, stream_);
+}
+
+void TalkerCudaEngine::forward_decode(const float *input_embed,
+                                       int pos, float *hidden_out) {
+    if (!ready_) {
+        fprintf(stderr, "[talker_cuda] forward_decode called before init\n");
+        std::abort();
+    }
+    if (pos < 0 || pos >= MAX_SEQ) {
+        fprintf(stderr, "[talker_cuda] forward_decode: pos %d out of range [0,%d)\n",
+                pos, MAX_SEQ);
+        std::abort();
+    }
+
+    // 1. Upload F32 input embedding to staging (sync H2D — small, off the
+    //    inner loop). Then cast F32 -> F16 cur_dev_ on stream_.
+    cudaMemcpyAsync(input_stage_f32_dev_, input_embed,
+                     (size_t)n_embd_ * sizeof(float),
+                     cudaMemcpyHostToDevice, stream_);
+    launch_cast_f32_to_f16((const float *)input_stage_f32_dev_,
+                             (__half *)cur_dev_, n_embd_, stream_);
+
+    // 2. Run the 28-layer body. All ops on stream_.
+    run_decode_ops_(pos);
+
+    // 3. D2H download of F32 output. Synchronizes so the caller can read
+    //    `hidden_out` immediately (this matches the Ascend
+    //    forward_decode_fetch behaviour for the eager / non-graph path).
+    cudaMemcpyAsync(hidden_out, output_stage_f32_dev_,
+                     (size_t)n_embd_ * sizeof(float),
+                     cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+
+    if (kv_cache_len_ < pos + 1) kv_cache_len_ = pos + 1;
 }
 
 void TalkerCudaEngine::forward_prefill(const float * /*input_embeds*/,
                                         int /*seq_len*/, int /*start_pos*/,
                                         float * /*last_hidden_out*/) {
     fprintf(stderr,
-            "[talker_cuda] forward_prefill not yet implemented (Phase 2.2)\n");
+            "[talker_cuda] forward_prefill not yet implemented (Phase 2.2 — "
+            "decode-only deliverable; prefill lands in Phase 2.3)\n");
     std::abort();
 }
 
