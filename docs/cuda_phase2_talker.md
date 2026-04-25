@@ -59,6 +59,30 @@ cmake --build build -j --target test_talker_cuda_init` succeeds on GB10 #1,
 binary runs and prints `[talker_cuda] Phase 2.1 scaffold init OK …` for the
 canonical Talker GGUF.
 
+**Phase 2.1 gate result — 2026-04-22 GB10 #1 (zgx-3675, sm_121a, CUDA 13.0.88)**:
+
+```
+$ ./bin/test_talker_cuda_init ~/ominix-cuda/models/ggml-vocab-llama-bpe.gguf
+[talker_cuda] Phase 2.1 scaffold init OK  device=0  n_embd=2048  n_heads=16  \
+    n_kv=8  head_dim=128  inter=6144  n_layers=28  MAX_SEQ=4096  MAX_PREFILL=512
+[smoke] Phase 2.1 scaffold init PASS  ready=1  use_cuda_graphs=0  \
+    use_int8=0  use_fp8=0
+exit=0
+```
+
+Process tree during run contains only `test_talker_cuda_init` — **no Python**.
+
+CMake auto-promoted `CMAKE_CUDA_ARCHITECTURES=121` to `121a` (Blackwell-A).
+nvcc options applied: `-O3 -use_fast_math -extended-lambda -compress-mode=size`.
+`ldd` resolves cleanly against `libcudart.so.13`, `libcublas.so.13`, libgcc/libc.
+
+Build host: GB10 #1 (zgx-3675 aarch64 Grace + Blackwell, 119 GB unified mem).
+Build wall: ~3 min from cold cmake (most spent compiling ggml-cuda's
+`fattn-tile-instance-*` template instances; subsequent reconfigure re-link
+< 5s thanks to cached object files).
+
+Gate: PASS. Phase 2.2 cleared to start.
+
 ### Phase 2.2 — Per-token forward (PENDING)
 ### Phase 2.3 — KV cache + autoregressive loop (PENDING)
 ### Phase 2.4 — Codec C++ via cuDNN (PENDING)

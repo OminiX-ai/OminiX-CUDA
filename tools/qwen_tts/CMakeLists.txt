@@ -505,7 +505,9 @@ if(QWEN_TTS_CUDA)
     target_link_libraries     (test_talker_cuda_init PRIVATE Threads::Threads
                                                               CUDA::cudart CUDA::cublas)
     target_include_directories(test_talker_cuda_init PUBLIC  .)
-    target_include_directories(test_talker_cuda_init PRIVATE ../.. ../../vendor native)
+    target_include_directories(test_talker_cuda_init PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)   # talker.h includes <llama.h>
     target_compile_definitions(test_talker_cuda_init PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_compile_features   (test_talker_cuda_init PRIVATE cxx_std_17)
     if(OMINIX_CUDA_USE_CUDNN)
