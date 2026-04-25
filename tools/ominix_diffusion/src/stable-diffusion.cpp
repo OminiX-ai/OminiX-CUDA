@@ -244,6 +244,21 @@ __STATIC_INLINE__ struct ggml_tensor* cfg_build_attention_mask(struct ggml_conte
     return mask;
 }
 
+__STATIC_INLINE__ size_t cfg_attention_mask_nbytes(int64_t s_cond,
+                                                  int64_t s_uncond,
+                                                  int64_t s_max,
+                                                  int64_t n_non_text_tokens,
+                                                  int64_t n_head) {
+    if (s_cond == s_uncond) {
+        return 0;
+    }
+    const int64_t L_total = s_max + n_non_text_tokens;
+    const int64_t N       = 2;
+    return ggml_row_size(GGML_TYPE_F32, L_total) *
+           static_cast<size_t>(L_total) *
+           static_cast<size_t>(n_head * N);
+}
+
 // HBM budget guard for the mask: fall back to sequential when the mask alone
 // would exceed this many bytes. Keeps us within the +2 GiB activation budget
 // called out in docs/qie_q4_cfg_batching.md §6 even at 1024×1024.
@@ -2371,22 +2386,23 @@ public:
                 int64_t non_text_tokens = cfg_count_non_text_tokens_qwen_image(noised_input, ref_latents, /*patch_size=*/2);
                 // Qwen-Image has 24 attention heads (see QwenImageParams::num_attention_heads).
                 constexpr int64_t kQwenImageNumHeads = 24;
-                struct ggml_tensor* attn_mask =
-                    cfg_build_attention_mask(work_ctx, s_cond, s_uncond, s_max, non_text_tokens, kQwenImageNumHeads);
-                // Budget guard: at high resolution the 48-slot mask footprint dominates. Fall
-                // back to sequential if the mask would blow past CFG_BATCHED_MAX_MASK_BYTES.
-                const bool mask_over_budget =
-                    attn_mask != nullptr &&
-                    ggml_nbytes(attn_mask) > CFG_BATCHED_MAX_MASK_BYTES;
+                // Budget guard: at high resolution the 48-slot mask footprint dominates.
+                // Check the footprint before allocation so an oversized mask falls back
+                // cleanly instead of aborting in ggml_new_tensor_4d().
+                const size_t attn_mask_nbytes =
+                    cfg_attention_mask_nbytes(s_cond, s_uncond, s_max, non_text_tokens, kQwenImageNumHeads);
+                const bool mask_over_budget = attn_mask_nbytes > CFG_BATCHED_MAX_MASK_BYTES;
                 if (mask_over_budget) {
                     static bool mask_budget_logged_once = false;
                     if (!mask_budget_logged_once) {
                         mask_budget_logged_once = true;
                         LOG_WARN("OMINIX_CFG_BATCHED=1: mask footprint %.1f MiB > %.1f MiB budget — falling back to sequential this run.",
-                                 (double)ggml_nbytes(attn_mask) / (1024.0 * 1024.0),
+                                 (double)attn_mask_nbytes / (1024.0 * 1024.0),
                                  (double)CFG_BATCHED_MAX_MASK_BYTES / (1024.0 * 1024.0));
                     }
                 } else {
+                    struct ggml_tensor* attn_mask =
+                        cfg_build_attention_mask(work_ctx, s_cond, s_uncond, s_max, non_text_tokens, kQwenImageNumHeads);
                     struct ggml_tensor* x_batched = cfg_dup_on_ne3(work_ctx, noised_input);
                     struct ggml_tensor* t_batched = cfg_dup_timesteps(work_ctx, timesteps);
                     std::vector<ggml_tensor*> refs_batched;
