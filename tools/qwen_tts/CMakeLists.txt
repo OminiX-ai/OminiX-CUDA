@@ -43,6 +43,23 @@ if(QWEN_TTS_ASCENDC)
     message(FATAL_ERROR "QWEN_TTS_ASCENDC is not available in ominix-cuda")
 endif()
 
+# Native CUDA Talker engine (Phase 2 of the OminiX-CUDA contract). Default
+# OFF on hosts without CUDA. Mirror of QWEN_TTS_CP_CANN on the Ascend side:
+# when ON, the executable + shared lib pull in the new
+# tools/qwen_tts/native/talker_cuda_engine.* sources and link cuBLAS (and
+# cuDNN if the user opts into FMHA helpers via OMINIX_CUDA_USE_CUDNN).
+option(QWEN_TTS_CUDA "Build native CUDA Talker engine (Phase 2)" OFF)
+if(QWEN_TTS_CUDA)
+    if(NOT GGML_CUDA)
+        message(WARNING "QWEN_TTS_CUDA=ON requires -DGGML_CUDA=ON for matching "
+                        "ggml-cuda backend; building anyway since the native "
+                        "engine dispatches cuBLAS directly")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "qwen_tts: native CUDA Talker engine ENABLED "
+                   "(CUDA ${CUDAToolkit_VERSION})")
+endif()
+
 # llama.cpp fallback Talker path: optional, default OFF. When OFF, the
 # `--llama_fallback` runtime flag prints a clear error and exits; the
 # native TalkerCannEngine is the only backbone path. When ON, llama.cpp
@@ -62,6 +79,13 @@ set(KISSFFT_SRC
     ${KISSFFT_DIR}/kiss_fftr.c
 )
 list(APPEND SRC_FILES ${KISSFFT_SRC})
+
+# Native CUDA engine sources (Phase 2 of OminiX-CUDA contract).
+if(QWEN_TTS_CUDA)
+    list(APPEND SRC_FILES
+        native/talker_cuda_engine.cpp
+    )
+endif()
 
 add_executable(${TARGET} ${SRC_FILES})
 
@@ -94,6 +118,16 @@ if(QWEN_TTS_ASCENDC)
         ${CMAKE_BINARY_DIR}/auto_gen/qwen_tts_ascendc_kernels
         ${CMAKE_BINARY_DIR}/include/qwen_tts_ascendc_kernels)
     target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_ASCENDC=1)
+endif()
+if(QWEN_TTS_CUDA)
+    target_link_libraries     (${TARGET} PRIVATE
+        CUDA::cudart CUDA::cublas)
+    target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_include_directories(${TARGET} PRIVATE native)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (${TARGET} PRIVATE CUDA::cudnn)
+        target_compile_definitions(${TARGET} PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
 endif()
 target_include_directories(${TARGET} PUBLIC  .)
 target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR})
@@ -162,6 +196,11 @@ if(QWEN_TTS_CP_CANN)
         talker_cann_engine.cpp
     )
 endif()
+if(QWEN_TTS_CUDA)
+    list(APPEND API_SRC_FILES
+        native/talker_cuda_engine.cpp
+    )
+endif()
 
 add_library(${API_TARGET} SHARED ${API_SRC_FILES})
 
@@ -198,6 +237,16 @@ if(QWEN_TTS_ASCENDC)
         ${CMAKE_BINARY_DIR}/auto_gen/qwen_tts_ascendc_kernels
         ${CMAKE_BINARY_DIR}/include/qwen_tts_ascendc_kernels)
     target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_ASCENDC=1)
+endif()
+if(QWEN_TTS_CUDA)
+    target_link_libraries     (${API_TARGET} PRIVATE
+        CUDA::cudart CUDA::cublas)
+    target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_include_directories(${API_TARGET} PRIVATE native)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (${API_TARGET} PRIVATE CUDA::cudnn)
+        target_compile_definitions(${API_TARGET} PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -434,4 +483,34 @@ if(QWEN_TTS_CP_CANN)
         endif()
         message(STATUS "qwen_tts: G1 aclGraph smoke harness ENABLED")
     endif()
+endif()
+
+# -------------------------------------------------------------------------
+# OminiX-CUDA Phase 2.1 smoke harness — test_talker_cuda_init
+#
+# Builds a tiny standalone executable that constructs `TalkerCudaEngine`,
+# pulls TalkerConfig defaults, calls init_from_gguf() against a path passed
+# on argv[1] (or `--noweights` to skip the file open and exercise scratch
+# alloc + RoPE table build alone), and prints a pass/fail line.
+#
+# Phase 2.1 deliverable: this binary builds + runs on GB10 #1, prints
+# scaffold-init OK with the configured 28/16/8/2048 dims and exits 0.
+# -------------------------------------------------------------------------
+if(QWEN_TTS_CUDA)
+    add_executable(test_talker_cuda_init
+        native/test_talker_cuda_init.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_talker_cuda_init PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_talker_cuda_init PRIVATE Threads::Threads
+                                                              CUDA::cudart CUDA::cublas)
+    target_include_directories(test_talker_cuda_init PUBLIC  .)
+    target_include_directories(test_talker_cuda_init PRIVATE ../.. ../../vendor native)
+    target_compile_definitions(test_talker_cuda_init PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_talker_cuda_init PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_talker_cuda_init PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_talker_cuda_init PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.1 smoke harness ENABLED")
 endif()
