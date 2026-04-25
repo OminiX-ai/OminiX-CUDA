@@ -398,3 +398,79 @@ Interpretation:
 Next:
 
 - Proceed to CacheDIT. For the final stack, benchmark both `torch.compile` alone and `torch.compile + --cfg-batching --cfg-batching-no-mask-padding`; Step 1 no-mask may compound with compile even though it was small in eager mode.
+
+### Step 4 - CacheDIT
+
+Date: 2026-04-25 PDT
+
+Harness changes:
+
+- Installed remote `cache-dit==1.3.5`; Torch remained `2.13.0.dev20260424+cu130`.
+- Added opt-in CacheDIT flags to `tools/qwen_image_edit/cuda/bench_qie_diffusers.py` / remote `~/qie_cuda/src/bench_qie_diffusers.py`.
+- Flags: `--cache-dit`, `--cache-dit-threshold`, `--cache-dit-fn-blocks`, `--cache-dit-bn-blocks`, `--cache-dit-warmup-steps`, `--cache-dit-max-cached-steps`, and `--cache-dit-max-continuous-cached-steps`.
+- The current CacheDIT API is `cache_dit.enable_cache(pipe, cache_config=DBCacheConfig(...))`, not `cache_pipeline(...)`.
+- Metrics now include `cache_dit_summary` from `cache_dit.summary(pipe, logging=False)`, including cached steps, CFG cached steps, and residual diffs.
+
+Install/API receipts:
+
+- Install log: `~/qie_cuda/logs/phase2_cachedit_install.log`
+- Package version: `cache-dit==1.3.5`
+- API compatibility: `QwenImageEditPlusPipeline is officially supported by cache-dit` appears in the smoke log.
+
+256x256 / 2-step smoke:
+
+| Variant | Threshold | Warmup steps | Inference wall | Transformer call mean | Cached steps | Verdict |
+|---|---:|---:|---:|---:|---|---|
+| Phase 0 BF16 smoke | N/A | N/A | 9.378 s | 1.808 s | N/A | Baseline smoke |
+| CacheDIT smoke | 0.08 | 0 | 9.507 s | 1.834 s | `[]` | PASS mechanical; cache path compatible, no step under threshold |
+
+Smoke receipts:
+
+- Log: `~/qie_cuda/logs/phase2_cachedit_smoke_256_2step.log`
+- Metrics: `~/qie_cuda/logs/phase2_cachedit_smoke_256_2step_metrics.json`
+- Output: `~/qie_cuda/outputs/phase2_cachedit_smoke_256_2step.png`
+
+Canonical 1024x1024 / 20-step threshold sweep:
+
+| Variant | Threshold | Cached steps | Inference wall | Step / grouped mean | Transformer call mean | Peak allocated | Eye check | Verdict |
+|---|---:|---|---:|---:|---:|---:|---|---|
+| Phase 1 BF16 baseline | N/A | N/A | 141.438 s | 6.926 s | 3.463 s | 57.970 GiB | PASS | Baseline |
+| CacheDIT | 0.05 | `[]` | 140.554 s | 6.910 s | 3.455 s | 58.160 GiB | PASS | No useful caching |
+| CacheDIT | 0.08 | `[11, 13]` | 129.780 s | 6.349 s | 3.175 s | 58.160 GiB | PASS | PASS, -8.2% wall |
+| CacheDIT | 0.10 | `[9, 11, 13, 15]` | 117.530 s | 5.737 s | 2.869 s | 58.160 GiB | PASS | PASS, -16.9% wall |
+| CacheDIT | 0.15 | `[8, 10, 12, 13, 15]` | 111.822 s | 5.454 s | 2.727 s | 58.160 GiB | PASS | Best standalone, -20.9% wall |
+
+Canonical receipts:
+
+- `0.05` log: `~/qie_cuda/logs/phase2_cachedit_r005_1024_20step.log`
+- `0.05` metrics: `~/qie_cuda/logs/phase2_cachedit_r005_1024_20step_metrics.json`
+- `0.05` output: `~/qie_cuda/outputs/phase2_cachedit_r005_1024_20step.png`
+- `0.08` log: `~/qie_cuda/logs/phase2_cachedit_r008_1024_20step.log`
+- `0.08` metrics: `~/qie_cuda/logs/phase2_cachedit_r008_1024_20step_metrics.json`
+- `0.08` output: `~/qie_cuda/outputs/phase2_cachedit_r008_1024_20step.png`
+- `0.10` log: `~/qie_cuda/logs/phase2_cachedit_r010_1024_20step.log`
+- `0.10` metrics: `~/qie_cuda/logs/phase2_cachedit_r010_1024_20step_metrics.json`
+- `0.10` output: `~/qie_cuda/outputs/phase2_cachedit_r010_1024_20step.png`
+- `0.15` log: `~/qie_cuda/logs/phase2_cachedit_r015_1024_20step.log`
+- `0.15` metrics: `~/qie_cuda/logs/phase2_cachedit_r015_1024_20step_metrics.json`
+- `0.15` output: `~/qie_cuda/outputs/phase2_cachedit_r015_1024_20step.png`
+
+Visual gate:
+
+- All threshold outputs are recognizable black-and-white cats and pass the locked eye check.
+- Pixel diff versus Phase 1:
+  - `0.05`: mean abs `[0.0000, 0.0000, 0.0000]`, RMSE `[0.0000, 0.0000, 0.0000]` because no steps cached.
+  - `0.08`: mean abs `[0.4032, 0.4242, 0.4040]`, RMSE `[0.6450, 0.6674, 0.6450]`.
+  - `0.10`: mean abs `[0.7908, 0.7962, 0.7866]`, RMSE `[0.9857, 0.9990, 0.9826]`.
+  - `0.15`: mean abs `[1.1042, 1.1015, 1.0882]`, RMSE `[1.3051, 1.3093, 1.2828]`.
+
+Interpretation:
+
+- CacheDIT is compatible with Qwen-Image-Edit-2509 and gives a real speedup, but it does not reach the hoped 30-60% step skipping on the canonical cat.
+- Best standalone threshold is `0.15`: it caches 5 of 20 denoise steps per CFG stream and cuts wall from `141.438 s` to `111.822 s` (`-20.9%`).
+- Cached steps still appear as transformer calls in the harness because the timing wrapper surrounds the patched transformer forward. Cached calls are visible as about `0.47 s` grouped calls, versus about `6.9-7.0 s` for full steps.
+- Peak memory is effectively unchanged; CacheDIT is a latency lever, not a memory lever.
+
+Next:
+
+- Run Step 5 stacked benchmarks. Current standalone candidates are `--torch-compile --compile-warmup-runs 1`, CacheDIT `--cache-dit --cache-dit-threshold 0.15`, and possibly `--cfg-batching --cfg-batching-no-mask-padding`. Exclude FP8 from the performance stack unless explicitly testing interactions, because FP8 alone is red.

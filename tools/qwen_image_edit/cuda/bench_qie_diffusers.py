@@ -70,6 +70,50 @@ def clone_tensors(value):
     return value
 
 
+def to_jsonable(value):
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def collect_cache_dit_summary(pipe):
+    try:
+        import cache_dit
+
+        stats = cache_dit.summary(pipe, logging=False)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    summary = []
+    for stat in stats:
+        summary.append(
+            {
+                "cached_steps": to_jsonable(getattr(stat, "cached_steps", [])),
+                "cfg_cached_steps": to_jsonable(getattr(stat, "cfg_cached_steps", [])),
+                "accumulated_cached_steps": getattr(stat, "accumulated_cached_steps", 0),
+                "cfg_accumulated_cached_steps": getattr(stat, "cfg_accumulated_cached_steps", 0),
+                "accumulated_executed_steps": getattr(stat, "accumulated_executed_steps", 0),
+                "accumulated_transformer_executed_steps": getattr(
+                    stat, "accumulated_transformer_executed_steps", 0
+                ),
+                "residual_diffs": to_jsonable(getattr(stat, "residual_diffs", {})),
+                "cfg_residual_diffs": to_jsonable(getattr(stat, "cfg_residual_diffs", {})),
+                "pruned_ratio": getattr(stat, "pruned_ratio", None),
+                "cfg_pruned_ratio": getattr(stat, "cfg_pruned_ratio", None),
+                "cache_options": to_jsonable(getattr(stat, "cache_options", {})),
+            }
+        )
+    return summary
+
+
 def parse_module_list(value):
     if value is None:
         return None
@@ -443,6 +487,13 @@ def main():
         default=0,
         help="Run same-shape generations before the measured run. Useful because torch.compile is lazy.",
     )
+    parser.add_argument("--cache-dit", action="store_true")
+    parser.add_argument("--cache-dit-threshold", type=float, default=0.08)
+    parser.add_argument("--cache-dit-fn-blocks", type=int, default=8)
+    parser.add_argument("--cache-dit-bn-blocks", type=int, default=0)
+    parser.add_argument("--cache-dit-warmup-steps", type=int, default=8)
+    parser.add_argument("--cache-dit-max-cached-steps", type=int, default=-1)
+    parser.add_argument("--cache-dit-max-continuous-cached-steps", type=int, default=-1)
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser()
@@ -493,6 +544,30 @@ def main():
     t2 = time.perf_counter()
     pipe.set_progress_bar_config(disable=args.disable_progress)
 
+    cache_dit_config = None
+    cache_dit_enable_wall = None
+    if args.cache_dit:
+        import cache_dit
+        from cache_dit import DBCacheConfig
+
+        cache_dit_config = {
+            "Fn_compute_blocks": args.cache_dit_fn_blocks,
+            "Bn_compute_blocks": args.cache_dit_bn_blocks,
+            "residual_diff_threshold": args.cache_dit_threshold,
+            "max_warmup_steps": args.cache_dit_warmup_steps,
+            "max_cached_steps": args.cache_dit_max_cached_steps,
+            "max_continuous_cached_steps": args.cache_dit_max_continuous_cached_steps,
+            "num_inference_steps": args.steps,
+        }
+        cache_t0 = time.perf_counter()
+        pipe = cache_dit.enable_cache(pipe, cache_config=DBCacheConfig(**cache_dit_config))
+        cache_t1 = time.perf_counter()
+        cache_dit_enable_wall = cache_t1 - cache_t0
+        print(
+            f"CACHE_DIT_ENABLED wall_s={cache_dit_enable_wall:.6f} config={cache_dit_config}",
+            flush=True,
+        )
+
     compile_wrap_wall = None
     if args.torch_compile:
         compile_t0 = time.perf_counter()
@@ -530,6 +605,9 @@ def main():
         "torch_compile_fullgraph": args.torch_compile_fullgraph if args.torch_compile else None,
         "torch_compile_wrap_wall_s": compile_wrap_wall,
         "compile_warmup_runs": args.compile_warmup_runs,
+        "cache_dit": args.cache_dit,
+        "cache_dit_config": cache_dit_config,
+        "cache_dit_enable_wall_s": cache_dit_enable_wall,
         "seed": args.seed,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -660,6 +738,7 @@ def main():
             "transformer_grouped_steps": summarize(grouped_transformer_steps),
             "callback_step_deltas_s": callback_step_times,
             "callback_steps": summarize(callback_step_times),
+            "cache_dit_summary": collect_cache_dit_summary(pipe) if args.cache_dit else None,
             "peak_allocated_gib": bytes_to_gib(torch.cuda.max_memory_allocated()),
             "peak_reserved_gib": bytes_to_gib(torch.cuda.max_memory_reserved()),
         }
