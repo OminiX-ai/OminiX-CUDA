@@ -1316,3 +1316,99 @@ OMINIX_QIE_DECODE_ONLY_LATENT=/tmp/qie_q45_step4_latent.f32.bin \
     --sample-method euler --seed 42 \
     --output /tmp/qie_q45_step4_native_cat.png
 ```
+
+
+### §5.5.2 Step 4 smoke re-run — RED under `QIE_MATMUL_INNER_PRECISE=0` (F32-accumulator)
+
+Re-run on ac03 against fork HEAD `722d1cf9` with the 4.4d-wired
+matmul-precision env knobs forced to F32-accum. Hypothesis under test:
+9.5 GiB F16-fallback weight path (Q4_1 FFN-down + Q5_K layers 0/59)
+overflows at first matmul under default F16-accumulator.
+
+**Command (SIGHUP-proof, HBM lock held):**
+
+```
+nohup setsid bash -c '
+  touch /tmp/ac03_hbm_lock && \
+  cd ~/work/OminiX-Ascend/tools/probes/qie_q45_step4_full_denoise && \
+  QIE_MATMUL_INNER_PRECISE=0 QIE_MATMUL_CUBE_MATH=1 \
+  GGML_BUILD=$HOME/work/OminiX-Ascend/build-w1 \
+  GGML_CANN_QUANT_BF16=on \
+  bash build_and_run.sh 2>&1 | tee /tmp/qie_q45_step4_f32acc.log; \
+  rm -f /tmp/ac03_hbm_lock
+' < /dev/null > /dev/null 2>&1 &
+```
+
+**Env actually honored by native engine:**
+
+```
+[qie_native] dispatch_matmul_: QIE_MATMUL_INNER_PRECISE=0
+  (WQBMMv3 innerPrecise; 0=HIGH_PRECISION/F32-accum, 1=HIGH_PERFORMANCE/F16-accum)
+[qie_native] dispatch_matmul_: QIE_MATMUL_CUBE_MATH=1
+  (aclnnMm cubeMathType; 0=KEEP_DTYPE, 1=ALLOW_FP32_DOWN_PRECISION, 2=USE_FP16, 3=USE_HF32)
+```
+
+Env knobs are read at `denoise_full` entry and logged before the first
+dispatch, so the first forward runs with F32-accum WQBMMv3 +
+ALLOW_FP32_DOWN_PRECISION aclnnMm. No fall-through path.
+
+**Init:** identical footprint to §5.5 (1933 tensors, 9.51 GiB F16
+fallback, 7.14 GiB Q4, 17.93 GiB peak HBM, 101.4 s wall).
+
+**Denoise:** `denoise_full` 26.48 s wall (vs 24.32 s under F16-accum;
++8.9% cost for the wider accumulator, within noise). Per-step wall
+still flat: median 1184 ms across all 20 steps (F16-accum was 1149
+ms). Final out_latent stats are bit-pattern-identical to the §5.5 RED
+run: `mean=0 std=0 min/max=±1e+30 NaN=16384 inf=0`. 16384 out of 16384
+elements are the F32-NaN sentinel.
+
+**Verdict:** **RED** — unchanged from §5.5. F32 inner-accumulator on
+WQBMMv3 does NOT fix the step-0 NaN. This **falsifies** the
+"F16-accum overflow at first matmul" hypothesis.
+
+**Signal we just bought:**
+
+The NaN is not coming from the 910b cube unit's F16-accumulator. This
+is consistent with the Leak #2 per-op trace result
+(`docs/qie_leak2_per_op_trace.md`): that trace measured residual-stream
+growth to 1.1e5 (above F16's 65504 limit) by block 1, and proved that
+F32-residual cast at graph level does NOT reduce the F32-correct
+magnitudes — the overflow is in a **backend storage-time saturation**
+inside a CANN op output dtype, not in the inner accumulator.
+
+The matmul-output dtype on 910b (WQBMMv2/v3, per
+`aic-ascend910b-ops-info.json`) is F16/BF16-only. `INNER_PRECISE=0`
+promotes the *accumulator* to F32, but the *output cast* still lands
+in F16 (or BF16 under `GGML_CANN_QUANT_BF16=on`). Any residual
+magnitude > 65504 (F16) or > ~3.4e38 (BF16 range but with 8 fewer
+mantissa bits than F32) saturates at the output cast, regardless of
+inner precision.
+
+**Proposed next diagnostics (defer to agent #62 per Step 4 workplan):**
+
+1. Confirm `GGML_CANN_QUANT_BF16=on` is plumbed into the *native*
+   engine's `dispatch_matmul_` — the env var is in Path C #4's
+   backend path (ominix-diffusion-cli), not necessarily in the native
+   probe. If the native probe still emits F16 matmul outputs,
+   residuals > 65504 saturate at block 0. Audit
+   `tools/qwen_image_edit/native/image_diffusion_engine.cpp`
+   `dispatch_matmul_` for BF16 output selection.
+2. Insert a `nan_check` on the first matmul output (Q/K/V projection
+   of block 0, img stream) in the native probe — should pinpoint
+   which projection first saturates.
+3. If BF16 plumbing is already active: the Leak #2 residual-stream
+   magnitude (1.1e5 by block 1) still exceeds practical F16/BF16
+   stability. The only path is F32 residual *storage* end-to-end,
+   which in the native engine means promoting the residual-add
+   tensor + LayerNorm compute to F32 (analog of 4.4d F32-resid on
+   the aclnn side). Audit which residuals land F16 in
+   `build_graph_` / `denoise_full`.
+
+**Wall summary (Step 4c re-run, F32-accum):**
+init 101.4 s + denoise_full 26.5 s = 127.9 s total. Step 4d decode
+skipped (NaN latent → guaranteed black PNG, same as §5.5).
+
+**Logs / artifacts (ac03):**
+- `/tmp/qie_q45_step4_f32acc.log` — full smoke (45 lines)
+- `/tmp/qie_q45_step4_latent.f32.bin` — overwritten, still 16384
+  NaN (65536 B), same sentinel pattern
