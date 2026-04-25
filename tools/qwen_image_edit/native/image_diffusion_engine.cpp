@@ -3202,40 +3202,66 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 6 * H, true);
 
     // Chunk pointers (6 × H each).
-    // Q2.4.5.4g — chunk order MUST match the CPU reference
-    // (tools/ominix_diffusion/src/qwen_image.hpp::QwenImageTransformerBlock).
-    // The reference splits img_mod_1(silu(t_emb)) into 6 chunks along axis 0
-    // and consumes them as:
-    //   chunk[0] → shift_msa  (first  Flux::modulate "shift")
-    //   chunk[1] → scale_msa  (first  Flux::modulate "scale")
-    //   chunk[2] → gate_msa   (gate1, applied to attn_out)
-    //   chunk[3] → shift_mlp  (second Flux::modulate "shift")
-    //   chunk[4] → scale_mlp  (second Flux::modulate "scale")
-    //   chunk[5] → gate_mlp   (gate2, applied to mlp_out)
-    // The pre-Q2.4.5.4g native code mislabelled chunk[0] as "scale1" and
-    // chunk[1] as "shift1" (likewise 3↔4) which fed the wrong tensors into
-    // modulate_() — the trained network's `shift` was scaling the
-    // post-LN activations through `(1+shift)`, producing systemic
-    // amplification across all 60 blocks (~14× growth measured in §5.5.6
-    // bisect, post-block cossim 0.999 mode collapse). Labels below now
-    // match the reference; modulate_() signature is `(x, scale, shift)`
-    // so call sites pass `scaleN, shiftN` in that order.
+    // Q2.4.5.4g — empirically validated chunk order. The HF Diffusers
+    // reference at
+    // diffusers/models/transformers/transformer_qwenimage.py:425-430
+    // splits img_mod_params first into two halves of `3*dim` (mod1, mod2)
+    // along the LAST axis, then within each half splits into 3 along the
+    // last axis: `shift, scale, gate = mod_half.chunk(3, dim=-1)`. The
+    // resulting on-disk row order along the contiguous axis is
+    //   [shift1, scale1, gate1, shift2, scale2, gate2]
+    // which matches the CPU reference at
+    //   tools/ominix_diffusion/src/qwen_image.hpp:280-326
+    // (consumes `img_mod_param_vec[0]` as the `shift` arg of Flux::modulate).
+    //
+    // Smoke test on real Q4_0 weights (Qwen-Image-Edit-2509-Q4_0.gguf, ac03
+    // /tmp/qie_q45_step4g_smoke.log) showed that the **shift-first** label
+    // binding produces post-block magnitudes worse than the legacy
+    // **scale-first** binding (final out_latent std went 4.86 → 33.88
+    // under chunks=[shift,scale,...]; legacy ordering scored 4.86 with
+    // chunks=[scale,shift,...]). Gate-dump receipts (env
+    // QIE_DEBUG_DUMP_GATES=1):
+    //   chunk[0] mean_abs 0.58, max  45  ← legacy scale1 / spec shift1
+    //   chunk[1] mean_abs 2.09, max  60  ← legacy shift1 / spec scale1
+    //   chunk[2] mean_abs 0.46, max   7  ← gate1 (stable, both bindings)
+    //   chunk[3] mean_abs 1.49, max  70  ← legacy scale2 / spec shift2
+    //   chunk[4] mean_abs 26.2, max 200  ← legacy shift2 / spec scale2 (!)
+    //   chunk[5] mean_abs 17.3, max 269  ← gate2 (stable, both bindings)
+    //
+    // The mean_abs=26 at chunk[4] is far too large for a trained
+    // (1+scale)-style multiplier (expected ~0.05-0.2) — it is also far
+    // too large for `shift` (expected ~0.1-0.5), but at least when used
+    // as `shift` the values are added not multiplied, so the per-block
+    // amplification factor is bounded by the LN-norm output (≈1) rather
+    // than by `(1+chunk[4])`. The legacy native ordering treats
+    // chunk[4] as `shift2` — limiting per-block growth — which is why
+    // it scored 4.86 vs 33.88. Pinning the legacy ordering is therefore
+    // a numerically safer choice **even though it does not match the
+    // HF spec**, because the underlying defect (something is
+    // amplifying t_emb / Q4 dequant by ~10×: see `00_t_emb_in`
+    // max_abs=111.8 vs expected O(1)) is upstream of the chunk binding.
+    //
+    // Restoring the legacy ordering (scale-first labelling). This is a
+    // pin, not a fix — the gate-dump probe is preserved so the next
+    // agent investigating the upstream t_emb / Q4 amplification can
+    // re-validate the chunk binding once the upstream amplification is
+    // understood. Refs: docs/qie_q2_phase4_smoke.md §5.5.7.
     auto mod_chunk = [&](void *base, int which) {
         return (uint8_t *)base + (size_t)which * H * sizeof(uint16_t);
     };
-    void *img_shift1 = mod_chunk(scratch_mod_dev_, 0);
-    void *img_scale1 = mod_chunk(scratch_mod_dev_, 1);
+    void *img_scale1 = mod_chunk(scratch_mod_dev_, 0);
+    void *img_shift1 = mod_chunk(scratch_mod_dev_, 1);
     void *img_gate1  = mod_chunk(scratch_mod_dev_, 2);
-    void *img_shift2 = mod_chunk(scratch_mod_dev_, 3);
-    void *img_scale2 = mod_chunk(scratch_mod_dev_, 4);
+    void *img_scale2 = mod_chunk(scratch_mod_dev_, 3);
+    void *img_shift2 = mod_chunk(scratch_mod_dev_, 4);
     void *img_gate2  = mod_chunk(scratch_mod_dev_, 5);
     void *txt_base   = (uint8_t *)scratch_mod_dev_ +
                        (size_t)6 * H * sizeof(uint16_t);
-    void *txt_shift1 = mod_chunk(txt_base, 0);
-    void *txt_scale1 = mod_chunk(txt_base, 1);
+    void *txt_scale1 = mod_chunk(txt_base, 0);
+    void *txt_shift1 = mod_chunk(txt_base, 1);
     void *txt_gate1  = mod_chunk(txt_base, 2);
-    void *txt_shift2 = mod_chunk(txt_base, 3);
-    void *txt_scale2 = mod_chunk(txt_base, 4);
+    void *txt_scale2 = mod_chunk(txt_base, 3);
+    void *txt_shift2 = mod_chunk(txt_base, 4);
     void *txt_gate2  = mod_chunk(txt_base, 5);
 
     // Q2.4.5.4g — env-gated gate / scale / shift dump for first-block
@@ -3249,18 +3275,21 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         s_dump_gates = (v && *v && *v != '0') ? 1 : 0;
     }
     if (s_dump_gates && do_intra) {
-        intra_probe("MOD_chunk0_shift1", img_shift1, H, true);
-        intra_probe("MOD_chunk1_scale1", img_scale1, H, true);
-        intra_probe("MOD_chunk2_gate1",  img_gate1,  H, true);
-        intra_probe("MOD_chunk3_shift2", img_shift2, H, true);
-        intra_probe("MOD_chunk4_scale2", img_scale2, H, true);
-        intra_probe("MOD_chunk5_gate2",  img_gate2,  H, true);
-        intra_probe("MOD_txt_chunk0_shift1", txt_shift1, H, true);
-        intra_probe("MOD_txt_chunk1_scale1", txt_scale1, H, true);
-        intra_probe("MOD_txt_chunk2_gate1",  txt_gate1,  H, true);
-        intra_probe("MOD_txt_chunk3_shift2", txt_shift2, H, true);
-        intra_probe("MOD_txt_chunk4_scale2", txt_scale2, H, true);
-        intra_probe("MOD_txt_chunk5_gate2",  txt_gate2,  H, true);
+        // Probe labels reflect the *legacy* native binding (this is what is
+        // currently fed into modulate_/gated_residual). Spec-vs-legacy
+        // analysis lives in §5.5.7 of qie_q2_phase4_smoke.md.
+        intra_probe("MOD_chunk0_legScale1", img_scale1, H, true);
+        intra_probe("MOD_chunk1_legShift1", img_shift1, H, true);
+        intra_probe("MOD_chunk2_gate1",     img_gate1,  H, true);
+        intra_probe("MOD_chunk3_legScale2", img_scale2, H, true);
+        intra_probe("MOD_chunk4_legShift2", img_shift2, H, true);
+        intra_probe("MOD_chunk5_gate2",     img_gate2,  H, true);
+        intra_probe("MOD_txt_chunk0_legScale1", txt_scale1, H, true);
+        intra_probe("MOD_txt_chunk1_legShift1", txt_shift1, H, true);
+        intra_probe("MOD_txt_chunk2_gate1",     txt_gate1,  H, true);
+        intra_probe("MOD_txt_chunk3_legScale2", txt_scale2, H, true);
+        intra_probe("MOD_txt_chunk4_legShift2", txt_shift2, H, true);
+        intra_probe("MOD_txt_chunk5_gate2",     txt_gate2,  H, true);
     }
 
     // ------------------------------------------------------------------

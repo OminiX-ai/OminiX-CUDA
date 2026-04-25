@@ -2229,3 +2229,78 @@ softmax max/min in `aclnnFusedInferAttentionScoreV2` via the
 intra_probe magnitudes already wired). Or candidate (2) (Q4_0 weight
 scale mishandling) — diff `dispatch_matmul_` output of img_mod.1 at
 block 0 between native and the CPU reference engine.
+
+#### Smoke under spec ordering (RED — pivot to legacy ordering)
+
+Built + ran the §5.5.5 Step 4 probe under
+`QIE_DEBUG_INTRA_BLOCK0=1 QIE_DEBUG_DUMP_GATES=1 QIE_ALL_BF16=1` on ac03
+with the spec ordering active (`/tmp/qie_q45_step4g_smoke.log`).
+Final out_latent: `mean=3.01 std=33.88 min/max=-141/128 NaN=0 inf=0`.
+**WORSE** than §5.5.5-d's std=4.86 — VERDICT YELLOW (range), gate
+fires `|min|<20, |max|<20`. Smoke is RED for the spec-ordering fix.
+
+Gate-dump receipts (block 0, single layer, mean_abs values):
+
+| chunk | spec name | legacy name | mean_abs | max_abs |
+|-------|-----------|-------------|---------:|--------:|
+| 0     | shift_msa | scale1      | 0.58     |  45.25  |
+| 1     | scale_msa | shift1      | 2.09     |  59.66  |
+| 2     | gate_msa  | gate1       | 0.46     |   7.10  |
+| 3     | shift_mlp | scale2      | 1.49     |  69.75  |
+| 4     | scale_mlp | shift2      | **26.21**| 200.00  |
+| 5     | gate_mlp  | gate2       |  17.30   | 269.00  |
+
+Diagnosis: chunk[4] has a mean_abs of 26.2. Under spec ordering this
+is treated as `scale_mlp` and applied as `(1+scale_mlp)` — i.e. a
+~27× per-block multiplier on the post-LN activations. That is the
+direct driver of the std=33.88 final latent (60 layers worth of
+~27× growth, attenuated by attention/gating but not by enough). Under
+legacy ordering chunk[4] is treated as `shift2` and applied
+additively after LN — bounded by LN output magnitude (≈1) — so its
+per-block contribution is O(chunk[4]_mean) ≈ 26 ADDED, far less
+explosive than 27× MULTIPLIED.
+
+Upstream defect signal: `00_t_emb_in` has `max_abs=111.8` with
+`mean_abs=0.33` (n=3072). Healthy timestep MLP output should be
+O(1) max — a max of ~112 is a 100× outlier dimension, indicative of
+upstream amplification in the time-text-embed pipeline (or in the
+`time_text_embed.linear_2.weight` Q4 dequant scale). All six modulation
+chunks are downstream consumers of `silu(t_emb)` and inherit its
+amplification.
+
+**Decision:** PIN the legacy chunk binding (chunk[0]→scale1,
+chunk[1]→shift1, etc.) for now. The spec ordering is mathematically
+correct per HF Diffusers
+(`transformer_qwenimage.py:425` → `chunk(2, dim=-1)` then
+`chunk(3, dim=-1)` → on-disk row order
+`shift1, scale1, gate1, shift2, scale2, gate2`), but it interacts
+with the upstream-amplified t_emb to produce a worse final latent.
+The legacy ordering is bug-for-bug safer until the t_emb/Q4 amplification
+is isolated and fixed; once that is fixed, the spec ordering must be
+restored (chunks[0,1] swap, chunks[3,4] swap) — and the gate-dump
+probe instrumentation is preserved precisely for that re-validation.
+
+**Hand-off to the next agent (Q2.4.5.4h or later):**
+
+1. Investigate the upstream amplification driving `00_t_emb_in`
+   max_abs=111.8. Likely suspects:
+   - `time_text_embed.timestep_embedder.linear_*` Q4 dequant scale
+     handling (`qwen_image.hpp:42-58` is the CPU reference; native
+     impl in `image_diffusion_engine.cpp` builds the time MLP from
+     scratch).
+   - `txt_norm` RMSNorm output magnitude (compare to reference).
+   - `txt_in` projection scale.
+2. Once upstream is bounded to O(1), re-test the spec ordering: in
+   `forward_block_` mod_chunk lambda, swap labels to
+   `chunk[0]=shift, chunk[1]=scale, chunk[3]=shift, chunk[4]=scale`
+   (i.e. revert §5.5.7's pin), keep `QIE_DEBUG_DUMP_GATES=1` on,
+   and verify chunk magnitudes drop into the healthy range (gates
+   ~0.01-0.1, scale* ~0.05-0.2, shift* ~0.1-0.5).
+3. Smoke: §5.5.5 Step 4 probe + VAE decode. Eye-check vs
+   `/tmp/phase1_baseline_1024_20step.png`.
+
+The Q2.4.5.4g commit (`8bcad851`) ships the gate-dump probe
+(`QIE_DEBUG_DUMP_GATES=1`) and pinned-legacy chunk binding with full
+audit trail in this section. Numerical gate (Step 1 cos_sim=1.0)
+unchanged because the env var is OFF by default and the chunk binding
+is byte-identical to the pre-§5.5.7 path.
