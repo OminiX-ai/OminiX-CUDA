@@ -3156,9 +3156,86 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                         is_f16 ? PROBE_F16 : PROBE_F32);
     };
 
+    // Q2.4.5.4i Step 1 — block-0 input/output dump for native vs CPU-reference
+    // discrimination. Gated by QIE_DUMP_BLOCK0_DIR=<path>. Only dumps on the
+    // FIRST forward_block_ invocation in the process lifetime (block 0,
+    // step 0). Always emits raw F32 binaries — F16 sources are upcast on
+    // host before write so the CPU-reference probe can ingest a single
+    // dtype. Files written: 00_img.f32, 00_txt.f32, 00_t_emb.f32,
+    // 24_img_resid2.f32, 24_txt_resid2.f32 (last two filled at end of
+    // forward_block_).
+    static std::string s_dump_dir;
+    static int         s_dump_init = -1;
+    if (s_dump_init < 0) {
+        const char *v = std::getenv("QIE_DUMP_BLOCK0_DIR");
+        s_dump_dir   = v ? std::string(v) : std::string();
+        s_dump_init  = 1;
+    }
+    const bool do_dump = !s_dump_dir.empty() && (s_intra_calls == 1);
+    auto dump_tensor_dt = [&](const char *fname, void *dev,
+                                 int64_t n_elts, ProbeDtype dt) -> void {
+        if (!do_dump) return;
+        g_cann.aclrtSynchronizeStream(compute_stream_);
+        const size_t bpe_dev = (dt == PROBE_F32) ? 4 : 2;
+        std::vector<uint8_t> raw((size_t)n_elts * bpe_dev);
+        aclError me = g_cann.aclrtMemcpy(raw.data(), raw.size(), dev,
+                                           raw.size(),
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (me != 0) {
+            QIE_LOG("dump_tensor_dt[%s]: D2H err=%d", fname, (int)me);
+            return;
+        }
+        std::vector<float> host_f32((size_t)n_elts);
+        if (dt == PROBE_F16) {
+            for (int64_t i = 0; i < n_elts; ++i) {
+                __fp16 hh;
+                std::memcpy(&hh, raw.data() + (size_t)i * 2, 2);
+                host_f32[(size_t)i] = (float)hh;
+            }
+        } else if (dt == PROBE_BF16) {
+            // BF16 = sign + 8-bit exp + 7-bit mantissa = top 16 bits of F32.
+            // Upcast: zero-extend low 16 bits of F32 mantissa.
+            for (int64_t i = 0; i < n_elts; ++i) {
+                uint16_t bf;
+                std::memcpy(&bf, raw.data() + (size_t)i * 2, 2);
+                uint32_t f = ((uint32_t)bf) << 16;
+                std::memcpy(&host_f32[(size_t)i], &f, 4);
+            }
+        } else {
+            std::memcpy(host_f32.data(), raw.data(),
+                         (size_t)n_elts * sizeof(float));
+        }
+        std::string path = s_dump_dir + "/" + fname;
+        FILE *f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            QIE_LOG("dump_tensor_dt[%s]: fopen failed", path.c_str());
+            return;
+        }
+        size_t wrote = std::fwrite(host_f32.data(), sizeof(float),
+                                     (size_t)n_elts, f);
+        std::fclose(f);
+        QIE_LOG("dump_tensor_dt[%s]: %lld F32 elts (%.2f MiB, src=%s) -> %s",
+                fname, (long long)n_elts,
+                (double)(n_elts * 4) / (1024.0 * 1024.0),
+                (dt == PROBE_F32) ? "F32" : (dt == PROBE_F16) ? "F16" : "BF16",
+                path.c_str());
+        if (wrote != (size_t)n_elts) {
+            QIE_LOG("dump_tensor_dt[%s]: short write %zu/%lld",
+                    fname, wrote, (long long)n_elts);
+        }
+    };
+    auto dump_tensor_f32 = [&](const char *fname, void *dev,
+                                 int64_t n_elts, bool is_f16) -> void {
+        dump_tensor_dt(fname, dev, n_elts,
+                        is_f16 ? PROBE_F16 : PROBE_F32);
+    };
+
     intra_probe("00_img_hidden_in", img_hidden, img_seq * H, false);
     intra_probe("00_txt_hidden_in", txt_hidden, txt_seq * H, false);
     intra_probe("00_t_emb_in", t_emb, H, true);
+    dump_tensor_f32("00_img.f32",   img_hidden, img_seq * H, /*is_f16*/ false);
+    dump_tensor_f32("00_txt.f32",   txt_hidden, txt_seq * H, /*is_f16*/ false);
+    dump_tensor_f32("00_t_emb.f32", t_emb,      H,           /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 1. Modulation: mod_params = img_mod.1(silu(t_emb))  (and txt side)
@@ -3304,16 +3381,20 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                   B, img_seq, H))
         return false;
     intra_probe("04_img_LN1", scratch_img_norm_dev_, img_seq * H, true);
+    dump_tensor_f32("04_img_LN1.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_img_norm_dev_, img_scale1, img_shift1,
                    B, img_seq, H)) return false;
     intra_probe("05_img_mod1", scratch_img_norm_dev_, img_seq * H, true);
+    dump_tensor_f32("05_img_mod1.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
     intra_probe("06_txt_LN1", scratch_txt_norm_dev_, txt_seq * H, true);
+    dump_tensor_f32("06_txt_LN1.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale1, txt_shift1,
                    B, txt_seq, H)) return false;
     intra_probe("07_txt_mod1", scratch_txt_norm_dev_, txt_seq * H, true);
+    dump_tensor_f32("07_txt_mod1.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 3. QKV projections. img → to_q / to_k / to_v, txt → add_q/k/v.
@@ -3461,6 +3542,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("11_attn_out_txt", scratch_attn_dev_, txt_seq * H, true);
     intra_probe("11_attn_out_img", offset_rows(scratch_attn_dev_, txt_seq),
                 img_seq * H, true);
+    dump_tensor_f32("11_attn_out_txt.f32", scratch_attn_dev_, txt_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("11_attn_out_img.f32",
+                     offset_rows(scratch_attn_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 7. Output projections.
@@ -3488,6 +3573,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                     attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
     intra_probe_dt("12_to_out_0",   scratch_img_out_dev_, img_seq * H,
                     attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
+    dump_tensor_dt("12_to_add_out.f32", scratch_txt_out_dev_, txt_seq * H,
+                    attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
+    dump_tensor_dt("12_to_out_0.f32",   scratch_img_out_dev_, img_seq * H,
+                    attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // ------------------------------------------------------------------
     // 8. Gated residual add: img += attn_out_img * gate1_img (and txt).
@@ -3511,6 +3600,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     }
     intra_probe("13_img_resid1", img_hidden, img_seq * H, false);
     intra_probe("13_txt_resid1", txt_hidden, txt_seq * H, false);
+    dump_tensor_f32("13_img_resid1.f32", img_hidden, img_seq * H, /*is_f16*/ false);
+    dump_tensor_f32("13_txt_resid1.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
     // ------------------------------------------------------------------
     // 9. LayerNorm2 + modulate(scale2, shift2) — Phase 4.4c F32-in path
@@ -3520,16 +3611,20 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                   B, img_seq, H))
         return false;
     intra_probe("14_img_LN2", scratch_img_norm_dev_, img_seq * H, true);
+    dump_tensor_f32("14_img_LN2.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_img_norm_dev_, img_scale2, img_shift2,
                    B, img_seq, H)) return false;
     intra_probe("15_img_mod2", scratch_img_norm_dev_, img_seq * H, true);
+    dump_tensor_f32("15_img_mod2.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
     intra_probe("16_txt_LN2", scratch_txt_norm_dev_, txt_seq * H, true);
+    dump_tensor_f32("16_txt_LN2.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale2, txt_shift2,
                    B, txt_seq, H)) return false;
     intra_probe("17_txt_mod2", scratch_txt_norm_dev_, txt_seq * H, true);
+    dump_tensor_f32("17_txt_mod2.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 10. FFN per stream: Linear(H→FF) → GELU-tanh → Linear(FF→H).
@@ -3588,6 +3683,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
     intra_probe_dt("20_img_ff_down", scratch_img_out_dev_, img_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
+    dump_tensor_dt("20_img_ff_down.f32", scratch_img_out_dev_, img_seq * H,
+                    ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // txt FFN.
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.txt_ff_up_w_q4,
@@ -3601,6 +3698,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           txt_seq, FF, H, scratch_txt_out_dev_,
                           ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
     intra_probe_dt("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H,
+                    ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
+    dump_tensor_dt("23_txt_ff_down.f32", scratch_txt_out_dev_, txt_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // ------------------------------------------------------------------
@@ -3623,6 +3722,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     }
     intra_probe("24_img_resid2", img_hidden, img_seq * H, false);
     intra_probe("24_txt_resid2", txt_hidden, txt_seq * H, false);
+    dump_tensor_f32("24_img_resid2.f32", img_hidden, img_seq * H, /*is_f16*/ false);
+    dump_tensor_f32("24_txt_resid2.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
     return true;
 }

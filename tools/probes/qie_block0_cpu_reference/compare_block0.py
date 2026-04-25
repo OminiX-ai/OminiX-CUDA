@@ -196,6 +196,59 @@ def main():
     cpu_txt = load_f32(os.path.join(args.cpu_dir,    "cpu_24_txt_resid2.f32"), txt_n)
     txt_stats = report_pair("txt_resid2", nat_txt, cpu_txt, args.hidden)
 
+    # Q2.4.5.4j substep bisect: if both native + CPU substep dumps exist,
+    # walk each substep and report its own verdict so we can localise the
+    # first substep that violates cos>0.99 (the bug enters there).
+    substeps = [
+        # (native filename, cpu filename, label, expected n)
+        ("04_img_LN1.f32",     "cpu_04_img_LN1.f32",     "04_img_LN1",     img_n),
+        ("05_img_mod1.f32",    "cpu_05_img_mod1.f32",    "05_img_mod1",    img_n),
+        ("06_txt_LN1.f32",     "cpu_06_txt_LN1.f32",     "06_txt_LN1",     txt_n),
+        ("07_txt_mod1.f32",    "cpu_07_txt_mod1.f32",    "07_txt_mod1",    txt_n),
+        ("11_attn_out_img.f32","cpu_11_attn_out_img.f32","11_attn_out_img",img_n),
+        ("11_attn_out_txt.f32","cpu_11_attn_out_txt.f32","11_attn_out_txt",txt_n),
+        ("13_img_resid1.f32",  "cpu_13_img_resid1.f32",  "13_img_resid1",  img_n),
+        ("13_txt_resid1.f32",  "cpu_13_txt_resid1.f32",  "13_txt_resid1",  txt_n),
+        ("14_img_LN2.f32",     "cpu_14_img_LN2.f32",     "14_img_LN2",     img_n),
+        ("15_img_mod2.f32",    "cpu_15_img_mod2.f32",    "15_img_mod2",    img_n),
+        ("16_txt_LN2.f32",     "cpu_16_txt_LN2.f32",     "16_txt_LN2",     txt_n),
+        ("17_txt_mod2.f32",    "cpu_17_txt_mod2.f32",    "17_txt_mod2",    txt_n),
+        ("20_img_ff_down.f32", "cpu_20_img_ff_down.f32", "20_img_ff_down", img_n),
+        ("23_txt_ff_down.f32", "cpu_23_txt_ff_down.f32", "23_txt_ff_down", txt_n),
+    ]
+    substep_results = []
+    for nat_name, cpu_name, label, n in substeps:
+        nat_path = os.path.join(args.native_dir, nat_name)
+        cpu_path = os.path.join(args.cpu_dir, cpu_name)
+        if not (os.path.isfile(nat_path) and os.path.isfile(cpu_path)):
+            continue
+        try:
+            nat = load_f32(nat_path, n)
+            cpu = load_f32(cpu_path, n)
+        except ValueError as e:
+            print(f"\n[substep {label}] skipped: {e}")
+            continue
+        s = report_pair(label, nat, cpu, args.hidden)
+        substep_results.append((label, s))
+
+    if substep_results:
+        print("\n" + "=" * 60)
+        print("SUBSTEP BISECT — first substep with cos_mean < 0.99 is the bug entry")
+        print("=" * 60)
+        first_break = None
+        for label, s in substep_results:
+            v = verdict(s)
+            tag = "GREEN" if "GREEN" in v else ("YELLOW" if "YELLOW" in v else "RED")
+            print(f"  {label:20s}  cos_mean={s['cos_mean']:.4f}  "
+                  f"ratio_max={s['mag_ratio_max']:.3g}  {tag}")
+            if first_break is None and s["cos_mean"] < 0.99:
+                first_break = label
+        print()
+        if first_break is not None:
+            print(f"  >> first cos < 0.99 substep: {first_break}")
+        else:
+            print("  >> all substeps GREEN; bug must be in the residual-add or post-block math")
+
     print("\n" + "=" * 60)
     print("FINAL VERDICT (img_resid2):", verdict(img_stats))
     print("FINAL VERDICT (txt_resid2):", verdict(txt_stats))

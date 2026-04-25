@@ -2655,3 +2655,173 @@ Three issues had to be patched before the CPU reference would build:
 
 Probe is now self-contained and re-runnable with one command:
 `bash tools/probes/qie_block0_cpu_reference/run_step_4i.sh`.
+
+### §5.5.10 Step 4j — substep bisect: bug isolated to attention (cos drops 0.98 → 0.002)
+
+Following §5.5.9's YELLOW(partial) verdict, the workplan called for
+extending `QIE_DUMP_BLOCK0_DIR` to intermediate substeps and
+repeating the bisect. Done in this session — both the native engine
+dump and the CPU reference probe now emit 14 substep tensors
+(LN1/mod1/attn-out/resid1/LN2/mod2/ff-down for img + txt streams),
+and `compare_block0.py` walks all of them with per-substep verdict
+plus a one-line "first cos < 0.99" pointer.
+
+#### Engine-side extension (~80 LoC)
+
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+
+- Generalised `dump_tensor_f32` → `dump_tensor_dt(fname, dev, n_elts,
+  ProbeDtype)`. The new `PROBE_BF16` arm host-upcasts BF16 to F32 by
+  zero-extending the low 16 mantissa bits (top 16 of F32). This
+  matches the existing `intra_probe_dt` BF16 handling.
+- Added 14 paired `dump_tensor_*` calls next to the existing
+  `intra_probe` sites for substeps 04, 05, 06, 07, 11_img, 11_txt,
+  12_to_add_out, 12_to_out_0, 13_img_resid1, 13_txt_resid1, 14, 15,
+  16, 17, 20, 23. Output filenames mirror the probe label
+  (`{step}_{stream}_{name}.f32`).
+
+#### CPU-reference extension
+
+`tools/probes/qie_block0_cpu_reference/test_qie_block0_cpu_reference.cpp`:
+
+- Replaced `block->forward(...)` with an inline copy of
+  `Qwen::QwenImageTransformerBlock::forward` (verbatim, ~80 LoC) so
+  intermediate substeps can be tagged. Each substep tensor is given
+  a `cpu_<step>` name plus `ggml_set_output(...)` (CRITICAL — without
+  this the gallocr reuses intermediate buffers for downstream ops
+  and the read-back returns garbage; this was the source of the
+  initial run's all-RED bisect).
+- Added `dump_named` helper in `compute_block0()` that walks the
+  same 14 substep names, looks them up in `compute_ctx`, and writes
+  `cpu_<step>.f32` to `$QIE_BLOCK0_OUTPUTS_DIR`.
+- Helper `PublicQwenImageTransformerBlock` (using-redeclares
+  `GGMLBlock::blocks` publicly via the same probe-only idiom from
+  §5.5.9).
+
+#### Comparator extension
+
+`compare_block0.py` now iterates the 14 substep pairs (graceful
+skip when files absent), prints a one-line table per substep with
+verdict tag, and reports the **first substep that crosses
+cos_mean < 0.99** — which localises the bug entry point.
+
+#### Substep verdict table (real Q4 weights, `QIE_FFN_DOWN_BF16=1`, img_seq=64, txt_seq=32)
+
+| substep              | cos_mean | ratio_max | verdict |
+|----------------------|---------:|----------:|---------|
+| 04_img_LN1           |   1.0000 |     1.000 | **GREEN** |
+| 05_img_mod1          |   0.9859 |     0.889 | YELLOW  |
+| 06_txt_LN1           |   1.0000 |     1.000 | **GREEN** |
+| 07_txt_mod1          |   0.9800 |     0.910 | YELLOW  |
+| **11_attn_out_img**  | **0.0022** | 0.023   | **RED** |
+| **11_attn_out_txt**  | **0.0033** | 0.221   | **RED** |
+| 13_img_resid1        |   0.5041 |     0.841 | YELLOW  |
+| 13_txt_resid1        |   0.4283 |     0.732 | RED     |
+| 14_img_LN2           |   0.5040 |     0.761 | YELLOW  |
+| 15_img_mod2          |   0.4902 |     0.788 | RED     |
+| 16_txt_LN2           |   0.4283 |     0.997 | RED     |
+| 17_txt_mod2          |   0.4116 |     0.923 | RED     |
+| 20_img_ff_down       |   0.3924 |     1.020 | RED     |
+| 23_txt_ff_down       |   0.5792 |     1.130 | YELLOW  |
+
+#### Diagnosis — bug is in attention
+
+The bisect is unambiguous:
+
+1. **LN1 is byte-perfect** (cos=1.0000 both streams). The pure-F32
+   `layer_norm_f32_to_f16_` path agrees with ggml's `ggml_norm` to
+   within rounding. This rules out the §5.5.9 hypothesis #3 (F16
+   RMSNorm).
+2. **mod1 is near-perfect** (cos≈0.98). The `(1+scale)*x + shift`
+   modulation introduces a small ~2% drift — consistent with F16
+   storage of the modulation chunks plus broadcast-mul precision.
+   This rules out the §5.5.9 hypothesis #2 (AdaLN
+   non-permutation transpose) — if the chunks were transposed, mod1
+   would be RED, not 0.98 YELLOW.
+3. **Attention drops cos to 0.002** — direction completely random,
+   magnitudes 22-44× smaller than CPU reference. **This is where the
+   bug lives.** Confirms §5.5.9 hypothesis #1 (F16 attention
+   accumulation) — but at a far more dramatic scale than predicted.
+   Cos≈0 with magnitude under-shoot suggests not just precision drift
+   but a structural bug: probable suspects, in priority order:
+   - **F16 softmax overflow on the 96×96 logit matrix** with q×k
+     scale=8.0 (head_dim=64 → 1/√64). The pre-softmax max can
+     reach ~|q|·|k|·8 / √64 — and §5.5.8 reports `09_img_Q_rmsnorm
+     max=723`, `09_img_K_rmsnorm max=571.5`. q·k logit max ≈
+     723·571.5/8 ≈ 51 600 — under F16 max but the per-row softmax
+     denominator after exp can saturate.
+   - **q/k RMSNorm magnitudes** at max=723 / 571.5 are pathological
+     for attention — they crash through softmax dynamic range. The
+     CPU reference does not have this issue because ggml_soft_max
+     auto-stabilises by max-subtraction.
+   - **add_q_proj / add_k_proj / add_v_proj weight-row layout
+     mismatch** between native (Diffusers naming) and the CPU
+     reference (which uses the same naming). Less likely given
+     LN1+mod1 are GREEN — projections feed off mod1 output.
+4. **Residual add #1 partially recovers** to cos≈0.5 because the
+   F32 residual stream `img_hidden + scrambled_attn * gate1`
+   inherits direction from the unaffected input `img_hidden`
+   (gate1·attn output is small in magnitude after the attention
+   under-shoot, so the residual is dominated by the input). This
+   explains the §5.5.9 final-resid2 cos=0.6 finding.
+5. **All downstream substeps stay at cos≈0.4-0.5** because
+   subsequent ops are linear and preserve the direction set by the
+   resid1 step. ff_down magnitudes match (ratio≈1.0) because the
+   FFN sub-tree is correct in isolation — it's just operating on
+   bad input.
+
+#### Strategic recommendation — focus on attention
+
+The next bisect (Q2.4.5.4k) should narrow inside the attention
+substep:
+
+1. **Per-substep dumps inside attention**: add native + CPU dumps
+   for `09_*_rmsnorm`, `10_*_rope`, the post-softmax score matrix,
+   and the `to_q/to_k/to_v/to_out` projection outputs. The
+   `intra_probe` sites at lines 3410-3475 already cover most of
+   these — extending dump-to-disk is ~10 LoC per substep.
+2. **F32-promote softmax**: attention softmax is the prime suspect
+   for cos≈0. Add a `QIE_ATTN_SOFTMAX_F32=1` env gate that runs
+   `aclnnSoftmax` on F32 logits then casts back to F16. Test impact
+   on the 11_attn_out_* cos.
+3. **F32-promote q/k post-RMSNorm**: with q-rmsnorm max=723 and
+   F16 forward, the q·k matmul is borderline. A
+   `QIE_ATTN_QK_F32=1` gate that keeps q,k in F32 through the
+   `aclnnFlashAttentionScore` (or matmul fallback) would test
+   precision-class.
+4. **Weight-layout cross-check**: `add_q_proj`/`add_k_proj`/
+   `add_v_proj` (txt-side projections — these feed `to_q/to_k/to_v`
+   in the joint attention) — verify GGUF row layout matches
+   Diffusers' MMDiT layout. Same as §5.5.9 hypothesis #2 but
+   targeted at the attention QKV projections rather than the
+   AdaLN chunks.
+
+**Path C #5 ship pivot remains gated.** A real algorithm bug exists
+in the native attention path; once attention bisects to GREEN, the
+final cos should jump from 0.6 → 0.99 and the pivot decision
+becomes trivial.
+
+#### Receipts
+
+- `/tmp/qie_q2454j_run_first.log` — orchestrator log (substep
+  dumps + initial all-RED bisect from missing
+  `ggml_set_output`).
+- `/tmp/qie_q2454j_compare.log` — final substep verdict table
+  after `ggml_set_output` fix.
+- `/tmp/qie_block0_inputs/` (21 files, 8.6 MB native dumps)
+- `/tmp/qie_block0_outputs/` (16 files, 4.3 MB CPU dumps).
+- Probe + comparator are re-runnable end-to-end with
+  `bash tools/probes/qie_block0_cpu_reference/run_step_4i.sh`.
+
+#### Source changes committed
+
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp`: 14
+  paired `dump_tensor_*` calls + `dump_tensor_dt` lambda extension
+  (BF16 host-upcast). Env-gated by `QIE_DUMP_BLOCK0_DIR`. Zero
+  effect when env unset (existing s_dump_dir guard).
+- `tools/probes/qie_block0_cpu_reference/test_qie_block0_cpu_reference.cpp`:
+  inline-replicate forward, `ggml_set_output` on each substep,
+  `dump_named` helper writing 14 cpu_*.f32 files.
+- `tools/probes/qie_block0_cpu_reference/compare_block0.py`:
+  substep-pair walker + bisect summary.
+

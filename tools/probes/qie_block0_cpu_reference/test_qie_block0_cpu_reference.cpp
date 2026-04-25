@@ -138,6 +138,10 @@ struct PublicQwenImageModel : public Qwen::QwenImageModel {
     using Qwen::QwenImageModel::blocks;
 };
 
+struct PublicQwenImageTransformerBlock : public Qwen::QwenImageTransformerBlock {
+    using GGMLBlock::blocks;
+};
+
 // ---------------------------------------------------------------------------
 // Block-0 CPU runner. Wraps a single QwenImageTransformerBlock and runs a
 // forward graph on the CPU backend in F32. Inputs (img, txt, t_emb, pe) are
@@ -194,26 +198,150 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
         set_backend_tensor_data(t_emb, t_emb_in.data());
         set_backend_tensor_data(pe,    pe_in.data());
 
-        // Run only block 0. PublicQwenImageModel adds no members and no
-        // virtual changes, so the derived view is layout-identical and
-        // safe to cast through (probe-only idiom).
+        // Replicate Qwen::QwenImageTransformerBlock::forward INLINE so we
+        // can intercept each substep with ggml_set_name + forward_expand.
+        // The substep names match the native engine's `dump_tensor_*` files
+        // so the comparator can do a parallel substep bisect.
+        // Source: qwen_image.hpp:255-340 (verbatim, with named taps).
         auto &qim_pub = reinterpret_cast<PublicQwenImageModel&>(qwen_image);
-        auto block = std::dynamic_pointer_cast<Qwen::QwenImageTransformerBlock>(
-            qim_pub.blocks["transformer_blocks.0"]);
-        if (!block) {
-            std::fprintf(stderr, "[block0_cpu] block 0 not found\n");
-            return nullptr;
-        }
+        auto &block_pub = reinterpret_cast<PublicQwenImageTransformerBlock&>(
+            *qim_pub.blocks["transformer_blocks.0"]);
 
-        auto runner_ctx = get_context();
-        auto pair = block->forward(&runner_ctx, img, txt, t_emb, pe,
-                                    /*modulate_index*/ nullptr,
-                                    /*attention_mask*/ nullptr);
-        struct ggml_tensor *img_out = pair.first;
-        struct ggml_tensor *txt_out = pair.second;
+        auto img_mod_1 = std::dynamic_pointer_cast<Linear>(block_pub.blocks["img_mod.1"]);
+        auto img_norm1 = std::dynamic_pointer_cast<LayerNorm>(block_pub.blocks["img_norm1"]);
+        auto img_norm2 = std::dynamic_pointer_cast<LayerNorm>(block_pub.blocks["img_norm2"]);
+        auto img_mlp   = std::dynamic_pointer_cast<FeedForward>(block_pub.blocks["img_mlp"]);
+
+        auto txt_mod_1 = std::dynamic_pointer_cast<Linear>(block_pub.blocks["txt_mod.1"]);
+        auto txt_norm1 = std::dynamic_pointer_cast<LayerNorm>(block_pub.blocks["txt_norm1"]);
+        auto txt_norm2 = std::dynamic_pointer_cast<LayerNorm>(block_pub.blocks["txt_norm2"]);
+        auto txt_mlp   = std::dynamic_pointer_cast<FeedForward>(block_pub.blocks["txt_mlp"]);
+
+        auto attn = std::dynamic_pointer_cast<Qwen::QwenImageAttention>(block_pub.blocks["attn"]);
+
+        auto runner_ctx_obj = get_context();
+        GGMLRunnerContext *ctx = &runner_ctx_obj;
+
+        // Modulation chains.
+        auto img_mod_params    = ggml_silu(ctx->ggml_ctx, t_emb);
+        img_mod_params         = img_mod_1->forward(ctx, img_mod_params);
+        auto img_mod_param_vec = block_pub.get_mod_params_vec(ctx->ggml_ctx, img_mod_params, nullptr);
+
+        auto txt_mod_params    = ggml_silu(ctx->ggml_ctx, t_emb);
+        txt_mod_params         = txt_mod_1->forward(ctx, txt_mod_params);
+        auto txt_mod_param_vec = block_pub.get_mod_params_vec(ctx->ggml_ctx, txt_mod_params, nullptr);
+
+        // LN1 + mod1 substeps.
+        auto img_normed    = img_norm1->forward(ctx, img);
+        auto img_modulated = Flux::modulate(ctx->ggml_ctx, img_normed,
+                                              img_mod_param_vec[0],
+                                              img_mod_param_vec[1], false);
+        auto img_gate1     = img_mod_param_vec[2];
+
+        auto txt_normed    = txt_norm1->forward(ctx, txt);
+        auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed,
+                                              txt_mod_param_vec[0],
+                                              txt_mod_param_vec[1]);
+        auto txt_gate1     = txt_mod_param_vec[2];
+
+        ggml_set_name(img_normed,    "cpu_04_img_LN1");
+        ggml_set_name(img_modulated, "cpu_05_img_mod1");
+        ggml_set_name(txt_normed,    "cpu_06_txt_LN1");
+        ggml_set_name(txt_modulated, "cpu_07_txt_mod1");
+        // ggml_set_output prevents the gallocr from reusing this tensor's
+        // memory for downstream ops — required so we can read intermediate
+        // values back after compute() returns.
+        ggml_set_output(img_normed);
+        ggml_set_output(img_modulated);
+        ggml_set_output(txt_normed);
+        ggml_set_output(txt_modulated);
+        ggml_build_forward_expand(gf, img_normed);
+        ggml_build_forward_expand(gf, img_modulated);
+        ggml_build_forward_expand(gf, txt_normed);
+        ggml_build_forward_expand(gf, txt_modulated);
+
+        // Gate reshape (matches qwen_image.hpp:309-316 N=1 branch).
+        img_gate1 = ggml_reshape_4d(ctx->ggml_ctx, img_gate1,
+                                     img_gate1->ne[0], 1,
+                                     img_gate1->ne[1], img_gate1->ne[2]);
+        txt_gate1 = ggml_reshape_4d(ctx->ggml_ctx, txt_gate1,
+                                     txt_gate1->ne[0], 1,
+                                     txt_gate1->ne[1], txt_gate1->ne[2]);
+
+        // Attention.
+        auto attn_pair = attn->forward(ctx, img_modulated, txt_modulated,
+                                         pe, /*attention_mask*/ nullptr);
+        auto img_attn_output = attn_pair.first;
+        auto txt_attn_output = attn_pair.second;
+        ggml_set_name(img_attn_output, "cpu_11_attn_out_img");
+        ggml_set_name(txt_attn_output, "cpu_11_attn_out_txt");
+        ggml_set_output(img_attn_output);
+        ggml_set_output(txt_attn_output);
+        ggml_build_forward_expand(gf, img_attn_output);
+        ggml_build_forward_expand(gf, txt_attn_output);
+
+        // Residual #1.
+        auto img1 = ggml_add(ctx->ggml_ctx, img,
+                              ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
+        auto txt1 = ggml_add(ctx->ggml_ctx, txt,
+                              ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
+        ggml_set_name(img1, "cpu_13_img_resid1");
+        ggml_set_name(txt1, "cpu_13_txt_resid1");
+        ggml_set_output(img1);
+        ggml_set_output(txt1);
+        ggml_build_forward_expand(gf, img1);
+        ggml_build_forward_expand(gf, txt1);
+
+        // LN2 + mod2 substeps.
+        auto img_normed2    = img_norm2->forward(ctx, img1);
+        auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2,
+                                               img_mod_param_vec[3],
+                                               img_mod_param_vec[4], false);
+        auto img_gate2      = img_mod_param_vec[5];
+
+        auto txt_normed2    = txt_norm2->forward(ctx, txt1);
+        auto txt_modulated2 = Flux::modulate(ctx->ggml_ctx, txt_normed2,
+                                               txt_mod_param_vec[3],
+                                               txt_mod_param_vec[4]);
+        auto txt_gate2      = txt_mod_param_vec[5];
+
+        ggml_set_name(img_normed2,    "cpu_14_img_LN2");
+        ggml_set_name(img_modulated2, "cpu_15_img_mod2");
+        ggml_set_name(txt_normed2,    "cpu_16_txt_LN2");
+        ggml_set_name(txt_modulated2, "cpu_17_txt_mod2");
+        ggml_set_output(img_normed2);
+        ggml_set_output(img_modulated2);
+        ggml_set_output(txt_normed2);
+        ggml_set_output(txt_modulated2);
+        ggml_build_forward_expand(gf, img_normed2);
+        ggml_build_forward_expand(gf, img_modulated2);
+        ggml_build_forward_expand(gf, txt_normed2);
+        ggml_build_forward_expand(gf, txt_modulated2);
+
+        img_gate2 = ggml_reshape_4d(ctx->ggml_ctx, img_gate2,
+                                     img_gate2->ne[0], 1,
+                                     img_gate2->ne[1], img_gate2->ne[2]);
+        txt_gate2 = ggml_reshape_4d(ctx->ggml_ctx, txt_gate2,
+                                     txt_gate2->ne[0], 1,
+                                     txt_gate2->ne[1], txt_gate2->ne[2]);
+
+        // FFN substeps (post-down only).
+        auto img_mlp_out = img_mlp->forward(ctx, img_modulated2);
+        auto txt_mlp_out = txt_mlp->forward(ctx, txt_modulated2);
+        ggml_set_name(img_mlp_out, "cpu_20_img_ff_down");
+        ggml_set_name(txt_mlp_out, "cpu_23_txt_ff_down");
+        ggml_set_output(img_mlp_out);
+        ggml_set_output(txt_mlp_out);
+        ggml_build_forward_expand(gf, img_mlp_out);
+        ggml_build_forward_expand(gf, txt_mlp_out);
+
+        // Residual #2.
+        auto img_out = ggml_add(ctx->ggml_ctx, img1,
+                                  ggml_mul(ctx->ggml_ctx, img_mlp_out, img_gate2));
+        auto txt_out = ggml_add(ctx->ggml_ctx, txt1,
+                                  ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_gate2));
         ggml_set_name(img_out, "img_out");
         ggml_set_name(txt_out, "txt_out");
-
         ggml_build_forward_expand(gf, img_out);
         ggml_build_forward_expand(gf, txt_out);
         return gf;
@@ -280,6 +408,60 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
                                   img_out.size() * sizeof(float));
         ggml_backend_tensor_get(txt_t, txt_out.data(), 0,
                                   txt_out.size() * sizeof(float));
+
+        // Substep dumps (Q2.4.5.4j extension) — written to
+        // $QIE_BLOCK0_OUTPUTS_DIR/cpu_<step>.f32, paired with the native
+        // engine's QIE_DUMP_BLOCK0_DIR substep dumps for substep-by-substep
+        // bisect via compare_block0.py.
+        const char *dump_env = std::getenv("QIE_BLOCK0_OUTPUTS_DIR");
+        if (dump_env) {
+            std::string out_dir(dump_env);
+            auto dump_named = [&](const char *cpu_name,
+                                    const char *file_name,
+                                    int64_t expected_n) {
+                struct ggml_tensor *t = ggml_get_tensor(compute_ctx, cpu_name);
+                if (!t) {
+                    std::fprintf(stderr, "[block0_cpu] substep '%s' not in compute_ctx\n",
+                                 cpu_name);
+                    return;
+                }
+                int64_t n = ggml_nelements(t);
+                if (n != expected_n) {
+                    std::fprintf(stderr, "[block0_cpu] substep '%s' size %lld != expected %lld\n",
+                                 cpu_name, (long long)n, (long long)expected_n);
+                }
+                std::vector<float> buf((size_t)n);
+                ggml_backend_tensor_get(t, buf.data(), 0,
+                                         buf.size() * sizeof(float));
+                std::string path = out_dir + "/" + file_name;
+                FILE *fp = std::fopen(path.c_str(), "wb");
+                if (!fp) {
+                    std::fprintf(stderr, "[block0_cpu] open %s for write failed\n",
+                                 path.c_str());
+                    return;
+                }
+                std::fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                std::fclose(fp);
+            };
+            // Substep ↔ filename map (matches native engine dumps).
+            const int64_t img_n = (int64_t)img_seq * H;
+            const int64_t txt_n = (int64_t)txt_seq * H;
+            dump_named("cpu_04_img_LN1",     "cpu_04_img_LN1.f32",     img_n);
+            dump_named("cpu_05_img_mod1",    "cpu_05_img_mod1.f32",    img_n);
+            dump_named("cpu_06_txt_LN1",     "cpu_06_txt_LN1.f32",     txt_n);
+            dump_named("cpu_07_txt_mod1",    "cpu_07_txt_mod1.f32",    txt_n);
+            dump_named("cpu_11_attn_out_img","cpu_11_attn_out_img.f32",img_n);
+            dump_named("cpu_11_attn_out_txt","cpu_11_attn_out_txt.f32",txt_n);
+            dump_named("cpu_13_img_resid1",  "cpu_13_img_resid1.f32",  img_n);
+            dump_named("cpu_13_txt_resid1",  "cpu_13_txt_resid1.f32",  txt_n);
+            dump_named("cpu_14_img_LN2",     "cpu_14_img_LN2.f32",     img_n);
+            dump_named("cpu_15_img_mod2",    "cpu_15_img_mod2.f32",    img_n);
+            dump_named("cpu_16_txt_LN2",     "cpu_16_txt_LN2.f32",     txt_n);
+            dump_named("cpu_17_txt_mod2",    "cpu_17_txt_mod2.f32",    txt_n);
+            dump_named("cpu_20_img_ff_down", "cpu_20_img_ff_down.f32", img_n);
+            dump_named("cpu_23_txt_ff_down", "cpu_23_txt_ff_down.f32", txt_n);
+        }
+
         ggml_free(work_ctx);
         return true;
     }
