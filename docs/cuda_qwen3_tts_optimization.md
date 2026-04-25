@@ -152,7 +152,7 @@ TensorRT-LLM follow-up before Phase 2:
 
 Date: 2026-04-25 America/Los_Angeles
 
-Status: **YELLOW/GREEN**
+Status: **YELLOW**
 
 The TRT-LLM path remains blocked on PyTorch internal ABI mismatches, so Phase 2
 pivoted to vLLM 0.19.1. vLLM can load and serve the Talker GGUF through a
@@ -378,23 +378,140 @@ The intended low-latency path is:
 vLLM token stream -> audio-code token buffer -> codec decoder on GPU -> audio
 ```
 
-The vLLM side is ready: `/v1/completions` accepts list-of-int prompts and can
-stream generated token IDs. The codec side was not completed in this Phase 2
-run because the available local bundle contains `qwen3_tts_decoder.onnx` plus
-GGUF assets, but no ready Qwen3-TTS pipeline runner was present, and the model
-card's broader ONNX encoder/speaker-encoder layout was not present in the
-downloaded files. Next work is to fetch the complete official HF asset set or
-implement the bridge from `qwen3_assets.gguf`/predictor output into the ONNX
-decoder input contract.
+The vLLM side can accept list-of-int prompts and stream generated token IDs,
+but the raw-token path is not enough to drive the codec. Qwen3-TTS Talker
+generation is not a plain CausalLM loop:
 
-### Next Measurements
+1. The prompt is built as `inputs_embeds` from text projection, speaker/ref
+   embeddings, language tags, and codec prefill IDs.
+2. Each generated step produces the first codec group through the Talker head.
+3. The code predictor then consumes the Talker hidden state plus the first
+   codec ID and generates the remaining 15 codec groups.
+4. The summed 16-codebook embedding, plus trailing text hidden state, becomes
+   the next Talker step input.
 
-To close Phase 2 as an end-to-end TTS result:
+The current vLLM OpenAI path returns only token IDs from the first-codebook
+head. It does not return per-step Talker hidden states, does not run
+`qwen3_tts_predictor.gguf`, and therefore cannot directly produce the
+`[num_frames, 16]` codec code tensor required by the decoder. vLLM 0.19.1 does
+support `--enable-prompt-embeds`, so initial prompt embedding is solvable, but
+a real vLLM TTS bridge still needs either a custom vLLM model/runner that
+implements the code-predictor feedback loop or an API path that exposes hidden
+states for an external predictor.
 
-1. Fetch or reconstruct the complete codec path.
-2. Use a canonical prompt and reference speaker audio.
-3. Record total synthesis wall time, first-token latency, first-audio latency,
-   steady-state audio fps, Talker decode tok/s, and peak GPU memory.
-4. Compare complete TTS fps against Ascend 32.2 fps and any available MLX
-   result. Keep the current 131.78 tok/s Talker number as a raw-token ceiling,
-   not as an audio fps claim.
+### Codec Asset Reconstruction
+
+Completed on 2026-04-25:
+
+- Installed official `qwen-tts==0.1.1` into
+  `/home/user1/qwen3_tts_cuda/.venv` without replacing the CUDA 13 PyTorch
+  wheel. Dependencies added: `transformers==4.57.3`, `accelerate==1.12.0`,
+  `librosa`, `soundfile`, `sox`, `einops`, and `onnxruntime==1.25.0`.
+- Cloned Qwen reference source at:
+  `/home/user1/qwen3_tts_cuda/vendor/Qwen3-TTS`
+  (`022e286b98fbec7e1e916cb940cdf532cd9f488e`).
+- Downloaded official Base model for reference-audio cloning:
+  `/home/user1/qwen3_tts_cuda/models/Qwen3-TTS-12Hz-1.7B-Base` (4.3G).
+  The official HF repos contain PyTorch `speech_tokenizer/` weights, not split
+  ONNX encoder/speaker-encoder files.
+- Downloaded a split 1.7B ONNX shared codec stack from
+  `xkos/Qwen3-TTS-12Hz-1.7B-ONNX`:
+  `/home/user1/qwen3_tts_cuda/models/xkos-qwen3-tts-12hz-1.7b-onnx`.
+  ONNX contracts:
+  - `speaker_encoder.onnx`: `mel_spectrogram [batch,time,128] -> speaker_embedding [batch,2048]`
+  - `speech_tokenizer_encoder.onnx`: `input_values [batch,1,audio_len] -> audio_codes [batch,16,codes_len]`
+  - `speech_tokenizer_decoder.onnx`: `codes [batch,seq_len,16] -> audio [batch,audio_len]`
+- Confirmed the existing cgisky decoder is a streaming decoder, not the simple
+  stateless wrapper:
+  `audio_codes [1,num_frames,16]` plus `is_last`, conv history, latent buffer,
+  and 8 layers of KV cache state -> `final_wav`, `valid_samples`, next caches.
+
+Harness:
+
+```text
+/home/user1/qwen3_tts_cuda/scripts/tts_e2e_bench.py
+OminiX-Ascend/scripts/tts_e2e_bench.py
+```
+
+The harness loads the official Base model, creates a voice-clone prompt from
+reference audio/text, runs Talker generation, decodes codec frames to 24 kHz
+audio, writes WAV, and records timing/memory JSON.
+
+### End-to-End Audio Measurement
+
+Canonical prompt:
+
+```text
+The quick brown fox jumps over the lazy dog.
+```
+
+Reference audio:
+
+```text
+/home/user1/qwen3_tts_cuda/inputs/qwen3_tts_clone_ref.wav
+```
+
+Reference text:
+
+```text
+Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.
+```
+
+Hot official Base run, one warmup + three measured runs in one loaded model:
+
+```text
+metrics: /home/user1/qwen3_tts_cuda/logs/qwen3_tts_e2e_base_hot3_metrics.json
+wav:     /home/user1/qwen3_tts_cuda/outputs/qwen3_tts_e2e_quick_brown_fox_hot.wav
+```
+
+| Metric | Result |
+| --- | ---: |
+| Model load wall | 27.08 s |
+| Mean total synthesis wall | 3.103 s |
+| Median total synthesis wall | 3.205 s |
+| Mean end-to-end audio fps | 11.53 fps |
+| Median end-to-end audio fps | 11.55 fps |
+| Mean Talker decode | 12.11 tok/s |
+| Median Talker decode | 12.12 tok/s |
+| Mean codec-only decode | 0.0963 s |
+| Mean codec-only fps | 368.66 fps |
+| Reference prompt build | 0.0332 s mean after warmup |
+| Realtime factor | 0.922x mean |
+| Peak CUDA allocated | 4.62 GB |
+| First-token latency | not measured in official non-streaming path |
+| First-audio latency | not measured in official non-streaming path |
+
+One-shot runs:
+
+| Run | Total wall | Audio fps | Talker tok/s | Codec fps | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| URL ref audio | 6.297 s | 5.56 | 11.11 | 236.92 | Includes cold-ish reference processing path |
+| Local ref audio | 9.754 s | 3.59 | 11.42 | 229.68 | One-shot; slower prompt encode/compile variance |
+
+Interpretation:
+
+- The audio loop is now closed and produces valid 24 kHz WAV output.
+- Codec decode is not the bottleneck on the official path; it is already
+  hundreds of codec frames/sec after warmup.
+- The official PyTorch Talker loop is the bottleneck at ~12 tok/s, far below
+  the raw vLLM first-codebook microbench of 131.78 tok/s.
+- The current end-to-end official Base result is below the Ascend shipping
+  reference of 32.2 fps. It is a correctness/measurement closure, not the
+  target CUDA result.
+- The previous vLLM 131.78 tok/s number remains a raw first-codebook ceiling,
+  not an audio fps claim, until the code-predictor hidden-state loop is wired
+  inside or alongside vLLM.
+
+### Next Measurements / Work
+
+1. Implement a vLLM-compatible Qwen3-TTS runner that preserves the official
+   code-predictor feedback loop:
+   `prompt_embeds -> Talker hidden -> first codec ID -> predictor 15 IDs -> next embed`.
+2. Reuse the split ONNX codec stack or the official PyTorch speech tokenizer
+   for decode once vLLM produces complete `[T,16]` codec frames.
+3. Re-measure first-token latency and first-audio latency on the real streaming
+   path. The official path above cannot report these because it is
+   non-streaming at the API level.
+4. After complete-code vLLM generation works, re-test CUDA graphs, FP8 KV, and
+   ONNX Runtime CUDA/TensorRT codec execution. Current evidence says the codec
+   is already fast enough; the missing lever is Talker/code-predictor coupling.
