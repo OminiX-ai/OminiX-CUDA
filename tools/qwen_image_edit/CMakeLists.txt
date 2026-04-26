@@ -29,6 +29,18 @@ message(STATUS "qwen_image_edit: native CUDA engine ENABLED "
                "(CUDA ${CUDAToolkit_VERSION}, sm=${CMAKE_CUDA_ARCHITECTURES})")
 
 # ---------------------------------------------------------------------------
+# Phase 3.2 CUDA kernel static lib — qwen_image_edit_cuda_kernels
+# ---------------------------------------------------------------------------
+add_library(qwen_image_edit_cuda_kernels STATIC
+    native/cuda_kernels/dit_kernels.cu
+)
+target_include_directories(qwen_image_edit_cuda_kernels PUBLIC native)
+set_target_properties(qwen_image_edit_cuda_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE  ON)
+target_compile_features(qwen_image_edit_cuda_kernels PUBLIC cxx_std_17)
+
+# ---------------------------------------------------------------------------
 # Phase 3.1 smoke harness — test_image_diffusion_cuda_init
 # ---------------------------------------------------------------------------
 add_executable(test_image_diffusion_cuda_init
@@ -37,7 +49,8 @@ add_executable(test_image_diffusion_cuda_init
 )
 target_link_libraries     (test_image_diffusion_cuda_init PUBLIC  ggml qwen_common)
 target_link_libraries     (test_image_diffusion_cuda_init PRIVATE Threads::Threads
-                                                                    CUDA::cudart CUDA::cublas)
+                                                                    CUDA::cudart CUDA::cublas
+                                                                    qwen_image_edit_cuda_kernels)
 target_include_directories(test_image_diffusion_cuda_init PUBLIC  .)
 target_include_directories(test_image_diffusion_cuda_init PRIVATE
     ../.. ../../vendor native
@@ -58,3 +71,33 @@ endif()
 install(TARGETS test_image_diffusion_cuda_init RUNTIME)
 message(STATUS "qwen_image_edit: Phase 3.1 smoke harness ENABLED "
                "(test_image_diffusion_cuda_init)")
+
+# ---------------------------------------------------------------------------
+# Phase 3.2 smoke harness — test_image_diffusion_cuda_block
+# ---------------------------------------------------------------------------
+add_executable(test_image_diffusion_cuda_block
+    native/test_image_diffusion_cuda_block.cpp
+    native/image_diffusion_cuda_engine.cpp
+)
+target_link_libraries     (test_image_diffusion_cuda_block PUBLIC  ggml qwen_common)
+target_link_libraries     (test_image_diffusion_cuda_block PRIVATE Threads::Threads
+                                                                     CUDA::cudart CUDA::cublas
+                                                                     qwen_image_edit_cuda_kernels)
+target_include_directories(test_image_diffusion_cuda_block PUBLIC  .)
+target_include_directories(test_image_diffusion_cuda_block PRIVATE
+    ../.. ../../vendor native
+    ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_image_diffusion_cuda_block PRIVATE
+    QWEN_IMAGE_EDIT_HAS_CUDA=1)
+target_compile_features   (test_image_diffusion_cuda_block PRIVATE cxx_std_17)
+if(OMINIX_CUDA_USE_CUDNN)
+    target_link_libraries     (test_image_diffusion_cuda_block PRIVATE CUDA::cudnn)
+    target_compile_definitions(test_image_diffusion_cuda_block PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+endif()
+if(BUILD_SHARED_LIBS)
+    set_target_properties(test_image_diffusion_cuda_block PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+endif()
+install(TARGETS test_image_diffusion_cuda_block RUNTIME)
+message(STATUS "qwen_image_edit: Phase 3.2 block-forward smoke harness ENABLED "
+               "(test_image_diffusion_cuda_block)")

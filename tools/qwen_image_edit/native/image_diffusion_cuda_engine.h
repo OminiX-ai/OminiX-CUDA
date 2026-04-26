@@ -142,9 +142,21 @@ public:
                         int device = 0);
 
     // Phase 3.2 — single-block joint forward: img/txt streams in/out, plus
-    // modulation vector (timestep + pooled text embedding). Stub aborts
-    // in Phase 3.1.
-    void forward_block(int block_idx,
+    // modulation vector. Inputs/outputs are F32 host buffers:
+    //   img_in / img_out : [img_seq_len, hidden]  F32
+    //   txt_in / txt_out : [txt_seq_len, hidden]  F32
+    //   mod_vec          : [12 * hidden]          F32
+    //                       layout: [img_scale1, img_shift1, img_gate1,
+    //                                img_scale2, img_shift2, img_gate2,
+    //                                txt_scale1, txt_shift1, txt_gate1,
+    //                                txt_scale2, txt_shift2, txt_gate2]
+    //                       (mirrors Ascend's "scale-first" empirical legacy
+    //                       chunk binding — see Ascend ref §5.5.7. Phase 3.2
+    //                       smoke ingests synthetic mod, parity is Phase 3.3.)
+    //   block_idx        : 0..n_blocks-1
+    // Returns true on success, false on any device / cuBLAS error. Output
+    // buffers are populated only on true.
+    bool forward_block(int block_idx,
                        const float *img_in, int img_seq_len,
                        const float *txt_in, int txt_seq_len,
                        const float *mod_vec,
@@ -196,6 +208,28 @@ private:
     // Diagnostics
     size_t total_weight_bytes_ = 0;
     size_t nonfinite_weight_count_ = 0;
+
+    // ---- Phase 3.2 forward-block scratch (lazy-allocated on first call) ----
+    // All sized for the smoke target: img_seq_max=4096, txt_seq_max=256.
+    int   scratch_img_seq_ = 0;
+    int   scratch_txt_seq_ = 0;
+    void *scratch_img_f16_     = nullptr;  // F16 [img_seq, H]
+    void *scratch_txt_f16_     = nullptr;  // F16 [txt_seq, H]
+    void *scratch_img_norm_    = nullptr;  // F16 [img_seq, H]
+    void *scratch_txt_norm_    = nullptr;  // F16 [txt_seq, H]
+    void *scratch_q_full_      = nullptr;  // F16 [seq_total, H]
+    void *scratch_k_full_      = nullptr;  // F16 [seq_total, H]
+    void *scratch_v_full_      = nullptr;  // F16 [seq_total, H]
+    void *scratch_attn_full_   = nullptr;  // F16 [seq_total, H]
+    void *scratch_img_mlp_     = nullptr;  // F16 [img_seq, mlp_inter]
+    void *scratch_txt_mlp_     = nullptr;  // F16 [txt_seq, mlp_inter]
+    void *scratch_img_proj_    = nullptr;  // F16 [img_seq, H] (post out-proj)
+    void *scratch_txt_proj_    = nullptr;  // F16 [txt_seq, H]
+    void *scratch_mod_vec_f16_ = nullptr;  // F16 [12 * H]
+    void *scratch_rope_cos_    = nullptr;  // F16 [seq_total, head_dim/2]
+    void *scratch_rope_sin_    = nullptr;  // F16 [seq_total, head_dim/2]
+
+    bool ensure_scratch_(int img_seq_len, int txt_seq_len);
 
     // Helpers
     void alloc_dev_(void **ptr, size_t bytes);
