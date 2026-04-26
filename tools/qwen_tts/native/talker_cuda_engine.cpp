@@ -89,9 +89,19 @@ std::vector<float> load_gguf_tensor_f32(ggml_context *ggml_ctx,
         const ggml_fp16_t *src = (const ggml_fp16_t *)t->data;
         for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(src[i]);
     } else {
-        fprintf(stderr, "[talker_cuda] %s: unsupported dtype %d\n",
-                name, (int)t->type);
-        return {};
+        // Generic dequant path: handles Q8_0, Q4_0, Q5_K, and any other
+        // quantized dtype ggml supports via its type-trait to_float hook.
+        // Phase 2.2: zgx-3675 ships only Q8_0 GGUF; this unblocks smoke
+        // and keeps the loader future-proof for additional quants.
+        const ggml_type_traits *tt = ggml_get_type_traits(t->type);
+        if (tt && tt->to_float) {
+            tt->to_float(t->data, out.data(), (int64_t)n);
+        } else {
+            fprintf(stderr,
+                    "[talker_cuda] %s: unsupported dtype %d (no to_float trait)\n",
+                    name, (int)t->type);
+            return {};
+        }
     }
     return out;
 }
