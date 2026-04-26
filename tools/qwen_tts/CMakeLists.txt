@@ -566,4 +566,32 @@ if(QWEN_TTS_CUDA)
         target_compile_definitions(test_talker_cuda_decode PRIVATE OMINIX_CUDA_USE_CUDNN=1)
     endif()
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.2 decode smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.3 smoke harness — test_talker_cuda_autoreg
+    #
+    # Drives a true autoregressive loop: token_embd lookup → forward_decode
+    # → CPU lm_head matvec → argmax → next-token. Reports tokens/sec and
+    # token-sequence sanity (not-all-same, not-degenerate runs). The lm_head
+    # matmul stays on host for Phase 2.3; Phase 2.4 will move it onto GPU.
+    # ---------------------------------------------------------------------
+    add_executable(test_talker_cuda_autoreg
+        native/test_talker_cuda_autoreg.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_talker_cuda_autoreg PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_talker_cuda_autoreg PRIVATE Threads::Threads
+                                                                  CUDA::cudart CUDA::cublas
+                                                                  qwen_tts_cuda_kernels)
+    target_include_directories(test_talker_cuda_autoreg PUBLIC  .)
+    target_include_directories(test_talker_cuda_autoreg PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_talker_cuda_autoreg PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_talker_cuda_autoreg PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_talker_cuda_autoreg PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_talker_cuda_autoreg PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.3 autoreg smoke ENABLED")
 endif()
