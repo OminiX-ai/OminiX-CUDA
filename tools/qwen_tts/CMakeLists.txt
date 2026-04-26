@@ -594,4 +594,37 @@ if(QWEN_TTS_CUDA)
         target_compile_definitions(test_talker_cuda_autoreg PRIVATE OMINIX_CUDA_USE_CUDNN=1)
     endif()
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.3 autoreg smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.4 smoke harness — test_codec_cuda
+    #
+    # The qwen3_tts_predictor.gguf shipped on zgx-3675 is a flat llama.cpp
+    # Qwen3 transformer export with the SAME tensor schema as the Talker
+    # GGUF (blk.<L>.attn_q.weight etc.); only the hyperparameters differ
+    # (5 layers / hidden 1024 / FFN 3072 / vocab 30720 = 15 groups × 2048).
+    # Phase 2.4 reuses TalkerCudaEngine directly with a TalkerConfig
+    # populated from CodePredictorConfig values, then drives a 256-step
+    # autoreg loop to prove the transformer engine works on codec dims.
+    # No new engine source needed; binary just links the existing
+    # talker_cuda_engine.cpp + qwen_tts_cuda_kernels static lib.
+    # ---------------------------------------------------------------------
+    add_executable(test_codec_cuda
+        native/test_codec_cuda.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_codec_cuda PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_codec_cuda PRIVATE Threads::Threads
+                                                        CUDA::cudart CUDA::cublas
+                                                        qwen_tts_cuda_kernels)
+    target_include_directories(test_codec_cuda PUBLIC  .)
+    target_include_directories(test_codec_cuda PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_codec_cuda PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_codec_cuda PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_codec_cuda PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_codec_cuda PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.4 codec smoke ENABLED")
 endif()
