@@ -468,6 +468,18 @@ bool TalkerCudaEngine::init_from_gguf(const std::string &gguf_path,
     // ---- Decode-graph cache placeholder (Phase 2.5) -----------------------
     decode_graph_execs_.assign(MAX_SEQ, nullptr);
 
+    // Phase 2.5 — env toggle. Mirrors Ascend TALKER_CP_ACLGRAPH=1 lever.
+    // Engine setter still works programmatically; this just gives smoke
+    // tests a no-source-edit way to flip it on.
+    if (const char *e = std::getenv("TALKER_USE_CUDA_GRAPHS")) {
+        if (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T') {
+            use_cuda_graphs_ = true;
+            fprintf(stderr,
+                    "[talker_cuda] CUDA Graphs enabled via "
+                    "TALKER_USE_CUDA_GRAPHS=%s\n", e);
+        }
+    }
+
     // Free GGUF context — Phase 2.2 re-opens it inside a dedicated weight-
     // upload helper that does the per-layer cudaMemcpyAsync.
     gguf_free(gguf_ctx);
@@ -731,6 +743,8 @@ void TalkerCudaEngine::forward_decode(const float *input_embed,
 
     // 1. Upload F32 input embedding to staging (sync H2D — small, off the
     //    inner loop). Then cast F32 -> F16 cur_dev_ on stream_.
+    //    Kept outside CUDA-graph capture: H2D from pageable host memory
+    //    is not always capturable, and the input pointer changes per call.
     cudaMemcpyAsync(input_stage_f32_dev_, input_embed,
                      (size_t)n_embd_ * sizeof(float),
                      cudaMemcpyHostToDevice, stream_);
@@ -738,7 +752,69 @@ void TalkerCudaEngine::forward_decode(const float *input_embed,
                              (__half *)cur_dev_, n_embd_, stream_);
 
     // 2. Run the 28-layer body. All ops on stream_.
-    run_decode_ops_(pos);
+    //    Phase 2.5: when use_cuda_graphs_ is on, capture the body once per
+    //    `pos` (KV-slot/RoPE-row pointers + seq_len_total are pos-baked),
+    //    then replay on every subsequent visit. cur_dev_/residual_dev_/
+    //    normed_dev_/etc. are stable buffers refilled per call by the
+    //    upstream cast above, so replay sees fresh inputs each time.
+    if (use_cuda_graphs_) {
+        cudaGraphExec_t exec = decode_graph_execs_[pos];
+        if (exec == nullptr) {
+            // First visit at this pos — capture.
+            cudaGraph_t graph = nullptr;
+            cudaError_t cerr = cudaStreamBeginCapture(
+                stream_, cudaStreamCaptureModeThreadLocal);
+            if (cerr != cudaSuccess) {
+                fprintf(stderr,
+                        "[talker_cuda] cudaStreamBeginCapture failed at pos=%d: "
+                        "%s — falling back to eager\n",
+                        pos, cudaGetErrorString(cerr));
+                run_decode_ops_(pos);
+            } else {
+                run_decode_ops_(pos);
+                cerr = cudaStreamEndCapture(stream_, &graph);
+                if (cerr != cudaSuccess || graph == nullptr) {
+                    fprintf(stderr,
+                            "[talker_cuda] cudaStreamEndCapture failed at "
+                            "pos=%d: %s — falling back to eager\n",
+                            pos, cudaGetErrorString(cerr));
+                } else {
+                    cerr = cudaGraphInstantiate(&exec, graph,
+                                                 nullptr, nullptr, 0);
+                    cudaGraphDestroy(graph);
+                    if (cerr != cudaSuccess || exec == nullptr) {
+                        fprintf(stderr,
+                                "[talker_cuda] cudaGraphInstantiate failed at "
+                                "pos=%d: %s — falling back to eager\n",
+                                pos, cudaGetErrorString(cerr));
+                        exec = nullptr;
+                    } else {
+                        decode_graph_execs_[pos] = exec;
+                        cudaError_t lerr =
+                            cudaGraphLaunch(exec, stream_);
+                        if (lerr != cudaSuccess) {
+                            fprintf(stderr,
+                                    "[talker_cuda] cudaGraphLaunch (post-cap) "
+                                    "failed at pos=%d: %s\n",
+                                    pos, cudaGetErrorString(lerr));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Replay path — the hot loop.
+            cudaError_t lerr = cudaGraphLaunch(exec, stream_);
+            if (lerr != cudaSuccess) {
+                fprintf(stderr,
+                        "[talker_cuda] cudaGraphLaunch failed at pos=%d: "
+                        "%s — falling back to eager\n",
+                        pos, cudaGetErrorString(lerr));
+                run_decode_ops_(pos);
+            }
+        }
+    } else {
+        run_decode_ops_(pos);
+    }
 
     // 3. D2H download of F32 output. Synchronizes so the caller can read
     //    `hidden_out` immediately (this matches the Ascend

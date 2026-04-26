@@ -236,6 +236,35 @@ int main(int argc, char **argv) {
     std::vector<int>   tokens;
     tokens.reserve(n_steps);
 
+    // Phase 2.5 — warmup pass under CUDA Graphs to populate per-pos cache.
+    const bool use_graphs = eng.use_cuda_graphs();
+    std::vector<int> warmup_tokens;
+    if (use_graphs) {
+        warmup_tokens.reserve(n_steps);
+        int cur_w = initial_token;
+        for (int pos = 0; pos < n_steps; ++pos) {
+            std::memcpy(input_emb.data(),
+                        token_embd_w.data() + (size_t)cur_w * n_embd,
+                        n_embd * sizeof(float));
+            eng.forward_decode(input_emb.data(), pos, hidden.data());
+            if (!check_finite(hidden.data(), n_embd, pos)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx);
+                return 1;
+            }
+            matvec_f32(lm_head_w.data(), hidden.data(), logits.data(),
+                        vocab_size, n_embd);
+            int nxt = argmax_f32(logits.data(), vocab_size);
+            warmup_tokens.push_back(nxt);
+            cur_w = nxt;
+        }
+        eng.reset_kv_cache();
+        printf("[codec] warmup pass complete (graphs captured) — "
+               "first 16 tokens:");
+        for (int i = 0; i < 16 && i < (int)warmup_tokens.size(); ++i)
+            printf(" %d", warmup_tokens[i]);
+        printf("\n");
+    }
+
     int cur = initial_token;
     auto t_start = std::chrono::high_resolution_clock::now();
     double total_engine_ms = 0.0;
@@ -266,6 +295,26 @@ int main(int argc, char **argv) {
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_wall_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    if (use_graphs && !warmup_tokens.empty()) {
+        int matches = 0;
+        int first_diff = -1;
+        for (size_t i = 0; i < tokens.size() && i < warmup_tokens.size(); ++i) {
+            if (tokens[i] == warmup_tokens[i]) ++matches;
+            else if (first_diff < 0) first_diff = (int)i;
+        }
+        double cossim = (double)matches / (double)tokens.size();
+        printf("[codec] graph parity: warm-vs-replay match %d/%d "
+               "(cossim=%.6f)  first_diff=%d\n",
+               matches, (int)tokens.size(), cossim, first_diff);
+        if (matches != (int)tokens.size()) {
+            fprintf(stderr,
+                    "[codec] FAIL: graph replay tokens differ from "
+                    "capture-pass tokens at index %d\n", first_diff);
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx);
+            return 1;
+        }
+    }
 
     // ---- 6. Sanity gates -----------------------------------------------
     std::set<int> uniq(tokens.begin(), tokens.end());
