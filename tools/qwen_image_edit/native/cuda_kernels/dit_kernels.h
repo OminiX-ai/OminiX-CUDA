@@ -128,4 +128,61 @@ void launch_attn_joint_naive_f16(const __half *q, const __half *k,
                                  int seq_total, int n_heads, int head_dim,
                                  float inv_sqrt_d, cudaStream_t stream);
 
+// Phase 3.3b — F32-input variant. Same math as launch_attn_joint_naive_f16
+// but Q/K/V/Y are F32 buffers. Used by the engine when AdaLN modulation
+// amplifies activations past the F16 representable ceiling (Ascend §5.5.46
+// equivalent: BF16 widening of Q/K/V outputs).
+void launch_attn_joint_naive_f32(const float *q, const float *k,
+                                 const float *v, float *y,
+                                 int seq_total, int n_heads, int head_dim,
+                                 float inv_sqrt_d, cudaStream_t stream);
+
+// F32 head-wise RMSNorm (matches launch_rmsnorm_head_f16_g32 layout).
+void launch_rmsnorm_head_f32_g32(const float *x, const float *gamma,
+                                  float *y, int rows, int n_heads,
+                                  int head_dim, float eps,
+                                  cudaStream_t stream);
+
+// F32 multi-axis NEOX RoPE (matches launch_rope_neox_3axis_f16 layout).
+void launch_rope_neox_3axis_f32(const float *x, const __half *cos,
+                                 const __half *sin, float *y,
+                                 int rows, int n_heads, int head_dim,
+                                 int pe_off, cudaStream_t stream);
+
+// F32 → F16 cast (separate name to avoid clash with existing _dit kernel).
+void launch_cast_f32_to_f16_2d(const float *in, __half *out, int n,
+                                cudaStream_t stream);
+
+// F32 bias add (broadcast).
+void launch_add_bias_f32_f32(float *y, const float *bias,
+                              int rows, int cols, cudaStream_t stream);
+
+// F32 LayerNorm (no affine).
+void launch_layernorm_noaffine_f32(const float *x, float *y,
+                                    int rows, int cols, float eps,
+                                    cudaStream_t stream);
+
+// F32 AdaLN-modulate (in-place): x = x * (1 + scale) + shift.
+// scale/shift remain F16 (the mod_vec scratch buffer is F16).
+void launch_adaln_modulate_f32(float *x, const __half *scale,
+                                const __half *shift, int rows, int cols,
+                                cudaStream_t stream);
+
+// F32 residual gated add: x[F32] += delta[F16] * gate[F16].
+void launch_gated_residual_add_f32(float *x, const __half *delta,
+                                    const __half *gate, int rows, int cols,
+                                    cudaStream_t stream);
+
+// F16 → F32 cast.
+void launch_cast_f16_to_f32_2d(const __half *in, float *out, int n,
+                                cudaStream_t stream);
+
+// F32 residual gated add with F32 delta: x[F32] += delta[F32] * gate[F16].
+void launch_gated_residual_add_f32_delta(float *x, const float *delta,
+                                          const __half *gate, int rows, int cols,
+                                          cudaStream_t stream);
+
+// F32 GELU-tanh elementwise (in-place).
+void launch_gelu_tanh_f32(float *x, int n, cudaStream_t stream);
+
 }  // namespace ominix_cuda

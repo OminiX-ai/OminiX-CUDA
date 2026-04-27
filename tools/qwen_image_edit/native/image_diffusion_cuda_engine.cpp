@@ -202,10 +202,16 @@ ImageDiffusionCudaEngine::~ImageDiffusionCudaEngine() {
 
     safe_free(scratch_img_f16_);  safe_free(scratch_txt_f16_);
     safe_free(scratch_img_norm_); safe_free(scratch_txt_norm_);
+    safe_free(scratch_img_resid_f32_); safe_free(scratch_txt_resid_f32_);
+    safe_free(scratch_img_norm_f32_);  safe_free(scratch_txt_norm_f32_);
     safe_free(scratch_q_full_);   safe_free(scratch_k_full_);
     safe_free(scratch_v_full_);   safe_free(scratch_attn_full_);
+    safe_free(scratch_q_full_f32_); safe_free(scratch_k_full_f32_);
+    safe_free(scratch_v_full_f32_); safe_free(scratch_attn_f32_);
     safe_free(scratch_img_mlp_);  safe_free(scratch_txt_mlp_);
     safe_free(scratch_img_proj_); safe_free(scratch_txt_proj_);
+    safe_free(scratch_img_mlp_f32_); safe_free(scratch_txt_mlp_f32_);
+    safe_free(scratch_img_proj_f32_); safe_free(scratch_txt_proj_f32_);
     safe_free(scratch_mod_vec_f16_);
     // Phase 3.3a: pe-table + t_emb buffers.
     safe_free(pe_cos_dev_);       safe_free(pe_sin_dev_);
@@ -616,10 +622,16 @@ bool ImageDiffusionCudaEngine::ensure_scratch_(int img_seq_len, int txt_seq_len)
     auto re = [&](void **p) { if (*p) { cudaFree(*p); *p = nullptr; } };
     re(&scratch_img_f16_);  re(&scratch_txt_f16_);
     re(&scratch_img_norm_); re(&scratch_txt_norm_);
+    re(&scratch_img_resid_f32_); re(&scratch_txt_resid_f32_);
+    re(&scratch_img_norm_f32_);  re(&scratch_txt_norm_f32_);
     re(&scratch_q_full_);   re(&scratch_k_full_);
     re(&scratch_v_full_);   re(&scratch_attn_full_);
+    re(&scratch_q_full_f32_); re(&scratch_k_full_f32_);
+    re(&scratch_v_full_f32_); re(&scratch_attn_f32_);
     re(&scratch_img_mlp_);  re(&scratch_txt_mlp_);
     re(&scratch_img_proj_); re(&scratch_txt_proj_);
+    re(&scratch_img_mlp_f32_); re(&scratch_txt_mlp_f32_);
+    re(&scratch_img_proj_f32_); re(&scratch_txt_proj_f32_);
     re(&scratch_mod_vec_f16_);
 
     const size_t H        = (size_t)cfg_.hidden;
@@ -643,14 +655,27 @@ bool ImageDiffusionCudaEngine::ensure_scratch_(int img_seq_len, int txt_seq_len)
     ok = ok && alloc(&scratch_txt_f16_,     txt_seq * H   * hsz);
     ok = ok && alloc(&scratch_img_norm_,    img_seq * H   * hsz);
     ok = ok && alloc(&scratch_txt_norm_,    txt_seq * H   * hsz);
+    ok = ok && alloc(&scratch_img_resid_f32_, img_seq * H * sizeof(float));
+    ok = ok && alloc(&scratch_txt_resid_f32_, txt_seq * H * sizeof(float));
+    ok = ok && alloc(&scratch_img_norm_f32_,  img_seq * H * sizeof(float));
+    ok = ok && alloc(&scratch_txt_norm_f32_,  txt_seq * H * sizeof(float));
     ok = ok && alloc(&scratch_q_full_,      seq_tot * H   * hsz);
     ok = ok && alloc(&scratch_k_full_,      seq_tot * H   * hsz);
     ok = ok && alloc(&scratch_v_full_,      seq_tot * H   * hsz);
     ok = ok && alloc(&scratch_attn_full_,   seq_tot * H   * hsz);
+    // Phase 3.3b — F32 mirrors for the widened attention path.
+    ok = ok && alloc(&scratch_q_full_f32_,  seq_tot * H   * sizeof(float));
+    ok = ok && alloc(&scratch_k_full_f32_,  seq_tot * H   * sizeof(float));
+    ok = ok && alloc(&scratch_v_full_f32_,  seq_tot * H   * sizeof(float));
+    ok = ok && alloc(&scratch_attn_f32_,    seq_tot * H   * sizeof(float));
     ok = ok && alloc(&scratch_img_mlp_,     img_seq * MLP * hsz);
     ok = ok && alloc(&scratch_txt_mlp_,     txt_seq * MLP * hsz);
     ok = ok && alloc(&scratch_img_proj_,    img_seq * H   * hsz);
     ok = ok && alloc(&scratch_txt_proj_,    txt_seq * H   * hsz);
+    ok = ok && alloc(&scratch_img_mlp_f32_, img_seq * MLP * sizeof(float));
+    ok = ok && alloc(&scratch_txt_mlp_f32_, txt_seq * MLP * sizeof(float));
+    ok = ok && alloc(&scratch_img_proj_f32_, img_seq * H   * sizeof(float));
+    ok = ok && alloc(&scratch_txt_proj_f32_, txt_seq * H   * sizeof(float));
     ok = ok && alloc(&scratch_mod_vec_f16_, 12 * H        * hsz);
     if (!ok) return false;
     scratch_img_seq_ = img_seq_len;
@@ -790,38 +815,43 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
     auto &lw = blocks_[block_idx];
     cudaStream_t s = stream_;
 
-    // ---- Upload inputs (F32 host -> F16 device) ----
-    // img_in [img_seq, H], txt_in [txt_seq, H].  mod_vec is derived internally
-    // from `timestep` (Phase 3.3a Gate B + C).
-    {
-        std::vector<__half> img_h((size_t)img_seq * H);
-        std::vector<__half> txt_h((size_t)txt_seq * H);
-        for (size_t i = 0; i < img_h.size(); ++i) img_h[i] = __float2half(img_in[i]);
-        for (size_t i = 0; i < txt_h.size(); ++i) txt_h[i] = __float2half(txt_in[i]);
-        OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_img_f16_, img_h.data(),
-                                         img_h.size() * sizeof(__half),
-                                         cudaMemcpyHostToDevice, s));
-        OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_txt_f16_, txt_h.data(),
-                                         txt_h.size() * sizeof(__half),
-                                         cudaMemcpyHostToDevice, s));
-    }
+    // ---- Upload inputs (F32 host -> F32 device residual) ----
+    // Phase 3.3b: residual chain widened to F32 (Ascend §5.5.46 BF16 analog
+    // applied to the whole double-stream residual, not just Q/K/V).
+    OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_img_resid_f32_, img_in,
+                                     (size_t)img_seq * H * sizeof(float),
+                                     cudaMemcpyHostToDevice, s));
+    OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_txt_resid_f32_, txt_in,
+                                     (size_t)txt_seq * H * sizeof(float),
+                                     cudaMemcpyHostToDevice, s));
 
     // ---- Phase 3.3a Gate B: compute silu(t_emb) from timestep ----
     if (!compute_t_emb_(timestep)) return false;
 
     // Convenience pointer aliases.
-    __half *img_resid = (__half *)scratch_img_f16_;   // [img_seq, H]
-    __half *txt_resid = (__half *)scratch_txt_f16_;   // [txt_seq, H]
-    __half *img_norm  = (__half *)scratch_img_norm_;  // [img_seq, H]
-    __half *txt_norm  = (__half *)scratch_txt_norm_;  // [txt_seq, H]
-    __half *Q_full    = (__half *)scratch_q_full_;
-    __half *K_full    = (__half *)scratch_k_full_;
-    __half *V_full    = (__half *)scratch_v_full_;
+    float  *img_resid_f32 = (float *)scratch_img_resid_f32_;
+    float  *txt_resid_f32 = (float *)scratch_txt_resid_f32_;
+    float  *img_norm_f32  = (float *)scratch_img_norm_f32_;
+    float  *txt_norm_f32  = (float *)scratch_txt_norm_f32_;
+    __half *img_norm  = (__half *)scratch_img_norm_;  // F16 staging for GEMM input
+    __half *txt_norm  = (__half *)scratch_txt_norm_;
+    // F16 attention output buffer (fed into the F16 attention output
+    // projection). Q/K/V used by the widened-F32 attention path live in
+    // scratch_q_full_f32_ / k_full_f32_ / v_full_f32_; the F16 mirrors
+    // are retained for any downstream Phase 3.3c FMHA fallback.
     __half *A_full    = (__half *)scratch_attn_full_;
+    float  *Q_full_f32 = (float *)scratch_q_full_f32_;
+    float  *K_full_f32 = (float *)scratch_k_full_f32_;
+    float  *V_full_f32 = (float *)scratch_v_full_f32_;
+    float  *A_full_f32 = (float *)scratch_attn_f32_;
+    (void)scratch_q_full_; (void)scratch_k_full_; (void)scratch_v_full_;
     __half *img_mlp   = (__half *)scratch_img_mlp_;
     __half *txt_mlp   = (__half *)scratch_txt_mlp_;
-    __half *img_proj  = (__half *)scratch_img_proj_;
-    __half *txt_proj  = (__half *)scratch_txt_proj_;
+    float  *img_mlp_f32  = (float *)scratch_img_mlp_f32_;
+    float  *txt_mlp_f32  = (float *)scratch_txt_mlp_f32_;
+    float  *img_proj_f32 = (float *)scratch_img_proj_f32_;
+    float  *txt_proj_f32 = (float *)scratch_txt_proj_f32_;
+    (void)scratch_img_proj_; (void)scratch_txt_proj_;
     __half *mod_h_dev = (__half *)scratch_mod_vec_f16_;
 
     // mod_vec chunk pointers (12 chunks of H halfs each).
@@ -897,140 +927,199 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
 
     // -----------------------------------------------------------------------
     // 1. LayerNorm1 + AdaLN-modulate(scale1, shift1) for both streams.
+    //    F32 residual → F32 LN → F32 AdaLN → F16 cast for GEMM input.
     // -----------------------------------------------------------------------
-    launch_layernorm_noaffine_f16(img_resid, img_norm, img_seq, H, ln_eps, s);
-    launch_adaln_modulate_f16(img_norm, img_scale1, img_shift1,
+    launch_layernorm_noaffine_f32(img_resid_f32, img_norm_f32, img_seq, H, ln_eps, s);
+    launch_adaln_modulate_f32(img_norm_f32, img_scale1, img_shift1,
                                 img_seq, H, s);
-    launch_layernorm_noaffine_f16(txt_resid, txt_norm, txt_seq, H, ln_eps, s);
-    launch_adaln_modulate_f16(txt_norm, txt_scale1, txt_shift1,
+    launch_cast_f32_to_f16_2d(img_norm_f32, img_norm, img_seq * H, s);
+    launch_layernorm_noaffine_f32(txt_resid_f32, txt_norm_f32, txt_seq, H, ln_eps, s);
+    launch_adaln_modulate_f32(txt_norm_f32, txt_scale1, txt_shift1,
                                 txt_seq, H, s);
+    launch_cast_f32_to_f16_2d(txt_norm_f32, txt_norm, txt_seq * H, s);
 
     // -----------------------------------------------------------------------
-    // 2. QKV projections (per stream). Joint sequence layout: txt rows first,
-    //    then img rows. Q/K/V buffers are [seq_tot, H].
+    // 2. Phase 3.3b — QKV projections via F16-input / F32-output cuBLAS GEMM.
+    //    The widened F32 Q/K/V storage is the CUDA equivalent of Ascend
+    //    §5.5.46 BF16 widening: AdaLN-modulated img_norm/txt_norm (already
+    //    near the F16 ceiling under high-magnitude mod_vec) projected by
+    //    F16 weights would saturate to Inf in F16 storage. F32 output keeps
+    //    the dynamic range intact through attention.
     // -----------------------------------------------------------------------
-    if (!gemm_f16(txt_norm, (const __half *)lw.add_q_w, Q_full,
+    auto gemm_f16in_f32out = [&](const __half *X, const __half *W, float *Y,
+                                  int M, int K, int N, const float *bias) -> bool {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            cublas_,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            W, CUDA_R_16F, K,
+            X, CUDA_R_16F, K,
+            &beta,
+            Y, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[image_diffusion_cuda] cuBLAS GemmEx (f32 out) failed: %d\n",
+                    (int)st);
+            return false;
+        }
+        if (bias) {
+            launch_add_bias_f32_f32(Y, bias, M, N, s);
+        }
+        return true;
+    };
+    if (!gemm_f16in_f32out(txt_norm, (const __half *)lw.add_q_w, Q_full_f32,
                     txt_seq, H, H, (const float *)lw.add_q_b)) return false;
-    if (!gemm_f16(txt_norm, (const __half *)lw.add_k_w, K_full,
+    if (!gemm_f16in_f32out(txt_norm, (const __half *)lw.add_k_w, K_full_f32,
                     txt_seq, H, H, (const float *)lw.add_k_b)) return false;
-    if (!gemm_f16(txt_norm, (const __half *)lw.add_v_w, V_full,
+    if (!gemm_f16in_f32out(txt_norm, (const __half *)lw.add_v_w, V_full_f32,
                     txt_seq, H, H, (const float *)lw.add_v_b)) return false;
-    __half *Q_img = Q_full + (size_t)txt_seq * H;
-    __half *K_img = K_full + (size_t)txt_seq * H;
-    __half *V_img = V_full + (size_t)txt_seq * H;
-    if (!gemm_f16(img_norm, (const __half *)lw.to_q_w, Q_img,
+    float *Q_img_f32 = Q_full_f32 + (size_t)txt_seq * H;
+    float *K_img_f32 = K_full_f32 + (size_t)txt_seq * H;
+    float *V_img_f32 = V_full_f32 + (size_t)txt_seq * H;
+    if (!gemm_f16in_f32out(img_norm, (const __half *)lw.to_q_w, Q_img_f32,
                     img_seq, H, H, (const float *)lw.to_q_b)) return false;
-    if (!gemm_f16(img_norm, (const __half *)lw.to_k_w, K_img,
+    if (!gemm_f16in_f32out(img_norm, (const __half *)lw.to_k_w, K_img_f32,
                     img_seq, H, H, (const float *)lw.to_k_b)) return false;
-    if (!gemm_f16(img_norm, (const __half *)lw.to_v_w, V_img,
+    if (!gemm_f16in_f32out(img_norm, (const __half *)lw.to_v_w, V_img_f32,
                     img_seq, H, H, (const float *)lw.to_v_b)) return false;
 
     // -----------------------------------------------------------------------
-    // 3. Head-wise RMSNorm on Q / K (txt + img streams use different gammas).
+    // 3. Head-wise RMSNorm on Q / K (F32, in-place).
     // -----------------------------------------------------------------------
-    launch_rmsnorm_head_f16_g32(Q_full, (const float *)lw.norm_added_q_w,
-                                  Q_full, txt_seq, NH, HD, rms_eps, s);
-    launch_rmsnorm_head_f16_g32(K_full, (const float *)lw.norm_added_k_w,
-                                  K_full, txt_seq, NH, HD, rms_eps, s);
-    launch_rmsnorm_head_f16_g32(Q_img, (const float *)lw.norm_q_w,
-                                  Q_img, img_seq, NH, HD, rms_eps, s);
-    launch_rmsnorm_head_f16_g32(K_img, (const float *)lw.norm_k_w,
-                                  K_img, img_seq, NH, HD, rms_eps, s);
+    launch_rmsnorm_head_f32_g32(Q_full_f32, (const float *)lw.norm_added_q_w,
+                                  Q_full_f32, txt_seq, NH, HD, rms_eps, s);
+    launch_rmsnorm_head_f32_g32(K_full_f32, (const float *)lw.norm_added_k_w,
+                                  K_full_f32, txt_seq, NH, HD, rms_eps, s);
+    launch_rmsnorm_head_f32_g32(Q_img_f32, (const float *)lw.norm_q_w,
+                                  Q_img_f32, img_seq, NH, HD, rms_eps, s);
+    launch_rmsnorm_head_f32_g32(K_img_f32, (const float *)lw.norm_k_w,
+                                  K_img_f32, img_seq, NH, HD, rms_eps, s);
 
     // -----------------------------------------------------------------------
-    // 4. Phase 3.3a Gate A — multi-axis NEOX RoPE on Q / K.
-    //    Joint sequence layout: rows 0..txt_seq = txt, rows txt_seq..seq_tot
-    //    = img.  pe-table layout: rows 0..max_txt_seq = txt slots,
-    //    rows max_txt_seq..pe_total_pos = img slots.  → txt portion uses
-    //    pe_off=0, img portion uses pe_off=max_txt_seq.
+    // 4. Multi-axis NEOX RoPE on Q / K (F32 in-place).
     // -----------------------------------------------------------------------
     {
         const __half *pe_cos = (const __half *)pe_cos_dev_;
         const __half *pe_sin = (const __half *)pe_sin_dev_;
-        // txt portion (rows 0..txt_seq).
-        launch_rope_neox_3axis_f16(Q_full, pe_cos, pe_sin, Q_full,
+        launch_rope_neox_3axis_f32(Q_full_f32, pe_cos, pe_sin, Q_full_f32,
                                      txt_seq, NH, HD, /*pe_off=*/0, s);
-        launch_rope_neox_3axis_f16(K_full, pe_cos, pe_sin, K_full,
+        launch_rope_neox_3axis_f32(K_full_f32, pe_cos, pe_sin, K_full_f32,
                                      txt_seq, NH, HD, /*pe_off=*/0, s);
-        // img portion (rows txt_seq..seq_tot, pe rows max_txt_seq..).
-        launch_rope_neox_3axis_f16(Q_img, pe_cos, pe_sin, Q_img,
+        launch_rope_neox_3axis_f32(Q_img_f32, pe_cos, pe_sin, Q_img_f32,
                                      img_seq, NH, HD,
                                      /*pe_off=*/cfg_.max_txt_seq, s);
-        launch_rope_neox_3axis_f16(K_img, pe_cos, pe_sin, K_img,
+        launch_rope_neox_3axis_f32(K_img_f32, pe_cos, pe_sin, K_img_f32,
                                      img_seq, NH, HD,
                                      /*pe_off=*/cfg_.max_txt_seq, s);
     }
 
     // -----------------------------------------------------------------------
-    // 5. Joint cross-attention (smoke-grade naive kernel).
+    // 5. Joint cross-attention (F32 in/out, F32 accumulator throughout).
     // -----------------------------------------------------------------------
-    launch_attn_joint_naive_f16(Q_full, K_full, V_full, A_full,
+    launch_attn_joint_naive_f32(Q_full_f32, K_full_f32, V_full_f32, A_full_f32,
                                   seq_tot, NH, HD, inv_sqrt_d, s);
 
+    // Cast attention output back to F16 for the output projection. The
+    // output projection re-expresses the attention output back into the
+    // residual hidden space; the residual itself is bounded by AdaLN gate
+    // (≪ 1) and the per-block residual add, so F16 storage is safe again.
+    launch_cast_f32_to_f16_2d(A_full_f32, A_full, (int)((size_t)seq_tot * H), s);
+
+    // Phase 3.3b probe (gated by env): scan F32 attn output for NaN/Inf
+    // *before* the F16 cast to localize where overflow originates.
+    if (const char *e = std::getenv("OMINIX_CUDA_PROBE_ATTN"); e && e[0] == '1') {
+        cudaStreamSynchronize(s);
+        std::vector<float> probe((size_t)seq_tot * H);
+        cudaMemcpy(probe.data(), A_full_f32,
+                    probe.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost);
+        size_t nan = 0, inf = 0;
+        double max_abs = 0.0, sum_abs = 0.0;
+        for (float v : probe) {
+            if (std::isnan(v)) { ++nan; continue; }
+            if (std::isinf(v)) { ++inf; continue; }
+            double a = std::fabs((double)v);
+            sum_abs += a;
+            if (a > max_abs) max_abs = a;
+        }
+        size_t valid = probe.size() - nan - inf;
+        fprintf(stderr,
+                "[image_diffusion_cuda] probe(attn_f32)  n=%zu  mean_abs=%.4g  "
+                "max_abs=%.4g  NaN=%zu  Inf=%zu\n",
+                probe.size(), valid > 0 ? sum_abs / valid : 0.0,
+                max_abs, nan, inf);
+    }
+
     // -----------------------------------------------------------------------
-    // 6. Output projections (per stream). txt occupies rows [0..txt_seq),
-    //    img occupies rows [txt_seq..seq_tot).
+    // 6. Output projections (per stream). F16-in, F32-out (Phase 3.3b).
+    //    txt occupies rows [0..txt_seq), img occupies rows [txt_seq..seq_tot).
     // -----------------------------------------------------------------------
-    if (!gemm_f16(A_full, (const __half *)lw.to_add_out_w, txt_proj,
+    if (!gemm_f16in_f32out(A_full, (const __half *)lw.to_add_out_w, txt_proj_f32,
                     txt_seq, H, H, (const float *)lw.to_add_out_b)) return false;
-    if (!gemm_f16(A_full + (size_t)txt_seq * H,
-                    (const __half *)lw.to_out_0_w, img_proj,
+    if (!gemm_f16in_f32out(A_full + (size_t)txt_seq * H,
+                    (const __half *)lw.to_out_0_w, img_proj_f32,
                     img_seq, H, H, (const float *)lw.to_out_0_b)) return false;
 
     // -----------------------------------------------------------------------
-    // 7. Gated residual add: img_resid += img_proj * gate1; same for txt.
+    // 7. Gated residual add (F32 resid += F32 delta * F16 gate).
     // -----------------------------------------------------------------------
-    launch_gated_residual_add_f16(img_resid, img_proj, img_gate1,
-                                    img_seq, H, s);
-    launch_gated_residual_add_f16(txt_resid, txt_proj, txt_gate1,
-                                    txt_seq, H, s);
+    launch_gated_residual_add_f32_delta(img_resid_f32, img_proj_f32, img_gate1,
+                                          img_seq, H, s);
+    launch_gated_residual_add_f32_delta(txt_resid_f32, txt_proj_f32, txt_gate1,
+                                          txt_seq, H, s);
 
     // -----------------------------------------------------------------------
     // 8. LayerNorm2 + AdaLN-modulate(scale2, shift2).
     // -----------------------------------------------------------------------
-    launch_layernorm_noaffine_f16(img_resid, img_norm, img_seq, H, ln_eps, s);
-    launch_adaln_modulate_f16(img_norm, img_scale2, img_shift2,
+    launch_layernorm_noaffine_f32(img_resid_f32, img_norm_f32, img_seq, H, ln_eps, s);
+    launch_adaln_modulate_f32(img_norm_f32, img_scale2, img_shift2,
                                 img_seq, H, s);
-    launch_layernorm_noaffine_f16(txt_resid, txt_norm, txt_seq, H, ln_eps, s);
-    launch_adaln_modulate_f16(txt_norm, txt_scale2, txt_shift2,
+    launch_cast_f32_to_f16_2d(img_norm_f32, img_norm, img_seq * H, s);
+    launch_layernorm_noaffine_f32(txt_resid_f32, txt_norm_f32, txt_seq, H, ln_eps, s);
+    launch_adaln_modulate_f32(txt_norm_f32, txt_scale2, txt_shift2,
                                 txt_seq, H, s);
+    launch_cast_f32_to_f16_2d(txt_norm_f32, txt_norm, txt_seq * H, s);
 
     // -----------------------------------------------------------------------
-    // 9. FFN: Linear(H -> MLP) + GELU-tanh + Linear(MLP -> H), per stream.
+    // 9. FFN — F32 widened path (Phase 3.3b).
+    //    MLP_0 (F16-in F32-out) → GELU-tanh F32 → cast to F16 →
+    //    MLP_2 (F16-in F32-out). The cast in the middle is safe because
+    //    GELU is bounded by its input (no amplification), and the post-AdaLN
+    //    F16 input to MLP_0 was bounded by the F32 cast precondition.
     // -----------------------------------------------------------------------
-    if (!gemm_f16(img_norm, (const __half *)lw.img_mlp_0_w, img_mlp,
+    if (!gemm_f16in_f32out(img_norm, (const __half *)lw.img_mlp_0_w, img_mlp_f32,
                     img_seq, H, MLP, (const float *)lw.img_mlp_0_b)) return false;
-    launch_gelu_tanh_f16(img_mlp, img_seq * MLP, s);
-    if (!gemm_f16(img_mlp, (const __half *)lw.img_mlp_2_w, img_proj,
+    launch_gelu_tanh_f32(img_mlp_f32, img_seq * MLP, s);
+    launch_cast_f32_to_f16_2d(img_mlp_f32, img_mlp, img_seq * MLP, s);
+    if (!gemm_f16in_f32out(img_mlp, (const __half *)lw.img_mlp_2_w, img_proj_f32,
                     img_seq, MLP, H, (const float *)lw.img_mlp_2_b)) return false;
-    if (!gemm_f16(txt_norm, (const __half *)lw.txt_mlp_0_w, txt_mlp,
+    if (!gemm_f16in_f32out(txt_norm, (const __half *)lw.txt_mlp_0_w, txt_mlp_f32,
                     txt_seq, H, MLP, (const float *)lw.txt_mlp_0_b)) return false;
-    launch_gelu_tanh_f16(txt_mlp, txt_seq * MLP, s);
-    if (!gemm_f16(txt_mlp, (const __half *)lw.txt_mlp_2_w, txt_proj,
+    launch_gelu_tanh_f32(txt_mlp_f32, txt_seq * MLP, s);
+    launch_cast_f32_to_f16_2d(txt_mlp_f32, txt_mlp, txt_seq * MLP, s);
+    if (!gemm_f16in_f32out(txt_mlp, (const __half *)lw.txt_mlp_2_w, txt_proj_f32,
                     txt_seq, MLP, H, (const float *)lw.txt_mlp_2_b)) return false;
 
     // -----------------------------------------------------------------------
-    // 10. Gated residual add #2.
+    // 10. Gated residual add #2 (F32 resid += F32 delta * F16 gate).
     // -----------------------------------------------------------------------
-    launch_gated_residual_add_f16(img_resid, img_proj, img_gate2,
-                                    img_seq, H, s);
-    launch_gated_residual_add_f16(txt_resid, txt_proj, txt_gate2,
-                                    txt_seq, H, s);
+    launch_gated_residual_add_f32_delta(img_resid_f32, img_proj_f32, img_gate2,
+                                          img_seq, H, s);
+    launch_gated_residual_add_f32_delta(txt_resid_f32, txt_proj_f32, txt_gate2,
+                                          txt_seq, H, s);
 
-    // ---- Download output (F16 device -> F32 host) ----
-    {
-        std::vector<__half> img_h((size_t)img_seq * H);
-        std::vector<__half> txt_h((size_t)txt_seq * H);
-        OMX_CUDA_CHECK(cudaMemcpyAsync(img_h.data(), img_resid,
-                                         img_h.size() * sizeof(__half),
-                                         cudaMemcpyDeviceToHost, s));
-        OMX_CUDA_CHECK(cudaMemcpyAsync(txt_h.data(), txt_resid,
-                                         txt_h.size() * sizeof(__half),
-                                         cudaMemcpyDeviceToHost, s));
-        OMX_CUDA_CHECK(cudaStreamSynchronize(s));
-        for (size_t i = 0; i < img_h.size(); ++i) img_out[i] = __half2float(img_h[i]);
-        for (size_t i = 0; i < txt_h.size(); ++i) txt_out[i] = __half2float(txt_h[i]);
-    }
+    // ---- Download output (F32 device -> F32 host) ----
+    OMX_CUDA_CHECK(cudaMemcpyAsync(img_out, img_resid_f32,
+                                     (size_t)img_seq * H * sizeof(float),
+                                     cudaMemcpyDeviceToHost, s));
+    OMX_CUDA_CHECK(cudaMemcpyAsync(txt_out, txt_resid_f32,
+                                     (size_t)txt_seq * H * sizeof(float),
+                                     cudaMemcpyDeviceToHost, s));
+    OMX_CUDA_CHECK(cudaStreamSynchronize(s));
     return true;
 }
 
@@ -1041,6 +1130,171 @@ void ImageDiffusionCudaEngine::final_proj(const float * /*img_in*/,
             "[image_diffusion_cuda] final_proj is a Phase 3.3 stub — "
             "aborting\n");
     std::abort();
+}
+
+// Phase 3.3b — full 60-block DiT forward (Gate C). Mirrors Ascend
+// `denoise_full` per-step body for a single timestep:
+//   - Internalised t_emb chain runs once per call (block 0 reuses it).
+//   - Loop blk=0..59: forward_block(blk, ...).
+//   - Final tail: SiLU(t_emb) → norm_out.linear → split [scale, shift] →
+//     LayerNorm(img_resid) → modulate(scale, shift) → proj_out → F16
+//     [img_seq, patch_in].
+//
+// The engine does not own the patchify/unpatchify reshape — the caller
+// is responsible for converting [img_seq, patch_in] back to a latent
+// volume with whatever grid shape its denoiser expects.
+bool ImageDiffusionCudaEngine::forward_dit(float timestep,
+                                            const float *img_in,
+                                            int img_seq_len,
+                                            const float *txt_in,
+                                            int txt_seq_len,
+                                            float *img_out) {
+    if (!ready_) {
+        fprintf(stderr, "[image_diffusion_cuda] forward_dit: engine not ready\n");
+        return false;
+    }
+    if (img_in == nullptr || txt_in == nullptr || img_out == nullptr) {
+        fprintf(stderr, "[image_diffusion_cuda] forward_dit: null input/output\n");
+        return false;
+    }
+    const int H        = cfg_.hidden;
+    const int PATCH    = cfg_.patch_in;
+    const int img_seq  = img_seq_len;
+    const float ln_eps  = cfg_.ln_eps;
+
+    // We thread img/txt through forward_block via host scratch (the existing
+    // F32-host -> F16-device path). For 60 blocks this is ~60*(img_seq*H +
+    // txt_seq*H) F32 host bytes copied each iter — acceptable for a smoke
+    // verdict; Phase 3.3c will keep activations resident on device.
+    std::vector<float> img_buf_a(img_in, img_in + (size_t)img_seq_len * H);
+    std::vector<float> img_buf_b((size_t)img_seq_len * H, 0.0f);
+    std::vector<float> txt_buf_a(txt_in, txt_in + (size_t)txt_seq_len * H);
+    std::vector<float> txt_buf_b((size_t)txt_seq_len * H, 0.0f);
+
+    float *img_src = img_buf_a.data();
+    float *img_dst = img_buf_b.data();
+    float *txt_src = txt_buf_a.data();
+    float *txt_dst = txt_buf_b.data();
+
+    bool dump_blocks = false;
+    if (const char *e = std::getenv("OMINIX_CUDA_DUMP_BLOCKS"); e && e[0] == '1') {
+        dump_blocks = true;
+    }
+    for (int blk = 0; blk < cfg_.n_blocks; ++blk) {
+        if (!forward_block(blk,
+                            img_src, img_seq_len,
+                            txt_src, txt_seq_len,
+                            timestep,
+                            img_dst, txt_dst)) {
+            fprintf(stderr,
+                    "[image_diffusion_cuda] forward_dit: block %d FAILED\n", blk);
+            return false;
+        }
+        if (dump_blocks) {
+            size_t nan_i = 0, inf_i = 0; double max_i = 0.0;
+            for (size_t i = 0; i < (size_t)img_seq_len * H; ++i) {
+                float v = img_dst[i];
+                if (std::isnan(v)) { ++nan_i; continue; }
+                if (std::isinf(v)) { ++inf_i; continue; }
+                double a = std::fabs((double)v);
+                if (a > max_i) max_i = a;
+            }
+            fprintf(stderr,
+                    "[image_diffusion_cuda] forward_dit blk=%d  img max_abs=%.4g  NaN=%zu  Inf=%zu\n",
+                    blk, max_i, nan_i, inf_i);
+        }
+        std::swap(img_src, img_dst);
+        std::swap(txt_src, txt_dst);
+    }
+    // After the loop, img_src points at the final residual (img_seq, H).
+
+    // ---- Tail: norm_out (AdaLN-final) + proj_out -------------------------
+    // 1. compute_t_emb_ already populated silu_t_emb_f16_; but forward_block
+    //    overwrites it each call. Re-compute fresh so the tail uses the
+    //    same timestep.
+    if (!compute_t_emb_(timestep)) return false;
+
+    cudaStream_t s = stream_;
+
+    // 2. norm_out.linear: [1, H] @ norm_out_w[2H, H]^T + norm_out_b → [1, 2H].
+    //    Reuse scratch_mod_vec_f16_ buffer (>= 12*H halfs, fits 2H trivially).
+    __half *adaln_emb_f16 = (__half *)scratch_mod_vec_f16_;
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+            /*N=*/2 * H, /*M=*/1, /*K=*/H,
+            &alpha,
+            norm_out_w_, CUDA_R_16F, H,
+            silu_t_emb_f16_, CUDA_R_16F, H,
+            &beta,
+            adaln_emb_f16, CUDA_R_16F, 2 * H,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[image_diffusion_cuda] forward_dit: norm_out GEMM failed: %d\n", (int)st);
+            return false;
+        }
+        launch_add_bias_f32_f16(adaln_emb_f16, (const float *)norm_out_b_,
+                                 1, 2 * H, s);
+    }
+    // diffusers convention: chunk is [scale, shift] (first H = scale, second H = shift).
+    __half *norm_out_scale = adaln_emb_f16;
+    __half *norm_out_shift = adaln_emb_f16 + H;
+
+    // 3. Upload final img_resid (img_src host F32) to F32 device buffer.
+    if (!ensure_scratch_(img_seq_len, txt_seq_len)) return false;
+    OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_img_resid_f32_, img_src,
+                                     (size_t)img_seq * H * sizeof(float),
+                                     cudaMemcpyHostToDevice, s));
+    float  *img_resid_f32 = (float *)scratch_img_resid_f32_;
+    float  *img_norm_f32  = (float *)scratch_img_norm_f32_;
+    __half *img_norm  = (__half *)scratch_img_norm_;
+
+    // 4. LayerNorm(img_resid) → img_norm in F32.
+    launch_layernorm_noaffine_f32(img_resid_f32, img_norm_f32, img_seq, H, ln_eps, s);
+
+    // 5. AdaLN-modulate(img_norm, scale, shift) in F32.
+    //    x = x * (1 + scale) + shift.
+    launch_adaln_modulate_f32(img_norm_f32, norm_out_scale, norm_out_shift,
+                                img_seq, H, s);
+
+    // 5b. Cast to F16 for proj_out GEMM input (post-AdaLN values are
+    //     bounded ~hundreds, fits F16).
+    launch_cast_f32_to_f16_2d(img_norm_f32, img_norm, img_seq * H, s);
+
+    // 6. proj_out: img_norm[img_seq, H] @ proj_out_w[PATCH, H]^T +
+    //    proj_out_b → [img_seq, PATCH] F16. Reuse scratch_img_proj_ for
+    //    the patch-sized output (img_seq * PATCH halfs ≤ img_seq * H halfs).
+    __half *patch_out_f16 = (__half *)scratch_img_proj_;
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+            /*N=*/PATCH, /*M=*/img_seq, /*K=*/H,
+            &alpha,
+            proj_out_w_, CUDA_R_16F, H,
+            img_norm, CUDA_R_16F, H,
+            &beta,
+            patch_out_f16, CUDA_R_16F, PATCH,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[image_diffusion_cuda] forward_dit: proj_out GEMM failed: %d\n", (int)st);
+            return false;
+        }
+        launch_add_bias_f32_f16(patch_out_f16, (const float *)proj_out_b_,
+                                 img_seq, PATCH, s);
+    }
+
+    // 7. Download patch_out F16 → host F32.
+    {
+        std::vector<__half> h((size_t)img_seq * PATCH);
+        OMX_CUDA_CHECK(cudaMemcpyAsync(h.data(), patch_out_f16,
+                                         h.size() * sizeof(__half),
+                                         cudaMemcpyDeviceToHost, s));
+        OMX_CUDA_CHECK(cudaStreamSynchronize(s));
+        for (size_t i = 0; i < h.size(); ++i) img_out[i] = __half2float(h[i]);
+    }
+    return true;
 }
 
 }  // namespace ominix_cuda

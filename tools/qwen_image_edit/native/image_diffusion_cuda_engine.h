@@ -172,6 +172,23 @@ public:
     // Phase 3.3 — proj_out / norm_out post-final-block.
     void final_proj(const float *img_in, int seq_len, float *img_out);
 
+    // Phase 3.3b — full 60-block DiT forward.
+    //
+    //   img_in   : F32 [img_seq_len, hidden]  (post-img_in projection input)
+    //   txt_in   : F32 [txt_seq_len, hidden]
+    //   timestep : sigma_s * 1000
+    //   img_out  : F32 [img_seq_len, patch_in]   (post-norm_out + proj_out)
+    //
+    // After all 60 blocks: img_resid is fed through the AdaLN-final head
+    // (norm_out.linear → split shift/scale → LayerNorm → modulate) and then
+    // proj_out (Linear hidden→patch_in). The unpatchify step is left to the
+    // caller (it depends on the latent grid shape, which the engine does not
+    // own).
+    bool forward_dit(float timestep,
+                     const float *img_in, int img_seq_len,
+                     const float *txt_in, int txt_seq_len,
+                     float *img_out);
+
     bool is_ready() const { return ready_; }
     int  n_blocks() const { return cfg_.n_blocks; }
     const ImageDiffusionConfig &config() const { return cfg_; }
@@ -220,18 +237,41 @@ private:
     // All sized for the smoke target: img_seq_max=4096, txt_seq_max=256.
     int   scratch_img_seq_ = 0;
     int   scratch_txt_seq_ = 0;
-    void *scratch_img_f16_     = nullptr;  // F16 [img_seq, H]
+    void *scratch_img_f16_     = nullptr;  // F16 [img_seq, H] (GEMM-input cast staging)
     void *scratch_txt_f16_     = nullptr;  // F16 [txt_seq, H]
-    void *scratch_img_norm_    = nullptr;  // F16 [img_seq, H]
+    void *scratch_img_norm_    = nullptr;  // F16 [img_seq, H] (GEMM-input cast staging)
     void *scratch_txt_norm_    = nullptr;  // F16 [txt_seq, H]
+    // Phase 3.3b — F32 residual chain.  The DiT residual buffer + LN/AdaLN
+    // intermediate is stored in F32 to lift the F16 representable ceiling
+    // under high-magnitude AdaLN modulation (silu_t_emb max≈278, mod_vec
+    // max≈200+ after the per-block mod GEMM). F16 storage saturated to Inf
+    // in the post-FFN gated residual add. F32 storage is safe across all
+    // 60 blocks. F16 cast happens at GEMM-input boundaries only.
+    void *scratch_img_resid_f32_  = nullptr;  // F32 [img_seq, H]
+    void *scratch_txt_resid_f32_  = nullptr;  // F32 [txt_seq, H]
+    void *scratch_img_norm_f32_   = nullptr;  // F32 [img_seq, H]
+    void *scratch_txt_norm_f32_   = nullptr;  // F32 [txt_seq, H]
     void *scratch_q_full_      = nullptr;  // F16 [seq_total, H]
     void *scratch_k_full_      = nullptr;  // F16 [seq_total, H]
     void *scratch_v_full_      = nullptr;  // F16 [seq_total, H]
     void *scratch_attn_full_   = nullptr;  // F16 [seq_total, H]
+    // Phase 3.3b — F32 mirrors. The widened attention path (Ascend §5.5.46
+    // analog) writes Q/K/V from F32 GEMM output, applies F32 RMSNorm/RoPE,
+    // and runs the F32-input attention kernel. Output is cast back to F16
+    // for the output projection.
+    void *scratch_q_full_f32_  = nullptr;  // F32 [seq_total, H]
+    void *scratch_k_full_f32_  = nullptr;  // F32 [seq_total, H]
+    void *scratch_v_full_f32_  = nullptr;  // F32 [seq_total, H]
+    void *scratch_attn_f32_    = nullptr;  // F32 [seq_total, H]
     void *scratch_img_mlp_     = nullptr;  // F16 [img_seq, mlp_inter]
     void *scratch_txt_mlp_     = nullptr;  // F16 [txt_seq, mlp_inter]
     void *scratch_img_proj_    = nullptr;  // F16 [img_seq, H] (post out-proj)
     void *scratch_txt_proj_    = nullptr;  // F16 [txt_seq, H]
+    // Phase 3.3b — F32 MLP-stage / proj scratch (FFN amplifies past F16 ceiling).
+    void *scratch_img_mlp_f32_ = nullptr;  // F32 [img_seq, mlp_inter]
+    void *scratch_txt_mlp_f32_ = nullptr;  // F32 [txt_seq, mlp_inter]
+    void *scratch_img_proj_f32_ = nullptr; // F32 [img_seq, H]
+    void *scratch_txt_proj_f32_ = nullptr; // F32 [txt_seq, H]
     void *scratch_mod_vec_f16_ = nullptr;  // F16 [12 * H]
 
     // ---- Phase 3.3a multi-axis RoPE pe-table (init-time, persistent) -------
