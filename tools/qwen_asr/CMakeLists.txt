@@ -237,7 +237,43 @@ if(QWEN_ASR_CUDA)
                                 QWEN_ASR_HAS_CUDA=1)
     target_compile_features   (test_audio_encoder_cuda PRIVATE cxx_std_17)
 
+    # ---------------------------------------------------------------------
+    # Phase 4.3 + 4.4 E2E smoke harness — test_qwen_asr_cuda_e2e
+    #
+    # Full pipeline: WAV -> mel -> audio encode -> split prefill (sequential
+    # forward_decode over prefix tokens, audio embeds, suffix tokens) ->
+    # autoregressive greedy generation -> BPE decode -> transcript.
+    # Drives AsrCudaEngine + a host-side BPE tokenizer + host-side
+    # token_embd / lm_head matvec (Phase 2.3 pattern).
+    # ---------------------------------------------------------------------
+    add_executable(test_qwen_asr_cuda_e2e
+        native/test_qwen_asr_cuda_e2e.cpp
+        ../qwen_tts/native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_qwen_asr_cuda_e2e PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_qwen_asr_cuda_e2e PRIVATE Threads::Threads
+                                                                qwen_asr_cuda
+                                                                qwen_asr_cuda_kernels
+                                                                CUDA::cudart
+                                                                CUDA::cublas
+                                                                qwen_tts_cuda_kernels)
+    target_include_directories(test_qwen_asr_cuda_e2e PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tools
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts/native)
+    target_compile_definitions(test_qwen_asr_cuda_e2e PRIVATE
+                                QWEN_ASR_HAS_CUDA=1 QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_qwen_asr_cuda_e2e PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_qwen_asr_cuda_e2e PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_qwen_asr_cuda_e2e PRIVATE
+                                    OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+
     message(STATUS
-        "qwen_asr: OminiX-CUDA Phase 4.1+4.2 ASR ENABLED "
-        "(qwen_asr_cuda + test_qwen_asr_cuda_init + test_audio_encoder_cuda)")
+        "qwen_asr: OminiX-CUDA Phase 4.1+4.2+4.3+4.4 ASR ENABLED "
+        "(qwen_asr_cuda + test_qwen_asr_cuda_init + test_audio_encoder_cuda "
+        "+ test_qwen_asr_cuda_e2e)")
 endif()
