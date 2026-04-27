@@ -120,3 +120,88 @@ if(FALSE)
 else()
     message(STATUS "qwen_asr: native engine disabled (ominix-cuda Phase 4 CUDA port pending)")
 endif()
+
+# =============================================================================
+# OminiX-CUDA Phase 4.1 — native ASR scaffold on NVIDIA Blackwell.
+#
+# Builds a static library with the host-side mel spectrogram, the CUDA audio
+# encoder scaffold, and the top-level AsrCudaEngine. Reuses
+# tools/qwen_tts/native/talker_cuda_engine for the 28L Qwen3 text decoder,
+# identical to the TTS talker.
+#
+# Phase 4.1 deliverable: scaffold + GGUF parse + smoke test.
+#   Phase 4.2: audio encoder forward kernels.
+#   Phase 4.3: split-prefill helper (prefix_text + audio_embeds + suffix_text).
+#   Phase 4.4: end-to-end transcribe.
+# =============================================================================
+option(QWEN_ASR_CUDA "Build native CUDA ASR engine (Phase 4)" OFF)
+if(QWEN_ASR_CUDA)
+    if(NOT QWEN_TTS_CUDA)
+        message(FATAL_ERROR
+            "QWEN_ASR_CUDA=ON requires -DQWEN_TTS_CUDA=ON (the ASR text decoder "
+            "reuses TalkerCudaEngine).")
+    endif()
+
+    # Static library: mel spectrogram (CPU) + audio encoder (CUDA) +
+    # AsrCudaEngine (top-level orchestration).
+    add_library(qwen_asr_cuda STATIC
+        native/mel_spectrogram.cpp
+        native/audio_encoder_cuda_engine.cpp
+        native/asr_cuda_engine.cpp
+        ${KISSFFT_SRC}
+    )
+    target_link_libraries     (qwen_asr_cuda PUBLIC  ggml qwen_common)
+    target_link_libraries     (qwen_asr_cuda PRIVATE Threads::Threads
+                                                      CUDA::cudart CUDA::cublas
+                                                      qwen_tts_cuda_kernels)
+    target_include_directories(qwen_asr_cuda PUBLIC  native)
+    target_include_directories(qwen_asr_cuda PRIVATE
+        ../.. ../../vendor ${KISSFFT_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts/native)
+    target_compile_features   (qwen_asr_cuda PUBLIC  cxx_std_17)
+    target_compile_definitions(qwen_asr_cuda PUBLIC  QWEN_ASR_HAS_CUDA=1
+                                                      QWEN_TTS_HAS_CUDA=1)
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        target_compile_options(qwen_asr_cuda PRIVATE -march=armv8.2-a+fp16)
+    endif()
+    if (BUILD_SHARED_LIBS)
+        set_target_properties(qwen_asr_cuda
+            PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    # ---------------------------------------------------------------------
+    # Phase 4.1 smoke harness — test_qwen_asr_cuda_init
+    #
+    # Init AsrCudaEngine from <audio_encoder_gguf> + <text_decoder_gguf>,
+    # report counts and dimensions, exit 0.
+    # ---------------------------------------------------------------------
+    add_executable(test_qwen_asr_cuda_init
+        native/test_qwen_asr_cuda_init.cpp
+        ../qwen_tts/native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_qwen_asr_cuda_init PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_qwen_asr_cuda_init PRIVATE Threads::Threads
+                                                                qwen_asr_cuda
+                                                                CUDA::cudart
+                                                                CUDA::cublas
+                                                                qwen_tts_cuda_kernels)
+    target_include_directories(test_qwen_asr_cuda_init PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts
+        ${CMAKE_SOURCE_DIR}/tools/qwen_tts/native)
+    target_compile_definitions(test_qwen_asr_cuda_init PRIVATE
+                                QWEN_ASR_HAS_CUDA=1 QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_qwen_asr_cuda_init PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_qwen_asr_cuda_init PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_qwen_asr_cuda_init PRIVATE
+                                    OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS
+        "qwen_asr: OminiX-CUDA Phase 4.1 ASR scaffold ENABLED "
+        "(qwen_asr_cuda + test_qwen_asr_cuda_init)")
+endif()
