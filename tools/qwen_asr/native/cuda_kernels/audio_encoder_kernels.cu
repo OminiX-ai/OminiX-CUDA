@@ -268,22 +268,24 @@ __global__ void add_bias_rowmajor_f32_kernel(float *y, const float *bias,
 }
 
 // ---------------------------------------------------------------------------
-// NCHW → per-frame slab in (H outer, C inner) ggml order.
-//   out[(n*W + w) * H*C + h*C + c] = in[n*C*H*W + c*H*W + h*W + w]
+// NCHW → per-frame slab in (C outer, H inner) order — matches Python
+// `padded_embed.permute(0,3,1,2).contiguous().view(b, t, c*f)` where f (== H
+// here) is the innermost dimension of the flatten:
+//   out[(n*W + w) * C*H + c*H + h] = in[((n*C + c)*H + h)*W + w]
 // ---------------------------------------------------------------------------
 __global__ void nchw_to_frame_slab_hc_kernel(const float *in, float *out,
                                                  int N, int C, int H, int W) {
-    int hc  = blockIdx.x * blockDim.x + threadIdx.x;
+    int ch  = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y;
-    if (hc >= H * C) return;
+    if (ch >= C * H) return;
     int total_rows = N * W;
     if (row >= total_rows) return;
     int n = row / W;
     int w = row % W;
-    int h = hc / C;
-    int c = hc % C;
+    int c = ch / H;   // C outer
+    int h = ch % H;   // H inner
     size_t in_idx  = (((size_t)n * C + c) * H + h) * W + w;
-    size_t out_idx = (size_t)row * H * C + hc;
+    size_t out_idx = (size_t)row * C * H + ch;
     out[out_idx] = in[in_idx];
 }
 

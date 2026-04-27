@@ -36,6 +36,40 @@
 #include <string>
 #include <vector>
 
+namespace {
+// Phase 4.5 parity-debug: dump device buffer to a host F32 binary file when
+// the OMINIX_ASR_DUMP_DIR env var is set. Files are named
+// "<dump_dir>/<stage>.f32.bin". Caller passes byte count (NOT element count).
+void dump_dev_f32_(const char *stage, const void *dev_ptr, size_t bytes,
+                   cudaStream_t stream) {
+    const char *dir = std::getenv("OMINIX_ASR_DUMP_DIR");
+    if (!dir || !*dir) return;
+    std::vector<float> host(bytes / sizeof(float));
+    cudaStreamSynchronize(stream);
+    cudaError_t e = cudaMemcpy(host.data(), dev_ptr, bytes,
+                               cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        fprintf(stderr,
+                "[audio_encoder_cuda] dump %s: cudaMemcpy failed: %s\n",
+                stage, cudaGetErrorString(e));
+        return;
+    }
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%s.f32.bin", dir, stage);
+    FILE *f = std::fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[audio_encoder_cuda] dump %s: open %s failed\n",
+                stage, path);
+        return;
+    }
+    std::fwrite(host.data(), sizeof(float), host.size(), f);
+    std::fclose(f);
+    fprintf(stderr,
+            "[audio_encoder_cuda] DUMP %s -> %s (%zu floats)\n",
+            stage, path, host.size());
+}
+}  // namespace
+
 namespace ominix_cuda {
 
 #define CUDA_CHECK(expr)                                                       \
@@ -569,18 +603,28 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
         return true;
     };
 
+    // Dump padded mel pre-conv1 (chunk_num,1,128,max_chunk_len).
+    dump_dev_f32_("padded_mel", scratch_mel_,
+                  (size_t)chunk_num * h0 * w0 * sizeof(float), s);
+
     // Conv1: [N, 1, h0, w0] → [N, H, h1, w1]
     if (!conv_layer((const float *)scratch_mel_, 1, h0, w0,
                      (const float *)conv2d1_w_, (const float *)conv2d1_b_,
                      H, h1, w1, (float *)scratch_conv1_)) return false;
+    dump_dev_f32_("after_conv2d1", scratch_conv1_,
+                  (size_t)chunk_num * H * h1 * w1 * sizeof(float), s);
     // Conv2: [N, H, h1, w1] → [N, H, h2, w2]
     if (!conv_layer((const float *)scratch_conv1_, H, h1, w1,
                      (const float *)conv2d2_w_, (const float *)conv2d2_b_,
                      H, h2, w2, (float *)scratch_conv2_)) return false;
+    dump_dev_f32_("after_conv2d2", scratch_conv2_,
+                  (size_t)chunk_num * H * h2 * w2 * sizeof(float), s);
     // Conv3: [N, H, h2, w2] → [N, H, h3, w3]
     if (!conv_layer((const float *)scratch_conv2_, H, h2, w2,
                      (const float *)conv2d3_w_, (const float *)conv2d3_b_,
                      H, h3, w3, (float *)scratch_conv3_)) return false;
+    dump_dev_f32_("after_conv2d3", scratch_conv3_,
+                  (size_t)chunk_num * H * h3 * w3 * sizeof(float), s);
 
     // 3. Slab extraction in (H outer, C inner) order to produce
     //    [chunk_num * w3, h3 * H] = [chunk_num * frames_per_chunk, conv_out_dim_].
@@ -613,6 +657,10 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
             return false;
         }
     }
+    // Dump conv_out projection (chunk_num, frames_per_chunk, D_model)
+    // — should match Python `after_conv_out.npy`.
+    dump_dev_f32_("after_conv_out", scratch_conv_proj_,
+                  (size_t)chunk_num * frames_per_chunk * D * sizeof(float), s);
 
     // 5. Build chunk_offsets / chunk_valid on host and upload.
     std::vector<int> chunk_offsets(chunk_num);
@@ -638,6 +686,11 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
                                   chunk_num, frames_per_chunk, D,
                                   max_source_positions_, total_frames,
                                   (float *)scratch_concat_, s);
+
+    // Dump gathered+pos-emb-added valid frames; should match
+    // Python `hidden_states_input.npy` (122, 1024).
+    dump_dev_f32_("after_concat_pos", scratch_concat_,
+                  (size_t)total_frames * D * sizeof(float), s);
 
     // 7. 24L Pre-LN transformer.
     //    Residual chain (F32) lives in scratch_resid_; initialize from concat.
@@ -686,6 +739,10 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
                                        (const float *)L.self_attn_layer_norm_b,
                                        (float *)scratch_norm_,
                                        total_frames, D, 1e-5f, s);
+        if (il == 0) {
+            dump_dev_f32_("after_layer0_norm", scratch_norm_,
+                          (size_t)total_frames * D * sizeof(float), s);
+        }
 
         // Q, K, V projections.
         if (!gemm_f32((const float *)scratch_norm_,
@@ -717,6 +774,10 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
                        (const float *)L.out_proj_w, (float *)scratch_norm_,
                        total_frames, D, D, (const float *)L.out_proj_b))
             return false;
+        if (il == 0) {
+            dump_dev_f32_("after_layer0_attn", scratch_norm_,
+                          (size_t)total_frames * D * sizeof(float), s);
+        }
 
         // Residual add: resid += attn_out_proj.
         launch_resid_add_f32((float *)scratch_resid_,
@@ -749,6 +810,10 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
         launch_resid_add_f32((float *)scratch_resid_,
                                (const float *)scratch_norm_,
                                total_frames, D, s);
+        if (il == 0) {
+            dump_dev_f32_("after_layer0_full", scratch_resid_,
+                          (size_t)total_frames * D * sizeof(float), s);
+        }
     }
 
     // 8. Output MLP: ln_post + proj1 + GELU-erf + proj2.
@@ -766,6 +831,8 @@ bool AudioEncoderCudaEngine::encode(const float *mel, int n_mels, int mel_T,
                    (const float *)proj2_w_, (float *)scratch_output_,
                    total_frames, D, output_dim_, (const float *)proj2_b_))
         return false;
+    dump_dev_f32_("encoder_output", scratch_output_,
+                  (size_t)total_frames * output_dim_ * sizeof(float), s);
 
     // 9. Download to host.
     size_t out_bytes = (size_t)total_frames * output_dim_ * sizeof(float);

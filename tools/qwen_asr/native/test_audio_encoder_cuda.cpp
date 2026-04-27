@@ -60,17 +60,40 @@ int main(int argc, char **argv) {
     }
 
     // 3. Compute mel spectrogram on host.
-    MelSpectrogram mel_spec(/*sample_rate=*/16000, /*n_fft=*/400,
-                             /*hop_length=*/160, /*n_mels=*/eng.num_mel_bins());
+    //    Phase 4.5 parity-debug: if OMINIX_ASR_USE_MEL_BIN=<path> is set, load
+    //    raw F32 mel of shape (n_mels, mel_T) from that file instead of
+    //    computing from the WAV. mel_T is inferred from file size.
     std::vector<float> mel;
     int mel_T = 0;
-    if (!mel_spec.compute(audio.samples, mel, mel_T)) {
-        fprintf(stderr, "[smoke] mel_spec.compute FAILED\n");
-        return 1;
+    const char *mel_bin_env = std::getenv("OMINIX_ASR_USE_MEL_BIN");
+    if (mel_bin_env && *mel_bin_env) {
+        FILE *f = std::fopen(mel_bin_env, "rb");
+        if (!f) {
+            fprintf(stderr, "[smoke] cannot open mel bin: %s\n", mel_bin_env);
+            return 1;
+        }
+        std::fseek(f, 0, SEEK_END);
+        long bytes = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        size_t nfloats = (size_t)bytes / sizeof(float);
+        mel_T = (int)(nfloats / (size_t)eng.num_mel_bins());
+        mel.resize(nfloats);
+        std::fread(mel.data(), sizeof(float), nfloats, f);
+        std::fclose(f);
+        fprintf(stderr,
+                "[smoke] mel LOADED from %s: shape=(%d, %d) elems=%zu\n",
+                mel_bin_env, eng.num_mel_bins(), mel_T, mel.size());
+    } else {
+        MelSpectrogram mel_spec(/*sample_rate=*/16000, /*n_fft=*/400,
+                                 /*hop_length=*/160, /*n_mels=*/eng.num_mel_bins());
+        if (!mel_spec.compute(audio.samples, mel, mel_T)) {
+            fprintf(stderr, "[smoke] mel_spec.compute FAILED\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "[smoke] mel computed: shape=(%d, %d) elems=%zu\n",
+                eng.num_mel_bins(), mel_T, mel.size());
     }
-    fprintf(stderr,
-            "[smoke] mel computed: shape=(%d, %d) elems=%zu\n",
-            eng.num_mel_bins(), mel_T, mel.size());
 
     // 4. Run encoder forward.
     int max_frames = mel_T;   // generous upper bound (output ≤ mel_T / 4)
