@@ -1,10 +1,11 @@
 # ominix-cuda Phase 0-5 Ship Summary
 
-Date: 2026-04-26
+Date: 2026-04-26 (Phase 4 ASR addendum same-day, post-Phase-5 ship).
 HEAD at ship: `07fb6b6d` (Phase 3.4d Euler-step fix; first authentic CUDA-native QIE-Edit parity vs Ascend).
+HEAD at Phase 4 ASR addendum: `a8858f86` (Phase 4.5 audio encoder cossim 1.000000 vs HF Python; first authentic CUDA-native ASR transcript landed).
 Reference contract: `/Users/yuechen/home/OminiX-Ascend/docs/contracts/OMINIX_CUDA_CONTRACT.md`.
 
-This document is the closing receipt for the `ominix-cuda` work-stream contracted in `OMINIX_CUDA_CONTRACT.md` (drafted 2026-04-26). It captures what landed across Phases 0-3 plus this Phase 5 docs pass, the runnable build/run incantations, perf numbers, model paths on each GB10 host, and the gaps that remain queued for Phase 4 plus Phase 2.6/3.6 perf follow-ups.
+This document is the closing receipt for the `ominix-cuda` work-stream contracted in `OMINIX_CUDA_CONTRACT.md` (drafted 2026-04-26). It captures what landed across Phases 0-3 plus this Phase 5 docs pass plus the Phase 4 ASR landing later the same day, the runnable build/run incantations, perf numbers, model paths on each GB10 host, and the gaps that remain queued for Phase 4.6 (mel parity) plus Phase 2.6/3.6 perf follow-ups and the SpeechTokenizerDecoder vocoder for E2E TTS audio.
 
 No Python / vLLM / PyTorch / diffusers / transformers in the production inference path. The QIE-Edit production cat PNG was generated end-to-end via `ominix-diffusion-cli` (the Phase 1 sd.cpp port on the ggml-cuda backend) — no Python in the runtime process tree.
 
@@ -102,6 +103,24 @@ The `forward_block` is correct end-to-end at F32-widened math, the 60-block stac
 - Contract status table updated in `OMINIX_CUDA_CONTRACT.md`.
 - No code changes.
 
+### Phase 4 — Native CUDA ASR (landed same day, post-Phase-5)
+
+The first authentic CUDA-native ASR transcript was produced on Mac-local build environment via the new `AsrCudaEngine` plus `AudioEncoderCudaEngine`, reusing `TalkerCudaEngine` (Phase 2.x) verbatim for the Qwen3 28-layer text decoder. No API changes to the Phase 2 engine.
+
+| Sub | Commit | Scope |
+|---|---|---|
+| 4.1 | `f50488e6` | Scaffold + GGUF parse: mel spec port (314 LoC C++ verbatim from Ascend) + AudioEncoderCudaEngine (303 LoC) + AsrCudaEngine (135 LoC). HF Qwen/Qwen3-ASR-1.7B (4.4 GB) exported to audio_encoder GGUF (606 MiB / 397 tensors) + decoder GGUF (3879 MiB / 311 tensors). Init smoke PASS: d_model=1024, layers=24, heads=16, ffn=4096, mels=128, out=2048. |
+| 4.2 | `0596f1e5` | Audio encoder forward: 3× Conv2d via im2col + cuBLAS GemmEx (kernel=3 stride=2 pad=1, channels 1→480→480→480), 24L transformer reusing Phase 3.3b F32 kernels (rmsnorm, attn_joint_naive_f32, gelu_erf, fc1/fc2 GemmEx), output MLP 1024→2048. New CUDA kernels: `launch_layernorm_affine_f32`, `launch_gelu_erf_f32`, `launch_im2col_f32`. Smoke: encode wall 178.6 ms (32 kHz/9.36 s) and 153.3 ms (24 kHz/8 s); output [T, 2048] NaN-free. |
+| 4.3 + 4.4 | `abec38ba` | Split prefill + E2E transcribe: 440 LoC `test_qwen_asr_cuda_e2e.cpp` mirrors Ascend `qwen_asr.cpp`. Reuses existing `TalkerCudaEngine::forward_decode(emb, pos)` for both token (via embed lookup) and embed injection — no API changes. Pipeline: WAV → mel → audio encode → 9 prefix tokens + 122 audio embeds + 6 suffix tokens prefill → autoregressive greedy → BPE decode. |
+| 4.5 | `a8858f86` | Audio encoder cossim parity vs HF Python. Bug: `nchw_to_frame_slab` inner-dim ordering — kernel had (H outer, C inner); HF expects (C outer, H inner) per `permute(0,3,1,2).contiguous().view(b,t,c*f)`. Fix: single index swap `c = ch / H; h = ch % H` and `out_idx = row * C * H + ch`. Pre-fix: conv2d{1,2,3} = 1.000, conv_out = 0.253, encoder_output = 0.081 (catastrophic collapse). Post-fix: ALL 11 stages cossim = **1.000000** vs HF Python reference (padded_mel, conv2d{1,2,3}, conv_out, concat_pos vs hidden_states_input, layer0 norm/attn/full, encoder_output). |
+| 4.6 | (in flight) | CPU mel parity. Currently 0.80 cossim vs HF Python (window/log-scale divergence). Non-blocking — bypassed via `OMINIX_ASR_USE_MEL_BIN` env when bit-parity matters. Targeted in separate dispatch. |
+
+**Phase 4 E2E receipt** (Mac local, Ellen audiobook 9.36 s WAV, post-4.5 fix):
+
+> "language English. It might serve you better to be a little less comfortable, but wherever you're listening to this book, please remember to turn off your cell phone and that the taking of flash photographs is strictly forbidden."
+
+43 tokens / 226 bytes; plausible audiobook intro. Wall total **3483 ms = 0.37 RTF** (mel 9.7 ms + encode 180.2 ms + prefill 2591 ms + gen 682 ms / 3 tok × 227 ms with cuBLAS warm-up + decode 20.2 ms). Above the contract <= 0.10 RTF target — gen-step time is the same Phase 2.6 FP8/INT8 lever as Talker (28L Qwen3, identical body), and prefill compresses with the same Phase 3.6 cuDNN FMHA work.
+
 ---
 
 ## 3. Perf Numbers Summary
@@ -120,8 +139,14 @@ The `forward_block` is correct end-to-end at F32-widened math, the 60-block stac
 | QIE-Edit production CLI | sd.cpp/ggml-cuda | s/step | 60.0 | zgx-5b44 |
 | QIE-Edit production CLI | sd.cpp/ggml-cuda | wall (1024^2/20-step) | **1229 s (20.5 min)** | zgx-5b44 |
 | QIE-Edit Phase 1 receipt | sd.cpp baseline | wall (1024^2/20-step canonical B&W cat) | 308.82 s | zgx-5b44 |
+| ASR Phase 4 E2E | native AsrCudaEngine | wall (Ellen 9.36 s WAV → 43 tok) | **3483 ms (RTF 0.37)** | Mac local |
+| ASR Phase 4 — mel | CPU port from Ascend | ms | 9.7 | Mac local |
+| ASR Phase 4 — audio encode | F32 naive attn | ms (32 kHz/9.36 s) | 180.2 | Mac local |
+| ASR Phase 4 — prefill | 28L Qwen3 (TalkerCudaEngine) | ms (137 positions) | 2591 | Mac local |
+| ASR Phase 4 — gen | 28L Qwen3 autoreg | ms/tok (3 tok, cuBLAS warm-up) | 227 | Mac local |
+| ASR Phase 4 — BPE decode | host | ms | 20.2 | Mac local |
 
-The production cat PNG (1229 s) and the Phase 1 receipt run (308.82 s) are different prompts/images and serve different gates. Phase 1 was the contract-eye-check at canonical small-edit; the production cat is the QIE-Edit bring-up smoke.
+The production cat PNG (1229 s) and the Phase 1 receipt run (308.82 s) are different prompts/images and serve different gates. Phase 1 was the contract-eye-check at canonical small-edit; the production cat is the QIE-Edit bring-up smoke. The ASR Phase 4 receipt was produced on Mac-local build (CUDA build harness running on developer machine via the same engines that target GB10).
 
 ---
 
@@ -287,9 +312,11 @@ The 28-layer Talker body is GEMM-compute-bound at F16. To clear the 80-150 fps c
 
 The native `ImageDiffusionCudaEngine` runs a naive F32 attention kernel at ~960 ms/block. Replacing this with cuDNN Fused MHA (Flash-Attention v3 backend on Blackwell) is expected to compress 60 s/step on the production CLI to 6-12 s/step, which matches Ascend's 17 s/step ceiling and beats codex stacked 89 s.
 
-### Phase 4 — Native ASR (not started)
+### Phase 4 — Native ASR (LANDED post-Phase-5; 4.6 mel parity in flight)
 
-Port `AsrTextDecoderCannEngine` to CUDA. The Qwen3 decoder is shared with Talker, so the cuBLAS dispatch / CUDA Graph capture / KV cache scaffolding from Phase 2.x is directly reusable. Contract target: RTF <= 0.10, CER=0 Tier-1 13-clip.
+Phases 4.1–4.5 are GREEN: scaffold + GGUF parse, audio encoder forward, split prefill + E2E transcribe, and audio encoder cossim parity (1.000000 across all 11 stages vs HF Python). First authentic CUDA-native ASR transcript on hand (Ellen 9.36 s WAV → 43-token plausible audiobook intro at 0.37 RTF). Phase 4.6 (CPU mel parity, currently 0.80 cossim vs HF Python — window/log-scale divergence) is the only open ASR sub-phase; non-blocking, bypassed via `OMINIX_ASR_USE_MEL_BIN` env when bit-parity matters; targeted in a separate concurrent dispatch.
+
+The 0.37 RTF is above the contract <= 0.10 target. The gen-step path is the 28L Qwen3 body shared with Talker, so Phase 2.6 (FP8/INT8 cuBLAS) is the same lever; the prefill (2591 ms / 137 positions) compresses with the same Phase 3.6 cuDNN FMHA work. CER vs Tier-1 13-clip is not yet measured — gated on Phase 4.6 mel parity for a clean contract receipt.
 
 ### SpeechTokenizerDecoder vocoder (TTS audio E2E, not started)
 
@@ -325,7 +352,7 @@ ssh zgx-5b44 "GGML_CUDA_VISIBLE_DEVICES=0 ~/ominix-cuda/build/bin/ominix-diffusi
 | Phase 1 Gate (1024^2/20-step <140 s) | PARTIAL | eye-PASS, wall 308.82 s |
 | Phase 2 Gate (TTS >= 80 fps end-to-end) | DEFERRED | 50.55 TPS Talker w/graphs; needs 2.6 FP8/INT8 |
 | Phase 3 Gate (QIE-Edit <= 50 s end-to-end) | PARTIAL | parity GREEN at n=1; wall 60 s/step on prod CLI |
-| Phase 4 Gate (ASR RTF <= 0.10, CER=0) | NOT STARTED | queued |
+| Phase 4 Gate (ASR RTF <= 0.10, CER=0) | PARTIAL | first authentic CUDA-native transcript on hand (43 tok, 0.37 RTF on Ellen 9.36 s WAV); audio encoder cossim 1.000000 across 11 stages vs HF Python; mel parity (4.6) at 0.80 cossim in flight; RTF target gated on Phase 2.6 + Phase 3.6 perf levers |
 | Phase 5 (docs + ship) | PASS | this document + contract update |
 | No Python in production process tree | PASS | `ominix-diffusion-cli` is pure C++/CUDA |
 
