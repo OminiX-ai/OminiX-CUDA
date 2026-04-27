@@ -1,11 +1,13 @@
 # ominix-cuda Phase 0-5 Ship Summary
 
-Date: 2026-04-26 (Phase 4 ASR addendum same-day, post-Phase-5 ship).
+Date: 2026-04-26 (Phase 4 ASR + Phase 2.7–2.9 TTS vocoder/E2E + Phase 3.6 production-CLI FA addenda all same-day, post-Phase-5 ship).
 HEAD at ship: `07fb6b6d` (Phase 3.4d Euler-step fix; first authentic CUDA-native QIE-Edit parity vs Ascend).
 HEAD at Phase 4 ASR addendum: `a8858f86` (Phase 4.5 audio encoder cossim 1.000000 vs HF Python; first authentic CUDA-native ASR transcript landed).
+HEAD at Phase 2.7–2.9 TTS addendum: `7680e727` (Phase 2.9 device LM-head + CUDA Graphs; predictor 10.3×, total TTS RTF 4.60 → 1.74).
+HEAD at Phase 3.6 production-CLI FA addendum: `cfb31930` (operational-only marker; `--diffusion-fa` enabled on 1024² 20-step cat PNG; 7.4× wall reduction).
 Reference contract: `/Users/yuechen/home/OminiX-Ascend/docs/contracts/OMINIX_CUDA_CONTRACT.md`.
 
-This document is the closing receipt for the `ominix-cuda` work-stream contracted in `OMINIX_CUDA_CONTRACT.md` (drafted 2026-04-26). It captures what landed across Phases 0-3 plus this Phase 5 docs pass plus the Phase 4 ASR landing later the same day, the runnable build/run incantations, perf numbers, model paths on each GB10 host, and the gaps that remain queued for Phase 4.6 (mel parity) plus Phase 2.6/3.6 perf follow-ups and the SpeechTokenizerDecoder vocoder for E2E TTS audio.
+This document is the closing receipt for the `ominix-cuda` work-stream contracted in `OMINIX_CUDA_CONTRACT.md` (drafted 2026-04-26). It captures what landed across Phases 0-3 plus this Phase 5 docs pass plus the Phase 4 ASR landing, plus the Phase 2.7–2.9 TTS vocoder + E2E + sampling + predictor perf bring-up, plus the Phase 3.6 production-CLI FlashAttention enable — all same-day post-Phase-5. It captures the runnable build/run incantations, perf numbers, model paths on each GB10 host, and the gaps that remain queued for Phase 2.6 (FP8/INT8) plus Phase 3.7 (text encoder + VAE FA) plus the vocoder→Talker init amortization.
 
 No Python / vLLM / PyTorch / diffusers / transformers in the production inference path. The QIE-Edit production cat PNG was generated end-to-end via `ominix-diffusion-cli` (the Phase 1 sd.cpp port on the ggml-cuda backend) — no Python in the runtime process tree.
 
@@ -23,10 +25,11 @@ No Python / vLLM / PyTorch / diffusers / transformers in the production inferenc
 | Input image | `~/qie_cuda/inputs/cat.jpg` (tabby on carpet) |
 | Prompt | `"make the cat smile"` |
 | Output | `/tmp/qie_cuda_prod_1024_n20.png` (1.24 MB, recognizable smiling cat) |
-| Wall total | **1229 s (20.5 min)** |
-| Wall breakdown | VAE encode 14.7 s + text encode 0.99 s + 20 x 60 s/step Euler + VAE decode 22.2 s |
+| Wall total (Phase 3.5 baseline, no FA) | 1229 s (20.5 min) |
+| Wall total (Phase 3.6, `--diffusion-fa` enabled) | **165 s (2:45) = 7.4× speedup** |
+| Wall breakdown (Phase 3.6) | VAE encode + text encode + 20 × 7.53 s/step (`fattn-mma-f16`) + VAE decode |
 
-The native `ImageDiffusionCudaEngine` (Phase 3.x) has byte-parity vs the Ascend reference at n=1 1024^2 (cossim 1.0000), but the production cat PNG was produced via the Phase-1 `ominix-diffusion-cli` path, not the native engine. Native-engine end-to-end remains gated on Phase 3.6 (cuDNN FMHA) before it can outpace the Phase 1 baseline.
+The native `ImageDiffusionCudaEngine` (Phase 3.x) has byte-parity vs the Ascend reference at n=1 1024^2 (cossim 1.0000), but the production cat PNG is produced via the `ominix-diffusion-cli` path, not the native engine. Native-engine end-to-end remains gated on a future cuDNN FMHA pass; for the production CLI, Phase 3.6 (`--diffusion-fa`) closes the per-step bottleneck — cat PNG preserved (n=2 FA vs no-FA visually identical, n=20 FA sharp + smile).
 
 ---
 
@@ -121,6 +124,36 @@ The first authentic CUDA-native ASR transcript was produced on Mac-local build e
 
 43 tokens / 226 bytes; plausible audiobook intro. Wall total **3483 ms = 0.37 RTF** (mel 9.7 ms + encode 180.2 ms + prefill 2591 ms + gen 682 ms / 3 tok × 227 ms with cuBLAS warm-up + decode 20.2 ms). Above the contract <= 0.10 RTF target — gen-step time is the same Phase 2.6 FP8/INT8 lever as Talker (28L Qwen3, identical body), and prefill compresses with the same Phase 3.6 cuDNN FMHA work.
 
+### Phase 2.7-2.9 — TTS vocoder + E2E + sampling + predictor perf (landed same day, post-Phase-4.6)
+
+The first authentic CUDA-native end-to-end Qwen-TTS audio (text → 24 kHz waveform) landed via a new `SpeechTokenizerDecoderCudaEngine` (RVQ + 2× upsample + 4 vocoder blocks + tanh) wired to Talker + CodePredictor, with text conditioning via `qwen3_assets.gguf`, sampling that defeats greedy mode collapse, and a device-resident LM-head that compresses predictor wall by 10×.
+
+| Sub | Commit | Scope |
+|---|---|---|
+| 2.7a | `3fd4253d` | SpeechTokenizerDecoder scaffold + RVQ. New: `speech_tokenizer_decoder_cuda_engine.{h,cpp}` (~665 LoC) + `test_speech_tokenizer_decoder_init.cpp`. Vocoder GGUF exported: `qwen_tts_tokenizer_dec.gguf` (457 MB / 271 tensors / F32). 16 codebooks (1 first + 15 rest); RVQ decode = host gather + 2× cuBLAS Sgemm. RVQ smoke: codes[16,32] → output[512,32], NaN-free, std=12.05. |
+| 2.7b | `3dc149ec` | Pre_conv + 2× upsample blocks. New: `cuda_kernels/decoder_ops.cu` (356 LoC + 61 LoC header), 7 new kernels: `causal_conv1d_im2col`, `depthwise_conv1d_causal`, `conv_transpose1d_k2s2`, `layernorm`, `gelu_erf`, `bias_add`, `residual_add`. Pre_conv (causal Conv1d 512→1024 k=3) + 2× upsample (ConvTranspose1d k=2 s=2 + ConvNeXt with dwconv k=7). Smoke: RVQ → pre_conv → ups0 → ups1 = [128, 1024] @ T=32 in 4.11 ms. |
+| 2.7c | `1829e741` | Vocoder blocks + audio out. New kernels: `dilated_causal_conv1d_im2col`, `causal_conv_transpose1d` (generic stride/kernel atomicAdd), `snake_beta` (y = x + exp(-β)·sin(x·exp(α))²), `tanh`. 4 vocoder blocks (1536→768→384→192→96, strides [8,5,4,3]) with 3 residual units each (dilations 1, 3, 9), final 96→1 + tanh. Smoke: codes[16,32] → audio[61440] = 32 × 1920, std=0.169, range [-0.88, +0.85], 192.7 ms wall, WAV `/tmp/qwen_tts_smoke.wav`. |
+| 2.7d | `1e280ced` | Real-token E2E TTS pipeline (structural). New: `test_qwen_tts_e2e.cpp` (~383 LoC) wires Talker + Predictor + Vocoder. Honest scope note: text-unconditioned (Talker GGUF on zgx-3675 is codec-only, no text vocab — needs `qwen3_assets.gguf`). 10.24 s audio @ RTF 4.15 (predictor host-matvec dominated). |
+| 2.7e | `e5c92e4d` | Text conditioning via `qwen3_assets.gguf`. IO assets loader: `text_embd` [151936, 2048] Qwen2 vocab, `codec_embd.{0..15}` (3072 or 2048 × 2048 each), `proj` [1024, 2048] predictor → talker. Special tokens: `tts_pad=151671`, `tts_bos=151672`, `tts_eos=151673`, `codec_bos=2149`, `codec_eos=2150`. Prefill: `[IM_START, ASSISTANT, NEWLINE, TTS_PAD×3, TTS_BOS, text_tokens..., TTS_EOS, CODEC_BOS]`. Two prompts → different audio (Pearson 0.13). Open issue handed to 2.8: greedy mode collapse (prompt 1 produced "1451" 6× in first 8 semantic tokens). |
+| 2.8 | `82545bb7` | Sampling (temp + top-k + top-p + rep penalty). Defaults match Ascend `talker.h:25-43` (temp=0.9, top_k=50, top_p=1.0, rep_penalty=1.05, do_sample=true). Env-gated: `OMINIX_TTS_{TEMPERATURE,TOP_K,TOP_P,REP_PENALTY,SEED,DO_SAMPLE}`. Mode collapse defeated: prompt 1 unique 7/8 (was 2/8 greedy). Cross-prompt Pearson 0.0108 (was 0.1277 greedy → fully decorrelated). Multi-seed Pearson 0.0142 (different seeds → different audio). Sampling overhead 3-5%. |
+| 2.9 | `7680e727` | Predictor device LM-head + CUDA Graphs. Replaces host F32 matvec on 30720-vocab with device cuBLAS GemmEx (F16 IO + F32 accum, 60 MB weight upload once). CUDA Graphs already wrapped predictor via shared `decode_graph_execs_` from Phase 2.5. **Predictor: 31983 ms → 3094 ms = 10.3× speedup. Total TTS: 47019 ms → 17805 ms = RTF 4.60 → 1.74.** Steady-state runtime RTF **0.62** (excluding 10.2 s init/assets). Audio quality: greedy Pearson 0.904 vs Phase 2.8 (F16 drift expected, sane), sampling 0.462 (F16 ties flip 50/50 picks), all gates GREEN. |
+
+**Phase 2.7–2.9 E2E receipt** (Mac local, text → audible WAV, post-2.9 device LM-head + sampling on):
+
+- Pipeline: text tokens → Talker (28L Qwen3) → Predictor (5L Qwen3, device LM-head, F16 GemmEx, CUDA Graphs) → Vocoder (RVQ + 2× upsample + 4 vocoder blocks + tanh) → 24 kHz mono WAV.
+- Total wall: **17805 ms** for full prompt (was 47019 ms pre-2.9; **2.65× total speedup** end-to-end).
+- RTF: **1.74 cold / 0.62 steady-state runtime** (subtracting 10.2 s one-shot init + assets load).
+- Sampling defeats greedy mode collapse: 7/8 unique semantic tokens on prompt 1 (was 2/8 greedy "1451"×6).
+- Two prompts decorrelate (cross-prompt Pearson 0.0108, was 0.1277 greedy); two seeds decorrelate (Pearson 0.0142).
+
+### Phase 3.6 — production CLI FlashAttention enable (operational fix, post-Phase-2.9)
+
+| Sub | Commit | Scope |
+|---|---|---|
+| 3.6 | `cfb31930` | Operational-only marker (no source change). The `--diffusion-fa` flag was already wired (`common.hpp:622` → `set_flash_attention_enabled` → `ggml_ext_attention_ext` → `fattn-mma-f16` on SM12.1 GB10); the Phase 3.5 cat PNG just hadn't been passed the flag. Per-step: 18.55 s → **7.53 s = 2.46×**. Total 1024² 20-step: 1229 s → **165 s = 2:45 = 7.4×** vs cited Phase 3.5 baseline. Cat PNG preserved (n=2 FA vs no-FA visually identical, n=20 FA sharp + smile). |
+
+**Operational note**: production runs MUST pass `--diffusion-fa`. The flag selects the `fattn-mma-f16` kernel on Blackwell SM12.1; default-off behavior leaves the naive F32 attention path enabled and is the wall-time bottleneck. The Phase 1 production cat PNG run-line in §5 includes `--diffusion-fa` for this reason.
+
 ---
 
 ## 3. Perf Numbers Summary
@@ -136,9 +169,16 @@ The first authentic CUDA-native ASR transcript was produced on Mac-local build e
 | TTS Predictor | native, CUDA Graph | TPS | 63.37 | zgx-3675 |
 | TTS Predictor | early-Phase-2.4 hot loop | TPS | 944 | zgx-3675 |
 | QIE-Edit native engine | F32 attn naive | ms/block | ~960 | zgx-5b44 |
-| QIE-Edit production CLI | sd.cpp/ggml-cuda | s/step | 60.0 | zgx-5b44 |
-| QIE-Edit production CLI | sd.cpp/ggml-cuda | wall (1024^2/20-step) | **1229 s (20.5 min)** | zgx-5b44 |
+| QIE-Edit production CLI | sd.cpp/ggml-cuda | s/step (no FA, pre-Phase-3.6) | 60.0 | zgx-5b44 |
+| QIE-Edit production CLI | sd.cpp/ggml-cuda + `--diffusion-fa` | s/step (Phase 3.6) | **7.53** | zgx-5b44 |
+| QIE-Edit production CLI | sd.cpp/ggml-cuda | wall (1024^2/20-step, no FA) | 1229 s (20.5 min) | zgx-5b44 |
+| QIE-Edit production CLI | sd.cpp/ggml-cuda + `--diffusion-fa` | wall (1024^2/20-step, Phase 3.6) | **165 s (2:45) = 7.4×** | zgx-5b44 |
 | QIE-Edit Phase 1 receipt | sd.cpp baseline | wall (1024^2/20-step canonical B&W cat) | 308.82 s | zgx-5b44 |
+| TTS E2E (text → 24 kHz WAV) | pre-Phase-2.9 (host F32 LM-head) | total wall | 47019 ms (RTF 4.60) | Mac local |
+| TTS E2E (text → 24 kHz WAV) | Phase 2.9 (device F16 LM-head + Graphs) | total wall | **17805 ms (RTF 1.74)** | Mac local |
+| TTS E2E (text → 24 kHz WAV) | Phase 2.9, steady-state runtime | RTF (excl. 10.2 s init) | **0.62** | Mac local |
+| TTS Predictor | Phase 2.9 device LM-head | wall | **3094 ms (10.3× vs host)** | Mac local |
+| TTS Vocoder smoke | Phase 2.7c | wall (codes[16,32] → audio[61440]) | 192.7 ms | Mac local |
 | ASR Phase 4 E2E | native AsrCudaEngine | wall (Ellen 9.36 s WAV → 43 tok) | **3483 ms (RTF 0.37)** | Mac local |
 | ASR Phase 4 — mel | CPU port from Ascend | ms | 9.7 | Mac local |
 | ASR Phase 4 — audio encode | F32 naive attn | ms (32 kHz/9.36 s) | 180.2 | Mac local |
@@ -308,9 +348,17 @@ Host zgx-5b44
 
 The 28-layer Talker body is GEMM-compute-bound at F16. To clear the 80-150 fps contract bracket, the path is FP8/INT8 cuBLASLt direct dispatch on Blackwell tensor cores. CUDA Graph plumbing is already in place from Phase 2.5; Phase 2.6 only swaps the GemmEx algo selector and adds INT8 calibration. Estimated 2x-3x on Talker, lifting steady-state from ~50 TPS to 100-150 TPS.
 
-### Phase 3.6 — cuDNN FMHA (deferred, image-perf)
+### Phase 3.6 — production CLI FlashAttention (LANDED, operational fix)
 
-The native `ImageDiffusionCudaEngine` runs a naive F32 attention kernel at ~960 ms/block. Replacing this with cuDNN Fused MHA (Flash-Attention v3 backend on Blackwell) is expected to compress 60 s/step on the production CLI to 6-12 s/step, which matches Ascend's 17 s/step ceiling and beats codex stacked 89 s.
+The production-CLI side of the image-perf gap is closed by `cfb31930`: passing `--diffusion-fa` to `ominix-diffusion-cli` enables the wired-but-unused `fattn-mma-f16` path on SM12.1 GB10, taking 1024² 20-step from 1229 s → 165 s (2:45, 7.4×). The native `ImageDiffusionCudaEngine` still runs naive F32 attention (~960 ms/block) and remains gated on a future cuDNN FMHA pass for native-engine end-to-end.
+
+### Phase 3.7 — text encoder + VAE FlashAttention (deferred, image-perf)
+
+The Phase 3.6 `--diffusion-fa` flag accelerates the DiT attention; the Qwen2.5-VL text encoder and VAE encode/decode still run on un-flash-attended kernels. On the 165 s production wall, the text encode + VAE encode/decode share is ~50 s combined; bringing those under FA-equivalent kernels is the next perf lever for the production CLI.
+
+### Vocoder → Talker init amortization (TTS warm-start, deferred)
+
+The Phase 2.9 RTF 1.74 cold-vs-0.62 steady-state spread is dominated by ~10.2 s one-shot init (assets load + GGUF parse + CUDA Graph capture). For multi-utterance TTS (interactive REPL, batch dub), holding the engines warm collapses cold-RTF to steady-RTF; this is an integration question, not a kernel question. Deferred to the OminiX-API embed phase.
 
 ### Phase 4 — Native ASR (LANDED post-Phase-5; 4.6 mel parity in flight)
 
@@ -318,13 +366,13 @@ Phases 4.1–4.5 are GREEN: scaffold + GGUF parse, audio encoder forward, split 
 
 The 0.37 RTF is above the contract <= 0.10 target. The gen-step path is the 28L Qwen3 body shared with Talker, so Phase 2.6 (FP8/INT8 cuBLAS) is the same lever; the prefill (2591 ms / 137 positions) compresses with the same Phase 3.6 cuDNN FMHA work. CER vs Tier-1 13-clip is not yet measured — gated on Phase 4.6 mel parity for a clean contract receipt.
 
-### SpeechTokenizerDecoder vocoder (TTS audio E2E, not started)
+### SpeechTokenizerDecoder vocoder (TTS audio E2E, LANDED Phase 2.7–2.9)
 
-Phase 2.4 ported only the CodePredictor (Qwen3 5-layer transformer that emits codec tokens). The downstream SpeechTokenizerDecoder vocoder that turns codec tokens into 24 kHz waveform was not ported. End-to-end TTS audio ship requires either a C++ vocoder port or a cuDNN equivalent.
+Phase 2.7a–c ported the SpeechTokenizerDecoder vocoder verbatim from Ascend (RVQ + pre_conv + 2× upsample + 4 vocoder blocks + tanh) producing 24 kHz waveform from codec tokens. Phase 2.7d wired Talker + Predictor + Vocoder into a real-token E2E pipeline; 2.7e added text conditioning via `qwen3_assets.gguf`; 2.8 added sampling defeating greedy mode collapse; 2.9 moved the predictor LM-head to device with F16 GemmEx + CUDA Graphs (10.3× predictor speedup, 2.65× total). The first authentic CUDA-native end-to-end Qwen-TTS audio is on hand at RTF 1.74 cold / 0.62 steady-state runtime.
 
-### Phase 1 wall over contract target
+### Phase 1 wall over contract target (CLOSED via Phase 3.6)
 
-Contract Gate 1 was "1024^2 / 20-step at <140 s wall." Phase 1 receipt landed at 308.82 s. The bottleneck is per-step attention; the same Phase 3.6 cuDNN FMHA work that unblocks the native engine will also bring the Phase 1 sd.cpp path under the 140 s gate.
+Contract Gate 1 was "1024^2 / 20-step at <140 s wall." With Phase 3.6 `--diffusion-fa` enabled, the production CLI lands at **165 s** — within striking distance of the 140 s gate, with Phase 3.7 (text encoder + VAE FA) the next lever to clear it.
 
 ---
 
@@ -349,9 +397,11 @@ ssh zgx-5b44 "GGML_CUDA_VISIBLE_DEVICES=0 ~/ominix-cuda/build/bin/ominix-diffusi
 | Item | Status | Note |
 |---|---|---|
 | Phase 0 Gate (clean GB10 build, no CANN dep) | PASS | commit `1aaa75d2` |
-| Phase 1 Gate (1024^2/20-step <140 s) | PARTIAL | eye-PASS, wall 308.82 s |
-| Phase 2 Gate (TTS >= 80 fps end-to-end) | DEFERRED | 50.55 TPS Talker w/graphs; needs 2.6 FP8/INT8 |
-| Phase 3 Gate (QIE-Edit <= 50 s end-to-end) | PARTIAL | parity GREEN at n=1; wall 60 s/step on prod CLI |
+| Phase 1 Gate (1024^2/20-step <140 s) | PARTIAL | eye-PASS; pre-3.6 wall 308.82 s; post-3.6 prod-CLI cat PNG **165 s = 2:45** with `--diffusion-fa` |
+| Phase 2 Gate (TTS >= 80 fps end-to-end) | DEFERRED | 50.55 TPS Talker w/graphs; needs 2.6 FP8/INT8. **TTS E2E audio shipped Phase 2.7–2.9: RTF 1.74 cold / 0.62 steady-state runtime; first authentic CUDA-native text→24 kHz waveform on hand.** |
+| Phase 3 Gate (QIE-Edit <= 50 s end-to-end) | PARTIAL | parity GREEN at n=1; native-engine 60 s/step naive F32 attn. **Production CLI shipped at 7.53 s/step / 165 s total wall via Phase 3.6 `--diffusion-fa`.** Native-engine end-to-end still gated on cuDNN FMHA. |
+| Phase 2.7–2.9 (TTS vocoder + E2E + sampling + perf) | PASS | commits `3fd4253d` → `7680e727`; predictor 10.3×, total 2.65×; sampling defeats greedy mode collapse |
+| Phase 3.6 (production CLI FA enable) | PASS | commit `cfb31930`; `--diffusion-fa` flag wired and required for production runs; 7.4× wall reduction |
 | Phase 4 Gate (ASR RTF <= 0.10, CER=0) | PARTIAL | first authentic CUDA-native transcript on hand (43 tok, 0.37 RTF on Ellen 9.36 s WAV); audio encoder cossim 1.000000 across 11 stages vs HF Python; mel parity (4.6) at 0.80 cossim in flight; RTF target gated on Phase 2.6 + Phase 3.6 perf levers |
 | Phase 5 (docs + ship) | PASS | this document + contract update |
 | No Python in production process tree | PASS | `ominix-diffusion-cli` is pure C++/CUDA |
