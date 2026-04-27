@@ -229,6 +229,33 @@ struct UpsampleBlockDev {
     float *gamma = nullptr;      // [1024]
 };
 
+// ---- Phase 2.7c: vocoder weights ------------------------------------------
+// Per-block channel widths: 1536 -> 768 -> 384 -> 192 -> 96
+// Strides:                         8     5     4    3   (k = 2*S each)
+// Each VocoderResUnit: SnakeBeta -> Conv1d(k=7, dilation D[j]) -> SnakeBeta -> Conv1d(k=1)
+struct VocoderResUnitDev {
+    float *act1_alpha = nullptr;   // [C]
+    float *act1_beta  = nullptr;   // [C]
+    float *conv1_w    = nullptr;   // rearranged [K*C, C] row-major (K=7)
+    float *conv1_b    = nullptr;   // [C]
+    float *act2_alpha = nullptr;
+    float *act2_beta  = nullptr;
+    float *conv2_w    = nullptr;   // [C, C] row-major (k=1; just a Linear)
+    float *conv2_b    = nullptr;
+};
+
+struct VocoderBlockDev {
+    int C_in    = 0;          // input channels (e.g. 1536 for block 0)
+    int C_out   = 0;          // output channels after upsample (e.g. 768)
+    int stride  = 0;          // upsample rate
+    int kernel  = 0;          // transconv kernel (= 2*stride)
+    float *snake_alpha = nullptr;  // [C_in]
+    float *snake_beta  = nullptr;  // [C_in]
+    float *up_w        = nullptr;  // [K, C_out, C_in] row-major (C_in fastest)
+    float *up_b        = nullptr;  // [C_out]
+    VocoderResUnitDev res[3];
+};
+
 struct DecoderCudaContext {
     cublasHandle_t cublas = nullptr;
     cudaStream_t stream = nullptr;
@@ -260,6 +287,15 @@ struct DecoderCudaContext {
     float *buf_b = nullptr;     // [4*T, 4096]
     float *im2col_buf = nullptr;// [T, K*C_in]  (pre_conv only, T worst case)
     int scratch_T_fwd = 0;      // T used to size buf_a / buf_b / im2col_buf
+
+    // ---- Phase 2.7c: vocoder weights -----------------------------------
+    float *voc_init_w = nullptr;   // rearranged [K*1024, 1536] (k=7)
+    float *voc_init_b = nullptr;   // [1536]
+    VocoderBlockDev voc_blocks[4];
+    float *voc_final_alpha = nullptr;  // [96]
+    float *voc_final_beta  = nullptr;  // [96]
+    float *voc_final_w     = nullptr;  // rearranged [K*96, 1] (k=7)
+    float *voc_final_b     = nullptr;  // [1]
 };
 
 // Stash the context as a heap-allocated opaque blob hung off `ready_`.
@@ -327,6 +363,32 @@ SpeechTokenizerDecoderCudaEngine::~SpeechTokenizerDecoderCudaEngine() {
         if (ctx->buf_a) cudaFree(ctx->buf_a);
         if (ctx->buf_b) cudaFree(ctx->buf_b);
         if (ctx->im2col_buf) cudaFree(ctx->im2col_buf);
+        // Vocoder weights (2.7c).
+        if (ctx->voc_init_w) cudaFree(ctx->voc_init_w);
+        if (ctx->voc_init_b) cudaFree(ctx->voc_init_b);
+        for (int i = 0; i < 4; ++i) {
+            auto &vb = ctx->voc_blocks[i];
+            if (vb.snake_alpha) cudaFree(vb.snake_alpha);
+            if (vb.snake_beta)  cudaFree(vb.snake_beta);
+            if (vb.up_w) cudaFree(vb.up_w);
+            if (vb.up_b) cudaFree(vb.up_b);
+            for (int j = 0; j < 3; ++j) {
+                auto &ru = vb.res[j];
+                if (ru.act1_alpha) cudaFree(ru.act1_alpha);
+                if (ru.act1_beta)  cudaFree(ru.act1_beta);
+                if (ru.conv1_w) cudaFree(ru.conv1_w);
+                if (ru.conv1_b) cudaFree(ru.conv1_b);
+                if (ru.act2_alpha) cudaFree(ru.act2_alpha);
+                if (ru.act2_beta)  cudaFree(ru.act2_beta);
+                if (ru.conv2_w) cudaFree(ru.conv2_w);
+                if (ru.conv2_b) cudaFree(ru.conv2_b);
+            }
+        }
+        if (ctx->voc_final_alpha) cudaFree(ctx->voc_final_alpha);
+        if (ctx->voc_final_beta)  cudaFree(ctx->voc_final_beta);
+        if (ctx->voc_final_w) cudaFree(ctx->voc_final_w);
+        if (ctx->voc_final_b) cudaFree(ctx->voc_final_b);
+
         if (ctx->cublas) cublasDestroy(ctx->cublas);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         delete ctx;
@@ -665,6 +727,192 @@ bool SpeechTokenizerDecoderCudaEngine::init_from_gguf(
 
     printf("[stdec_cuda] pre_conv + 2x upsample weights uploaded "
            "(C=%d, FFN=%d)\n", C, FFN);
+
+    // ------------------------------------------------------------------
+    // Phase 2.7c: load vocoder weights (initial conv + 4 blocks + final).
+    // ------------------------------------------------------------------
+    // Helper: rearrange a "K outer, C_in fastest" GGUF causal-conv1d weight
+    // [K, C_in, C_out] (axis 0 fastest in GGUF semantics, byte layout
+    // PyTorch row-major [C_out, C_in, K]) into [K*C_in, C_out] row-major
+    // (oc fastest globally) so cuBLAS Sgemm(N, N, C_out, T, K*C_in, ...)
+    // works against an im2col [T, K*C_in] row-major buffer.
+    auto rearrange_kCC = [](const std::vector<float> &w_pt,
+                              int K, int C_in, int C_out,
+                              std::vector<float> &w_flat) {
+        w_flat.assign((size_t)K * C_in * C_out, 0.0f);
+        for (int k = 0; k < K; ++k) {
+            for (int ic = 0; ic < C_in; ++ic) {
+                for (int oc = 0; oc < C_out; ++oc) {
+                    w_flat[((size_t)k * C_in + ic) * C_out + oc] =
+                        w_pt[((size_t)oc * C_in + ic) * K + k];
+                }
+            }
+        }
+    };
+
+    // Helper: rearrange a transconv [K, C_out, C_in] GGUF weight (bytes are
+    // PyTorch row-major [C_in, C_out, K]) into [K, C_out, C_in] row-major
+    // (C_in fastest) used by launch_causal_conv_transpose1d_f32.
+    auto rearrange_transconv = [](const std::vector<float> &w_pt,
+                                    int K, int C_in, int C_out,
+                                    std::vector<float> &w_flat) {
+        w_flat.assign((size_t)K * C_out * C_in, 0.0f);
+        for (int k = 0; k < K; ++k) {
+            for (int oc = 0; oc < C_out; ++oc) {
+                for (int ic = 0; ic < C_in; ++ic) {
+                    w_flat[((size_t)k * C_out + oc) * C_in + ic] =
+                        w_pt[((size_t)ic * C_out + oc) * K + k];
+                }
+            }
+        }
+    };
+
+    // ---- decoder.0.conv: 1024 -> 1536, k=7 (initial vocoder conv) ----
+    {
+        const int K_ = 7, C_in_ = 1024, C_out_ = 1536;
+        std::vector<float> w_pt;
+        if (!load_tensor_f32(ggml_ctx, "decoder.0.conv.weight",
+                              (size_t)K_ * C_in_ * C_out_, w_pt)) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        std::vector<float> w_flat;
+        rearrange_kCC(w_pt, K_, C_in_, C_out_, w_flat);
+        if (!upload_f32(w_flat, &ctx->voc_init_w, "decoder.0.weight")) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        std::vector<float> b;
+        if (!load_tensor_f32(ggml_ctx, "decoder.0.conv.bias",
+                              (size_t)C_out_, b)) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        if (!upload_f32(b, &ctx->voc_init_b, "decoder.0.bias")) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+    }
+
+    // ---- decoder.{1..4}: 4 vocoder blocks ----
+    // Channel widths: 1536 (in) -> 768 -> 384 -> 192 -> 96 (final out)
+    // Strides: [8, 5, 4, 3]. Kernel = 2*stride.
+    int voc_C[5]      = {1536, 768, 384, 192, 96};
+    int voc_strides[4] = {8, 5, 4, 3};
+    for (int bi = 0; bi < 4; ++bi) {
+        auto &vb = ctx->voc_blocks[bi];
+        vb.C_in   = voc_C[bi];
+        vb.C_out  = voc_C[bi + 1];
+        vb.stride = voc_strides[bi];
+        vb.kernel = 2 * vb.stride;
+        const std::string bp = "decoder." + std::to_string(bi + 1) + ".block.";
+        const int Cin  = vb.C_in;
+        const int Cout = vb.C_out;
+        const int Ks   = vb.kernel;
+
+        // SnakeBeta alpha/beta on input channels (C_in)
+        {
+            std::vector<float> a, b;
+            if (!load_tensor_f32(ggml_ctx, (bp + "0.alpha").c_str(),
+                                  (size_t)Cin, a)) return false;
+            if (!load_tensor_f32(ggml_ctx, (bp + "0.beta").c_str(),
+                                  (size_t)Cin, b)) return false;
+            if (!upload_f32(a, &vb.snake_alpha, "voc.snake.alpha")) return false;
+            if (!upload_f32(b, &vb.snake_beta,  "voc.snake.beta"))  return false;
+        }
+
+        // ConvTranspose1d (block.1.conv): k=2*S, C_in -> C_out
+        {
+            std::vector<float> w_pt;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.conv.weight").c_str(),
+                                  (size_t)Ks * Cout * Cin, w_pt)) return false;
+            std::vector<float> w_flat;
+            rearrange_transconv(w_pt, Ks, Cin, Cout, w_flat);
+            if (!upload_f32(w_flat, &vb.up_w, "voc.up.weight")) return false;
+            std::vector<float> bv;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.conv.bias").c_str(),
+                                  (size_t)Cout, bv)) return false;
+            if (!upload_f32(bv, &vb.up_b, "voc.up.bias")) return false;
+        }
+
+        // 3 residual units (block.2, block.3, block.4 — at channel C_out)
+        for (int j = 0; j < 3; ++j) {
+            auto &ru = vb.res[j];
+            const std::string rp = bp + std::to_string(j + 2) + ".";
+            const int Cr = Cout;
+
+            std::vector<float> a, bv;
+            if (!load_tensor_f32(ggml_ctx, (rp + "act1.alpha").c_str(),
+                                  (size_t)Cr, a)) return false;
+            if (!load_tensor_f32(ggml_ctx, (rp + "act1.beta").c_str(),
+                                  (size_t)Cr, bv)) return false;
+            if (!upload_f32(a,  &ru.act1_alpha, "ru.act1.alpha")) return false;
+            if (!upload_f32(bv, &ru.act1_beta,  "ru.act1.beta"))  return false;
+
+            // conv1: causal Conv1d k=7, dilation D[j], C_r -> C_r
+            {
+                const int K7 = 7;
+                std::vector<float> w_pt;
+                if (!load_tensor_f32(ggml_ctx, (rp + "conv1.conv.weight").c_str(),
+                                      (size_t)K7 * Cr * Cr, w_pt)) return false;
+                std::vector<float> w_flat;
+                rearrange_kCC(w_pt, K7, Cr, Cr, w_flat);
+                if (!upload_f32(w_flat, &ru.conv1_w, "ru.conv1.weight")) return false;
+                std::vector<float> bv2;
+                if (!load_tensor_f32(ggml_ctx, (rp + "conv1.conv.bias").c_str(),
+                                      (size_t)Cr, bv2)) return false;
+                if (!upload_f32(bv2, &ru.conv1_b, "ru.conv1.bias")) return false;
+            }
+
+            std::vector<float> a2, bv2;
+            if (!load_tensor_f32(ggml_ctx, (rp + "act2.alpha").c_str(),
+                                  (size_t)Cr, a2)) return false;
+            if (!load_tensor_f32(ggml_ctx, (rp + "act2.beta").c_str(),
+                                  (size_t)Cr, bv2)) return false;
+            if (!upload_f32(a2,  &ru.act2_alpha, "ru.act2.alpha")) return false;
+            if (!upload_f32(bv2, &ru.act2_beta,  "ru.act2.beta"))  return false;
+
+            // conv2: Conv1d k=1, C_r -> C_r — i.e. a Linear/pointwise.
+            // GGUF shape [K=1, C_in=Cr, C_out=Cr], bytes PyTorch [Cr, Cr, 1].
+            // We just store the [C_out, C_in] = [Cr, Cr] row-major buffer
+            // (== col-major [Cr, Cr]) and use cublasSgemm(opA=T) against it.
+            {
+                std::vector<float> w_pt;
+                if (!load_tensor_f32(ggml_ctx, (rp + "conv2.conv.weight").c_str(),
+                                      (size_t)Cr * Cr, w_pt)) return false;
+                if (!upload_f32(w_pt, &ru.conv2_w, "ru.conv2.weight")) return false;
+                std::vector<float> bv3;
+                if (!load_tensor_f32(ggml_ctx, (rp + "conv2.conv.bias").c_str(),
+                                      (size_t)Cr, bv3)) return false;
+                if (!upload_f32(bv3, &ru.conv2_b, "ru.conv2.bias")) return false;
+            }
+        }
+    }
+
+    // ---- decoder.5: final SnakeBeta (alpha, beta), C=96 ----
+    {
+        std::vector<float> a, b;
+        if (!load_tensor_f32(ggml_ctx, "decoder.5.alpha", 96, a)) return false;
+        if (!load_tensor_f32(ggml_ctx, "decoder.5.beta",  96, b)) return false;
+        if (!upload_f32(a, &ctx->voc_final_alpha, "voc.final.alpha")) return false;
+        if (!upload_f32(b, &ctx->voc_final_beta,  "voc.final.beta"))  return false;
+    }
+
+    // ---- decoder.6.conv: 96 -> 1, k=7 (final mono audio conv) ----
+    {
+        const int K_ = 7, C_in_ = 96, C_out_ = 1;
+        std::vector<float> w_pt;
+        if (!load_tensor_f32(ggml_ctx, "decoder.6.conv.weight",
+                              (size_t)K_ * C_in_ * C_out_, w_pt)) return false;
+        std::vector<float> w_flat;
+        rearrange_kCC(w_pt, K_, C_in_, C_out_, w_flat);
+        if (!upload_f32(w_flat, &ctx->voc_final_w, "decoder.6.weight")) return false;
+        std::vector<float> bv;
+        if (!load_tensor_f32(ggml_ctx, "decoder.6.conv.bias",
+                              (size_t)C_out_, bv)) return false;
+        if (!upload_f32(bv, &ctx->voc_final_b, "decoder.6.bias")) return false;
+    }
+
+    printf("[stdec_cuda] vocoder weights uploaded "
+           "(init=1024->1536, blocks=[%d,%d,%d,%d]@strides=[8,5,4,3], "
+           "final=96->1)\n",
+           voc_C[1], voc_C[2], voc_C[3], voc_C[4]);
 
     // We keep ggml_ctx alive only long enough to copy weights — done. Free.
     gguf_free(gguf_ctx);
@@ -1094,6 +1342,276 @@ std::vector<float> SpeechTokenizerDecoderCudaEngine::decode(
                 T, T_cur);
     }
     return out;
+}
+
+// ===========================================================================
+// Phase 2.7c: decode_audio() — full pipeline ending in audio waveform.
+//
+// Layout: feed `decode()` result [4T, 1024] back into the vocoder forward:
+//   y = vocoder_conv(x)                       # [4T, 1536], k=7 causal
+//   for blk in 0..3:
+//       y = snake_beta(y, blk.snake)
+//       y = causal_conv_transpose1d(y, ...)    # upsample by stride S
+//       for j in 0..2:
+//           res = y
+//           y = snake_beta(y, ru.act1)
+//           y = dilated_causal_conv1d(y, ru.conv1, dilation=[1,3,9][j])
+//           y = snake_beta(y, ru.act2)
+//           y = causal_conv1d(y, ru.conv2, k=1)
+//           y = y + res
+//   y = snake_beta(y, voc_final_snake)
+//   y = causal_conv1d(y, voc_final, k=7)       # [T_audio, 1]
+//   y = tanh(y)
+//
+// Channel widths progress 1024 -> 1536 -> 768 -> 384 -> 192 -> 96 -> 1.
+// Time progresses 4T -> 4T*8 -> 4T*40 -> 4T*160 -> 4T*480, total 1920*T samples.
+// ===========================================================================
+
+std::vector<float> SpeechTokenizerDecoderCudaEngine::decode_audio(
+    const int *codes, int n_codebooks, int T) {
+
+    if (!ready_) {
+        fprintf(stderr, "[stdec_cuda] decode_audio() called before init\n");
+        return {};
+    }
+    DecoderCudaContext *ctx = g_ctx_for(this);
+    if (!ctx) {
+        fprintf(stderr, "[stdec_cuda] decode_audio: no CUDA context\n");
+        return {};
+    }
+    const bool dbg = (std::getenv("QWEN_TTS_DEC_DEBUG") != nullptr);
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // Step 1: run decode() to get [4T, 1024] (RVQ -> pre_conv -> upsample).
+    std::vector<float> upsampled = decode(codes, n_codebooks, T);
+    if (upsampled.empty()) {
+        fprintf(stderr, "[stdec_cuda] decode_audio: decode() failed\n");
+        return {};
+    }
+
+    auto t_voc0 = std::chrono::steady_clock::now();
+
+    const int C_in_voc = config_.latent_dim;   // 1024
+    int T_voc = 4 * T;                          // input T to vocoder
+    const int C_init_out = 1536;
+    const int K_init = 7;
+
+    // Allocate two ping-pong device buffers sized for the *final* audio
+    // length. T grows by 1920× through the vocoder (4*T -> 4*T*1920 = 4T*8*5*4*3).
+    // Worst-case memory: T_audio * C_max where C_max = 1536 (right after initial conv).
+    // For T=32 -> T_audio = 32*1920 = 61440, * 1536 floats = ~360 MB. Big but OK on GB10.
+    // We can do better: peak channels happen at smaller T. Let's compute per-stage
+    // and use the peak (T_stage * C_stage).
+    //
+    // Stages (T_after_stage, C_after_stage):
+    //   init:  (4T,        1536)         -> 4T*1536
+    //   blk0:  (4T*8,      768)          -> 32T*768  = 24576*T
+    //   blk1:  (4T*40,     384)          -> 160T*384 = 61440*T
+    //   blk2:  (4T*160,    192)          -> 640T*192 = 122880*T
+    //   blk3:  (4T*480,    96)           -> 1920T*96 = 184320*T
+    //   final: (4T*480,    1)            -> 1920T
+    //
+    // Peak is blk3 output: 1920T * 96 = 184320*T floats. Plus the residual
+    // stash inside each block needs another buffer of equal size to the
+    // current stage. So we need 3 buffers (cur, nxt, residual) sized to peak.
+    size_t peak_floats = (size_t)T_voc * 8 * 5 * 4 * 3 * 96;
+    // The transconv input buffer also needs to be at least cur*C_in. Since
+    // C_in is at most 1536 (right before block 0), peak there is 4T*1536.
+    size_t peak_pre_blk0 = (size_t)T_voc * 1536;
+    if (peak_pre_blk0 > peak_floats) peak_floats = peak_pre_blk0;
+
+    size_t buf_bytes = peak_floats * sizeof(float);
+    float *bA = nullptr, *bB = nullptr, *bRes = nullptr;
+    cudaMalloc((void**)&bA,   buf_bytes);
+    cudaMalloc((void**)&bB,   buf_bytes);
+    cudaMalloc((void**)&bRes, buf_bytes);
+    if (!bA || !bB || !bRes) {
+        fprintf(stderr, "[stdec_cuda] decode_audio: scratch malloc failed\n");
+        if (bA) cudaFree(bA);
+        if (bB) cudaFree(bB);
+        if (bRes) cudaFree(bRes);
+        return {};
+    }
+
+    // Upload upsampled [4T, 1024] -> bA.
+    cudaMemcpyAsync(bA, upsampled.data(),
+                     upsampled.size() * sizeof(float),
+                     cudaMemcpyHostToDevice, ctx->stream);
+
+    // im2col scratch for the largest causal_conv1d step. Worst K*C is at
+    // res-unit conv1 inside block 0: K=7 * C=768 = 5376 floats per row,
+    // times T_after_blk0_up = T_voc*8 rows. Peak = 4T*8 * 7 * 768 = 172032*T
+    // floats. Worst case across all blocks happens at block 3 output:
+    // 4T*480 * 7 * 96 = 1290240*T (yes, larger because T grew most).
+    // Pre-allocate that.
+    size_t im2col_peak = (size_t)4 * T * 480 * 7 * 96;
+    // Also account for initial conv im2col (4T * 7 * 1024).
+    size_t im2col_init = (size_t)T_voc * 7 * 1024;
+    if (im2col_init > im2col_peak) im2col_peak = im2col_init;
+    float *im2col_dev = nullptr;
+    cudaMalloc((void**)&im2col_dev, im2col_peak * sizeof(float));
+    if (!im2col_dev) {
+        fprintf(stderr, "[stdec_cuda] decode_audio: im2col malloc failed\n");
+        cudaFree(bA); cudaFree(bB); cudaFree(bRes);
+        return {};
+    }
+
+    float *cur = bA;     // input buffer
+    float *nxt = bB;     // output buffer
+
+    // ---- Vocoder initial Conv1d: 1024 -> 1536, k=7 ----
+    {
+        const int K = K_init, Cin = C_in_voc, Cout = C_init_out;
+        // im2col [T_voc, K*Cin]
+        launch_causal_conv1d_im2col_f32(cur, im2col_dev,
+                                          T_voc, Cin, K, ctx->stream);
+        // GEMM: nxt[T_voc, Cout] = im2col[T_voc, K*Cin] @ W[K*Cin, Cout]
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                     Cout, T_voc, K * Cin,
+                     &alpha,
+                     ctx->voc_init_w, Cout,
+                     im2col_dev, K * Cin,
+                     &beta,
+                     nxt, Cout);
+        launch_bias_add_f32(nxt, ctx->voc_init_b, nxt,
+                              T_voc, Cout, ctx->stream);
+        std::swap(cur, nxt);
+    }
+    int C_cur = C_init_out;  // 1536
+    if (dbg) {
+        cudaStreamSynchronize(ctx->stream);
+        dev_stats("voc_init", cur, (size_t)T_voc * C_cur, ctx->stream);
+    }
+
+    int dilations[3] = {1, 3, 9};
+
+    // ---- 4 vocoder blocks ----
+    for (int bi = 0; bi < 4; ++bi) {
+        auto &vb = ctx->voc_blocks[bi];
+        // SnakeBeta on cur (C_cur channels)
+        launch_snake_beta_f32(cur, vb.snake_alpha, vb.snake_beta, cur,
+                                T_voc, C_cur, ctx->stream);
+
+        // ConvTranspose1d: cur [T_voc, C_in] -> nxt [T_voc * stride, C_out]
+        int T_up = T_voc * vb.stride;
+        launch_causal_conv_transpose1d_f32(cur, vb.up_w, vb.up_b, nxt,
+                                              T_voc, vb.C_in, vb.C_out,
+                                              vb.kernel, vb.stride,
+                                              ctx->stream);
+        std::swap(cur, nxt);
+        T_voc = T_up;
+        C_cur = vb.C_out;
+
+        // 3 residual units
+        for (int j = 0; j < 3; ++j) {
+            auto &ru = vb.res[j];
+            // Save residual: copy cur -> bRes
+            cudaMemcpyAsync(bRes, cur,
+                             (size_t)T_voc * C_cur * sizeof(float),
+                             cudaMemcpyDeviceToDevice, ctx->stream);
+
+            // SnakeBeta act1 (in-place on cur)
+            launch_snake_beta_f32(cur, ru.act1_alpha, ru.act1_beta, cur,
+                                    T_voc, C_cur, ctx->stream);
+
+            // conv1: dilated causal Conv1d k=7, dilation=dilations[j]
+            {
+                const int K = 7, D = dilations[j];
+                launch_dilated_causal_conv1d_im2col_f32(
+                    cur, im2col_dev, T_voc, C_cur, K, D, ctx->stream);
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                             C_cur, T_voc, K * C_cur,
+                             &alpha,
+                             ru.conv1_w, C_cur,
+                             im2col_dev, K * C_cur,
+                             &beta,
+                             nxt, C_cur);
+                launch_bias_add_f32(nxt, ru.conv1_b, nxt,
+                                      T_voc, C_cur, ctx->stream);
+                std::swap(cur, nxt);
+            }
+
+            // SnakeBeta act2
+            launch_snake_beta_f32(cur, ru.act2_alpha, ru.act2_beta, cur,
+                                    T_voc, C_cur, ctx->stream);
+
+            // conv2: pointwise Conv1d k=1 (== Linear). Weight stored as
+            // [C_out, C_in] PyTorch row-major; cublasSgemm(opA=T) treats
+            // it as [C_in, C_out] col-major and gives us [T, C_out] row-major.
+            {
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             C_cur, T_voc, C_cur,
+                             &alpha,
+                             ru.conv2_w, C_cur,
+                             cur, C_cur,
+                             &beta,
+                             nxt, C_cur);
+                launch_bias_add_f32(nxt, ru.conv2_b, nxt,
+                                      T_voc, C_cur, ctx->stream);
+                std::swap(cur, nxt);
+            }
+
+            // Residual: cur += bRes
+            launch_add_f32(cur, bRes, cur, T_voc * C_cur, ctx->stream);
+        }
+        if (dbg) {
+            cudaStreamSynchronize(ctx->stream);
+            char tag[32];
+            snprintf(tag, sizeof(tag), "voc_blk%d", bi);
+            dev_stats(tag, cur, (size_t)T_voc * C_cur, ctx->stream);
+        }
+    }
+
+    // ---- Final SnakeBeta + Conv1d (96 -> 1, k=7) + tanh ----
+    // After blocks: T_voc = 4T * 1920, C_cur = 96. Pipeline to [T_audio, 1].
+    launch_snake_beta_f32(cur, ctx->voc_final_alpha, ctx->voc_final_beta, cur,
+                            T_voc, C_cur, ctx->stream);
+    {
+        const int K = 7, Cin = 96, Cout = 1;
+        launch_causal_conv1d_im2col_f32(cur, im2col_dev,
+                                          T_voc, Cin, K, ctx->stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                     Cout, T_voc, K * Cin,
+                     &alpha,
+                     ctx->voc_final_w, Cout,
+                     im2col_dev, K * Cin,
+                     &beta,
+                     nxt, Cout);
+        launch_bias_add_f32(nxt, ctx->voc_final_b, nxt,
+                              T_voc, Cout, ctx->stream);
+        std::swap(cur, nxt);
+    }
+    // Tanh in-place
+    launch_tanh_f32(cur, cur, T_voc /* * 1 */, ctx->stream);
+
+    cudaStreamSynchronize(ctx->stream);
+    auto t_voc1 = std::chrono::steady_clock::now();
+
+    // D2H copy [T_audio] = T_voc floats
+    std::vector<float> audio((size_t)T_voc);
+    cudaMemcpyAsync(audio.data(), cur, audio.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost, ctx->stream);
+    cudaStreamSynchronize(ctx->stream);
+
+    cudaFree(bA);
+    cudaFree(bB);
+    cudaFree(bRes);
+    cudaFree(im2col_dev);
+
+    auto t_end = std::chrono::steady_clock::now();
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    fprintf(stderr,
+            "[stdec_cuda] decode_audio: T_in=%d T_audio=%d "
+            "voc_wall=%.2f ms total=%.2f ms\n",
+            T, T_voc, ms(t_voc0, t_voc1), ms(t_start, t_end));
+    return audio;
 }
 
 }  // namespace ominix_cuda

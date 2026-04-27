@@ -15,6 +15,7 @@
 #include "speech_tokenizer_decoder_cuda_engine.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -166,6 +167,111 @@ int main(int argc, char **argv) {
         if (dvmax == 0.0f && dvmin == 0.0f) {
             fprintf(stderr, "[smoke] FAIL: decode all zeros\n");
             return 1;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2.7c: decode_audio() — full pipeline, audio waveform out.
+    // ------------------------------------------------------------------
+    printf("[smoke] Phase 2.7c decode_audio() (T=%d -> T_audio=%d, sr=%d)\n",
+           T, T * cfg.decode_upsample_rate, cfg.output_sample_rate);
+    std::vector<float> audio = eng.decode_audio(codes.data(), n_q, T);
+    size_t expected_audio = (size_t)T * cfg.decode_upsample_rate;
+    if (audio.size() != expected_audio) {
+        fprintf(stderr, "[smoke] decode_audio bad size: got %zu, want %zu\n",
+                audio.size(), expected_audio);
+        return 1;
+    }
+    {
+        int an_nan = 0, an_inf = 0;
+        double asum = 0.0, asum2 = 0.0;
+        float avmin = +1e30f, avmax = -1e30f;
+        for (size_t i = 0; i < audio.size(); ++i) {
+            float v = audio[i];
+            if (std::isnan(v)) ++an_nan;
+            if (std::isinf(v)) ++an_inf;
+            asum  += v;
+            asum2 += (double)v * v;
+            if (v < avmin) avmin = v;
+            if (v > avmax) avmax = v;
+        }
+        double an = (double)audio.size();
+        double amean = asum / an;
+        double avar  = std::max(0.0, asum2 / an - amean * amean);
+        double astd  = std::sqrt(avar);
+        printf("[smoke] decode_audio OK: shape=[%zu] elems=%zu\n",
+               audio.size(), audio.size());
+        printf("[smoke] audio stats: nan=%d inf=%d min=%.4f max=%.4f "
+               "mean=%.4f std=%.4f\n",
+               an_nan, an_inf, avmin, avmax, amean, astd);
+        printf("[smoke] audio head[0..8]: ");
+        for (int i = 0; i < 8 && (size_t)i < audio.size(); ++i) {
+            printf("%.4f ", audio[i]);
+        }
+        printf("\n");
+        if (an_nan > 0 || an_inf > 0) {
+            fprintf(stderr, "[smoke] FAIL: audio nan/inf\n");
+            return 1;
+        }
+        if (avmax == 0.0f && avmin == 0.0f) {
+            fprintf(stderr, "[smoke] FAIL: audio all zeros\n");
+            return 1;
+        }
+        // Tanh-bounded check (allow tiny epsilon over 1.0 due to fp roundoff).
+        if (avmin < -1.001f || avmax > 1.001f) {
+            fprintf(stderr,
+                    "[smoke] WARN: audio out of [-1, 1] range (min=%.4f max=%.4f)\n",
+                    avmin, avmax);
+        }
+        if (astd < 1e-3) {
+            fprintf(stderr,
+                    "[smoke] FAIL: audio is silent (std=%.6f < 1e-3)\n", astd);
+            return 1;
+        }
+
+        // Save WAV (16-bit PCM) for eyeballing.
+        const char *wav_path = "/tmp/qwen_tts_smoke.wav";
+        FILE *fp = fopen(wav_path, "wb");
+        if (fp) {
+            uint32_t sr = cfg.output_sample_rate;
+            uint32_t n_samples = (uint32_t)audio.size();
+            uint32_t bytes_per_sample = 2;
+            uint32_t data_bytes = n_samples * bytes_per_sample;
+            uint32_t fmt_chunk_size = 16;
+            uint32_t riff_size = 4 + (8 + fmt_chunk_size) + (8 + data_bytes);
+            // RIFF header
+            fwrite("RIFF", 1, 4, fp);
+            fwrite(&riff_size, 4, 1, fp);
+            fwrite("WAVE", 1, 4, fp);
+            // fmt chunk
+            fwrite("fmt ", 1, 4, fp);
+            fwrite(&fmt_chunk_size, 4, 1, fp);
+            uint16_t fmt = 1; fwrite(&fmt, 2, 1, fp);  // PCM
+            uint16_t ch = 1;  fwrite(&ch, 2, 1, fp);    // mono
+            fwrite(&sr, 4, 1, fp);
+            uint32_t byte_rate = sr * ch * bytes_per_sample;
+            fwrite(&byte_rate, 4, 1, fp);
+            uint16_t block_align = ch * bytes_per_sample;
+            fwrite(&block_align, 2, 1, fp);
+            uint16_t bits_per_sample = 16;
+            fwrite(&bits_per_sample, 2, 1, fp);
+            // data chunk
+            fwrite("data", 1, 4, fp);
+            fwrite(&data_bytes, 4, 1, fp);
+            // Convert float [-1,1] -> int16
+            for (size_t i = 0; i < audio.size(); ++i) {
+                float v = audio[i];
+                if (v >  1.0f) v =  1.0f;
+                if (v < -1.0f) v = -1.0f;
+                int16_t s = (int16_t)(v * 32767.0f);
+                fwrite(&s, 2, 1, fp);
+            }
+            fclose(fp);
+            printf("[smoke] WAV saved: %s (%u samples @ %u Hz)\n",
+                    wav_path, n_samples, sr);
+        } else {
+            fprintf(stderr, "[smoke] WARN: could not open %s for writing\n",
+                    wav_path);
         }
     }
 

@@ -353,4 +353,195 @@ void launch_add_f32(const float *a, const float *b, float *y, int n,
     add_f32_kernel<<<grid, block, 0, stream>>>(a, b, y, n);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2.7c: dilated causal Conv1d im2col.
+//
+// Same as causal_conv1d_im2col but with dilation D. The Ascend reference
+// build_causal_conv1d zero-pads on the left by (K-1)*D, then runs an
+// undilated conv on the padded input (effectively reading every D-th sample
+// for the K kernel taps). We mirror that here:
+//
+//   out[t, k*C_in + c] = in[t + (k - (K-1)) * D, c]   (zero if out of range)
+//
+// For the vocoder residual units this is called with K=7 and D in {1, 3, 9}.
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void dilated_causal_conv1d_im2col_f32_kernel(
+    const float *__restrict__ in, float *__restrict__ out,
+    int T, int C_in, int K, int D) {
+    int t = blockIdx.x;
+    int kc = blockIdx.y * blockDim.x + threadIdx.x;
+    int total_kc = K * C_in;
+    if (t >= T || kc >= total_kc) return;
+
+    int k = kc / C_in;
+    int c = kc - k * C_in;
+    int src_t = t + (k - (K - 1)) * D;  // current sample at k=K-1
+    float v = 0.0f;
+    if (src_t >= 0 && src_t < T) {
+        v = in[(size_t)src_t * C_in + c];
+    }
+    out[(size_t)t * total_kc + kc] = v;
+}
+
+}  // namespace
+
+void launch_dilated_causal_conv1d_im2col_f32(const float *in, float *out,
+                                              int T, int C_in, int K, int D,
+                                              cudaStream_t stream) {
+    int total_kc = K * C_in;
+    int block = 256;
+    dim3 grid(T, (total_kc + block - 1) / block);
+    dilated_causal_conv1d_im2col_f32_kernel<<<grid, block, 0, stream>>>(
+        in, out, T, C_in, K, D);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.7c: generic causal ConvTranspose1d (stride S, kernel K).
+//
+// PyTorch semantics for ConvTranspose1d:
+//   y_pre[t*S + k, oc] = sum_ic in[t, ic] * w[k, oc, ic]
+// Then ggml_conv_transpose_1d returns a tensor of length (T-1)*S + K, which
+// we trim by removing (K-S) samples from the RIGHT to keep the conv causal.
+// The Ascend reference (build_causal_transconv1d) uses k = 2*S in practice
+// (so trim = S samples), giving final length T*S.
+//
+// Implementation: one block per (t, k); threads sweep oc. Each thread does a
+// dot over C_in. Output index validity is enforced by `trim` mask.
+//
+// Note: shapes for the vocoder upsample come in pairs (k, S):
+//   block 0: K=16, S=8   -> trim=8, out_len = T*8
+//   block 1: K=10, S=5   -> trim=5, out_len = T*5
+//   block 2: K=8,  S=4   -> trim=4, out_len = T*4
+//   block 3: K=6,  S=3   -> trim=3, out_len = T*3
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void causal_conv_transpose1d_f32_kernel(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ b, float *__restrict__ out,
+    int T, int C_in, int C_out, int K, int S, int out_len) {
+    int t  = blockIdx.x;
+    int k  = blockIdx.y;
+    int oc = blockIdx.z * blockDim.x + threadIdx.x;
+    if (t >= T || k >= K || oc >= C_out) return;
+
+    int dst_t = t * S + k;
+    if (dst_t >= out_len) return;  // trimmed-right region
+
+    const float *in_row = in + (size_t)t * C_in;
+    const float *w_row  = w  + ((size_t)k * C_out + oc) * C_in;
+
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int ic = 0; ic < C_in; ++ic) {
+        acc += in_row[ic] * w_row[ic];
+    }
+    // ConvTranspose1d *accumulates* across overlapping (t, k) → same dst_t.
+    // We use atomicAdd so multiple blocks can land on the same output cell.
+    atomicAdd(&out[(size_t)dst_t * C_out + oc], acc);
+
+    // Bias: only one block per (dst_t, oc) is responsible. Since multiple
+    // (t, k) collide, pick the canonical writer: the block where k == 0 and
+    // (k == 0 or t == 0) -- but that double-counts. Cleaner: bias is applied
+    // by a separate kernel after this one.
+}
+
+__global__ void zero_f32_kernel(float *p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0.0f;
+}
+
+__global__ void add_bias_inplace_f32_kernel(float *out, const float *b,
+                                              int N, int C_out) {
+    int i = blockIdx.x;
+    int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= N || c >= C_out) return;
+    out[(size_t)i * C_out + c] += b[c];
+}
+
+}  // namespace
+
+void launch_causal_conv_transpose1d_f32(const float *in, const float *w,
+                                          const float *b, float *out,
+                                          int T, int C_in, int C_out,
+                                          int K, int S,
+                                          cudaStream_t stream) {
+    int out_len = T * S;  // post-trim length (Ascend convention with k = 2*S)
+    // Zero the output first (atomicAdd accumulates).
+    int n_out = out_len * C_out;
+    {
+        int block = 256;
+        int grid = (n_out + block - 1) / block;
+        zero_f32_kernel<<<grid, block, 0, stream>>>(out, n_out);
+    }
+    {
+        int block = 128;
+        int oc_blocks = (C_out + block - 1) / block;
+        dim3 grid(T, K, oc_blocks);
+        causal_conv_transpose1d_f32_kernel<<<grid, block, 0, stream>>>(
+            in, w, b, out, T, C_in, C_out, K, S, out_len);
+    }
+    if (b != nullptr) {
+        int block = 128;
+        dim3 grid(out_len, (C_out + block - 1) / block);
+        add_bias_inplace_f32_kernel<<<grid, block, 0, stream>>>(
+            out, b, out_len, C_out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.7c: SnakeBeta activation.
+//   y[t, c] = x[t, c] + exp(-beta[c]) * sin(x[t, c] * exp(alpha[c]))^2
+// alpha, beta are [C] learnable per-channel.
+// In-place permitted (y == x).
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void snake_beta_f32_kernel(const float *__restrict__ x,
+                                        const float *__restrict__ alpha,
+                                        const float *__restrict__ beta,
+                                        float *__restrict__ y,
+                                        int T, int C) {
+    int t = blockIdx.x;
+    int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= T || c >= C) return;
+
+    float xv = x[(size_t)t * C + c];
+    float a  = expf(alpha[c]);
+    float ib = expf(-beta[c]);
+    float s  = sinf(xv * a);
+    y[(size_t)t * C + c] = xv + ib * (s * s);
+}
+
+}  // namespace
+
+void launch_snake_beta_f32(const float *x, const float *alpha,
+                            const float *beta, float *y,
+                            int T, int C, cudaStream_t stream) {
+    int block = 128;
+    dim3 grid(T, (C + block - 1) / block);
+    snake_beta_f32_kernel<<<grid, block, 0, stream>>>(x, alpha, beta, y, T, C);
+}
+
+// ---------------------------------------------------------------------------
+// Tanh elementwise.
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void tanh_f32_kernel(const float *x, float *y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = tanhf(x[i]);
+}
+
+}  // namespace
+
+void launch_tanh_f32(const float *x, float *y, int n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    tanh_f32_kernel<<<grid, block, 0, stream>>>(x, y, n);
+}
+
 }  // namespace ominix_cuda

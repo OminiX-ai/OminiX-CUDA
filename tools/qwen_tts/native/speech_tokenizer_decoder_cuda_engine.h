@@ -90,6 +90,12 @@ public:
     // Logs per-stage stats when env QWEN_TTS_DEC_DEBUG=1.
     std::vector<float> decode(const int *codes, int n_codebooks, int T);
 
+    // Phase 2.7c decode: codes -> RVQ -> pre_conv -> 2x upsample -> 4x vocoder
+    // blocks -> final 96->1 conv -> tanh. Returns flat F32 audio waveform of
+    // length T * decode_upsample_rate (= T * 1920) in [-1, 1].
+    // Logs per-stage stats when env QWEN_TTS_DEC_DEBUG=1.
+    std::vector<float> decode_audio(const int *codes, int n_codebooks, int T);
+
     const DecoderConfig &config() const { return config_; }
     bool is_ready() const { return ready_; }
 

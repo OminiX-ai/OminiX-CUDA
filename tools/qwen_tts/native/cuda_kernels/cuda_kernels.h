@@ -106,6 +106,40 @@ void launch_causal_conv1d_im2col_f32(const float *in, float *out,
                                       int T, int C_in, int K,
                                       cudaStream_t stream);
 
+// Dilated causal Conv1d im2col: same as above but with dilation D.
+//   out[t, k*C_in + c] = in_padded[t + (k - (K-1)) * D, c]
+// Padding on the left is (K-1)*D zeros (matches Ascend build_causal_conv1d).
+// Reuses the K=1 / D=1 fast path implicitly (caller can just use a GEMM).
+void launch_dilated_causal_conv1d_im2col_f32(const float *in, float *out,
+                                              int T, int C_in, int K, int D,
+                                              cudaStream_t stream);
+
+// Generic causal ConvTranspose1d (stride=S, kernel=K). PyTorch semantics:
+// for k in [0,K): for t in [0,T): out[t*S + k, oc] += sum_ic in[t, ic] * w[k, oc, ic]
+// (assuming GGUF row-major [K, C_out, C_in] with C_in fastest).
+// Pre-trim length is (T-1)*S + K; we trim (K-S) samples from the RIGHT to match
+// Ascend's "causal" convention. Final out length is T*S, written into `out`.
+//   in   : F32 [T, C_in]
+//   w    : F32 [K, C_out, C_in]
+//   b    : F32 [C_out]   (or nullptr)
+//   out  : F32 [T*S, C_out]
+void launch_causal_conv_transpose1d_f32(const float *in, const float *w,
+                                          const float *b, float *out,
+                                          int T, int C_in, int C_out,
+                                          int K, int S,
+                                          cudaStream_t stream);
+
+// SnakeBeta activation (Ascend reference build_snake_beta):
+//   y[t, c] = x[t, c] + exp(-beta[c]) * sin(x[t, c] * exp(alpha[c]))^2
+// alpha, beta are per-channel learnable params [C].
+//   x, y : F32 [T, C]   (y may alias x)
+void launch_snake_beta_f32(const float *x, const float *alpha,
+                            const float *beta, float *y,
+                            int T, int C, cudaStream_t stream);
+
+// Tanh elementwise: y[i] = tanhf(x[i]). In-place permitted.
+void launch_tanh_f32(const float *x, float *y, int n, cudaStream_t stream);
+
 // Depthwise causal Conv1d.
 //   in  : F32 [T, C]
 //   w   : F32 [K, C]   (per-channel filter; GGUF [K, 1, C] with the singleton
