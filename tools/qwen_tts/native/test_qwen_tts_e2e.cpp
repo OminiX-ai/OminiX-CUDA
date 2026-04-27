@@ -509,6 +509,11 @@ int main(int argc, char **argv) {
     std::vector<float> p_embd_w, p_lm_head_w;
     if (!load_tensor_f32(p_ctx, "token_embd.weight", (size_t)p_vocab * p_n_embd, p_embd_w)) return 1;
     if (!load_tensor_f32(p_ctx, "output.weight", (size_t)p_vocab * p_n_embd, p_lm_head_w)) return 1;
+    // Phase 2.9: upload LM-head once for device-side cuBLAS GEMM per step.
+    if (!predictor.upload_lm_head_weights(p_lm_head_w.data(), p_vocab)) {
+        fprintf(stderr, "[e2e] predictor LM-head upload FAIL\n");
+        return 1;
+    }
     auto t4 = std::chrono::high_resolution_clock::now();
     double ms_pred_init = std::chrono::duration<double, std::milli>(t4 - t0).count();
     printf("[e2e] predictor init+weights: %.2f ms (vocab=%d, n_embd=%d)\n",
@@ -526,9 +531,11 @@ int main(int argc, char **argv) {
             std::memcpy(p_input_emb.data(),
                         p_embd_w.data() + (size_t)p_cur * p_n_embd,
                         p_n_embd * sizeof(float));
-            predictor.forward_decode(p_input_emb.data(), g, p_hidden.data());
-            matvec_f32(p_lm_head_w.data(), p_hidden.data(), p_logits.data(),
-                        p_vocab, p_n_embd);
+            // Phase 2.9: device LM-head — body + cuBLAS GEMM in one call;
+            // only `p_vocab` floats D2H'd (vs. 4 KB hidden D2H + 31 M host
+            // FLOPs in the Phase 2.8 path).
+            predictor.forward_decode_with_logits(p_input_emb.data(), g,
+                                                  p_logits.data());
             int lo = g * 2048;
             int hi = lo + 2048;
             // Repetition penalty within this codebook over recent frames.

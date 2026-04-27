@@ -209,6 +209,11 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     safe_free(input_stage_f32_dev_);
     safe_free(output_stage_f32_dev_);
 
+    // Phase 2.9 device LM-head buffers.
+    safe_free(lm_head_w_f16_dev_);
+    safe_free(lm_head_hidden_f16_dev_);
+    safe_free(lm_head_logits_f32_dev_);
+
     for (auto exec : decode_graph_execs_) {
         if (exec) cudaGraphExecDestroy(exec);
     }
@@ -843,6 +848,181 @@ bool TalkerCudaEngine::int8_calibrate_weight_(const float * /*host_w*/,
     fprintf(stderr,
             "[talker_cuda] int8_calibrate_weight_ not yet implemented (Phase 2.6)\n");
     return false;
+}
+
+// ============================================================================
+// Phase 2.9 — device LM-head + per-step logits via cuBLAS.
+//
+// Replaces the host-side O(vocab * n_embd) matvec that the predictor
+// performed at every group step. For the predictor that's
+// 30720 * 1024 = ~31 M scalar ops per step on the CPU; on a 5-layer GPU
+// path that single host matvec was an order of magnitude more expensive
+// than the entire device decode it followed. After uploading the
+// LM-head weights once, we run cuBLAS GEMM on device and only D2H the
+// `vocab` floats of logits per step (~120 KB instead of needing 4 KB
+// hidden D2H + 31 M host FLOPs).
+// ============================================================================
+
+bool TalkerCudaEngine::upload_lm_head_weights(const float *lm_head_w_f32,
+                                              int vocab) {
+    if (!ready_) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights called before init\n");
+        return false;
+    }
+    if (lm_head_w_f32 == nullptr || vocab <= 0) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights: bad args (w=%p, vocab=%d)\n",
+                (const void *)lm_head_w_f32, vocab);
+        return false;
+    }
+    cudaSetDevice(device_);
+
+    // Free any previous upload (allow re-binding).
+    auto safe_free = [](void *&p) {
+        if (p) { cudaFree(p); p = nullptr; }
+    };
+    safe_free(lm_head_w_f16_dev_);
+    safe_free(lm_head_hidden_f16_dev_);
+    safe_free(lm_head_logits_f32_dev_);
+
+    const size_t n_w = (size_t)vocab * (size_t)n_embd_;
+    std::vector<__half> w_f16(n_w);
+    for (size_t i = 0; i < n_w; ++i) w_f16[i] = __float2half(lm_head_w_f32[i]);
+
+    alloc_dev_(&lm_head_w_f16_dev_, n_w * sizeof(__half));
+    cudaError_t err = cudaMemcpy(lm_head_w_f16_dev_, w_f16.data(),
+                                  n_w * sizeof(__half),
+                                  cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights: cudaMemcpy failed: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    alloc_dev_(&lm_head_hidden_f16_dev_, (size_t)n_embd_ * sizeof(__half));
+    alloc_dev_(&lm_head_logits_f32_dev_, (size_t)vocab * sizeof(float));
+    lm_head_vocab_ = vocab;
+    fprintf(stderr,
+            "[talker_cuda] Phase 2.9 LM-head uploaded: vocab=%d hidden=%d "
+            "(F16, %.2f MB)\n",
+            vocab, n_embd_,
+            (double)(n_w * sizeof(__half)) / (1024.0 * 1024.0));
+    return true;
+}
+
+namespace {
+
+// Helper: F32 logits[out] = W_f16[out, in] @ x_f16[in], cuBLAS GemmEx with
+// F32 accumulation. Mirrors gemm_rowmajor_matvec_f16 above but emits F32.
+inline cublasStatus_t gemm_lm_head_f16_to_f32(cublasHandle_t cublas,
+                                                const __half *W,
+                                                const __half *x,
+                                                float *y,
+                                                int out, int in_dim) {
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    return cublasGemmEx(
+        cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        /*m=*/out, /*n=*/1, /*k=*/in_dim,
+        &alpha,
+        W, CUDA_R_16F, /*lda=*/in_dim,
+        x, CUDA_R_16F, /*ldb=*/in_dim,
+        &beta,
+        y, CUDA_R_32F, /*ldc=*/out,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+}  // namespace
+
+void TalkerCudaEngine::forward_decode_with_logits(const float *input_embed,
+                                                   int pos,
+                                                   float *logits_out_f32) {
+    if (!ready_) {
+        fprintf(stderr,
+                "[talker_cuda] forward_decode_with_logits before init\n");
+        std::abort();
+    }
+    if (lm_head_w_f16_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] forward_decode_with_logits: LM-head not uploaded "
+                "(call upload_lm_head_weights first)\n");
+        std::abort();
+    }
+    if (pos < 0 || pos >= MAX_SEQ) {
+        fprintf(stderr,
+                "[talker_cuda] forward_decode_with_logits: pos %d out of range\n",
+                pos);
+        std::abort();
+    }
+
+    // Stage input (same as forward_decode).
+    cudaMemcpyAsync(input_stage_f32_dev_, input_embed,
+                     (size_t)n_embd_ * sizeof(float),
+                     cudaMemcpyHostToDevice, stream_);
+    launch_cast_f32_to_f16((const float *)input_stage_f32_dev_,
+                             (__half *)cur_dev_, n_embd_, stream_);
+
+    // Run the decode body. Reuse the per-pos CUDA-graph cache if enabled —
+    // identical body to forward_decode(), so the cache is shared and a
+    // single capture covers both call paths once both have visited a
+    // given pos.
+    if (use_cuda_graphs_) {
+        cudaGraphExec_t exec = decode_graph_execs_[pos];
+        if (exec == nullptr) {
+            cudaGraph_t graph = nullptr;
+            cudaError_t cerr = cudaStreamBeginCapture(
+                stream_, cudaStreamCaptureModeThreadLocal);
+            if (cerr != cudaSuccess) {
+                run_decode_ops_(pos);
+            } else {
+                run_decode_ops_(pos);
+                cerr = cudaStreamEndCapture(stream_, &graph);
+                if (cerr == cudaSuccess && graph != nullptr) {
+                    cerr = cudaGraphInstantiate(&exec, graph, nullptr,
+                                                 nullptr, 0);
+                    cudaGraphDestroy(graph);
+                    if (cerr == cudaSuccess && exec != nullptr) {
+                        decode_graph_execs_[pos] = exec;
+                        cudaGraphLaunch(exec, stream_);
+                    }
+                }
+            }
+        } else {
+            cudaError_t lerr = cudaGraphLaunch(exec, stream_);
+            if (lerr != cudaSuccess) run_decode_ops_(pos);
+        }
+    } else {
+        run_decode_ops_(pos);
+    }
+
+    // Cast device-resident F32 hidden -> F16 for cuBLAS LM-head GEMM.
+    launch_cast_f32_to_f16((const float *)output_stage_f32_dev_,
+                             (__half *)lm_head_hidden_f16_dev_,
+                             n_embd_, stream_);
+
+    // LM-head GEMM: logits_f32[vocab] = W_f16[vocab, n_embd] @ hidden_f16[n_embd]
+    cublasStatus_t st = gemm_lm_head_f16_to_f32(cublas_,
+                              (const __half *)lm_head_w_f16_dev_,
+                              (const __half *)lm_head_hidden_f16_dev_,
+                              (float *)lm_head_logits_f32_dev_,
+                              lm_head_vocab_, n_embd_);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "[talker_cuda] LM-head cuBLAS GemmEx failed (status=%d)\n",
+                (int)st);
+        std::abort();
+    }
+
+    // D2H the F32 logits — this is the only sync per step (~vocab*4 bytes).
+    cudaMemcpyAsync(logits_out_f32, lm_head_logits_f32_dev_,
+                     (size_t)lm_head_vocab_ * sizeof(float),
+                     cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+
+    if (kv_cache_len_ < pos + 1) kv_cache_len_ = pos + 1;
 }
 
 }  // namespace ominix_cuda

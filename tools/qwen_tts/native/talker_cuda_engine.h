@@ -75,6 +75,23 @@ public:
 
     void reset_kv_cache();
 
+    // ---- Phase 2.9 device LM-head -------------------------------------
+    // Upload an LM-head weight matrix [vocab, n_embd] (row-major F32 host)
+    // onto the device as F16 once. After this, callers can use
+    // forward_decode_with_logits() to skip the per-token D2H of the hidden
+    // state (4 KB) and replace the host matvec with a cuBLAS GEMM that
+    // emits F32 logits directly (only `vocab` floats D2H per step).
+    bool upload_lm_head_weights(const float *lm_head_w_f32, int vocab);
+    bool has_lm_head_uploaded() const { return lm_head_w_f16_dev_ != nullptr; }
+    int  lm_head_vocab() const { return lm_head_vocab_; }
+
+    // Same body as forward_decode(), but instead of D2H'ing the hidden
+    // state and forcing the caller to compute LM-head on host, this runs
+    // the LM-head GEMM on device and D2Hs only the F32 logits[vocab].
+    // Requires upload_lm_head_weights() to have been called first.
+    void forward_decode_with_logits(const float *input_embed, int pos,
+                                    float *logits_out_f32);
+
     // RoPE position-speed factor (EOS-steering parity with Ascend / MLX).
     void set_rope_speed_factor(float factor);
 
@@ -234,6 +251,13 @@ private:
     // ---- Boundary staging --------------------------------------------------
     void *input_stage_f32_dev_  = nullptr;  // F32 [MAX_PREFILL * n_embd]
     void *output_stage_f32_dev_ = nullptr;  // F32 [n_embd]
+
+    // ---- Phase 2.9 device LM-head ------------------------------------------
+    // Optional. Populated by upload_lm_head_weights().
+    void *lm_head_w_f16_dev_     = nullptr;  // F16 [vocab, n_embd] row-major
+    void *lm_head_hidden_f16_dev_ = nullptr; // F16 [n_embd] (cast staging)
+    void *lm_head_logits_f32_dev_ = nullptr; // F32 [vocab]
+    int   lm_head_vocab_         = 0;
 
     // ---- Phase 2.6 quant flags ---------------------------------------------
     bool use_int8_weights_ = false;
