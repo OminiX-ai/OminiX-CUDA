@@ -72,6 +72,31 @@ void launch_rope_neox_seq_f16(const __half *x, const __half *cos,
                               int rows, int n_heads, int head_dim,
                               cudaStream_t stream);
 
+// Phase 3.3a multi-axis NEOX RoPE.  Same math as launch_rope_neox_seq_f16,
+// but the cos/sin table covers a global pe-table of shape
+// [pe_total_rows, head_dim/2] and each output row picks its pe-row by
+// `pe_off + row`. This lets the joint sequence pick disjoint pe ranges:
+//   txt rows  → pe_off = 0
+//   img rows  → pe_off = max_txt_seq
+// (matches Ascend `compute_qwen_rope_pe_host` 3-axis layout: txt positions
+//  occupy [0..max_txt_seq), img positions occupy [max_txt_seq..max_txt_seq+
+//  img_tokens). The host fills cos/sin per multi-axis assignment so this
+//  kernel stays generic.)
+//
+//   x        : F16 [rows, n_heads, head_dim]    (Q or K tile for one stream)
+//   cos      : F16 [pe_total_rows, head_dim/2]  (engine pe_cos_dev_)
+//   sin      : F16 [pe_total_rows, head_dim/2]  (engine pe_sin_dev_)
+//   y        : F16 [rows, n_heads, head_dim]    (in-place permitted)
+//   pe_off   : int — additive row offset into cos/sin
+void launch_rope_neox_3axis_f16(const __half *x, const __half *cos,
+                                const __half *sin, __half *y,
+                                int rows, int n_heads, int head_dim,
+                                int pe_off, cudaStream_t stream);
+
+// Sigmoid-Linear-Unit (silu / swish) in place.
+//   x : F16 [n]      —  y[i] = x[i] / (1 + exp(-x[i]))
+void launch_silu_f16(__half *x, int n, cudaStream_t stream);
+
 // GELU-tanh elementwise (in-place).
 //   x : F16 [n]
 void launch_gelu_tanh_f16(__half *x, int n, cudaStream_t stream);

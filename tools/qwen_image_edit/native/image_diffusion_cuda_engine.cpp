@@ -207,7 +207,10 @@ ImageDiffusionCudaEngine::~ImageDiffusionCudaEngine() {
     safe_free(scratch_img_mlp_);  safe_free(scratch_txt_mlp_);
     safe_free(scratch_img_proj_); safe_free(scratch_txt_proj_);
     safe_free(scratch_mod_vec_f16_);
-    safe_free(scratch_rope_cos_); safe_free(scratch_rope_sin_);
+    // Phase 3.3a: pe-table + t_emb buffers.
+    safe_free(pe_cos_dev_);       safe_free(pe_sin_dev_);
+    safe_free(t_emb_in_f16_);     safe_free(t_emb_mid_f16_);
+    safe_free(silu_t_emb_f16_);
 
     if (primary_stream_) cudaStreamDestroy(primary_stream_);
     if (cublas_)         cublasDestroy(cublas_);
@@ -435,16 +438,31 @@ bool ImageDiffusionCudaEngine::init_from_gguf(const std::string &dit_path,
     gguf_free(gguf_ctx);
     ggml_free(ggml_ctx);
 
+    // ---- Phase 3.3a: precompute multi-axis RoPE pe-table (host → device) ---
+    if (!build_pe_table_()) {
+        fprintf(stderr, "[image_diffusion_cuda] build_pe_table_ FAILED\n");
+        return false;
+    }
+
+    // ---- Phase 3.3a: allocate persistent t_emb scratch buffers -------------
+    {
+        const size_t H = (size_t)cfg_.hidden;
+        const size_t T = (size_t)cfg_.timestep_inner;
+        OMX_CUDA_CHECK(cudaMalloc(&t_emb_in_f16_,   T * sizeof(__half)));
+        OMX_CUDA_CHECK(cudaMalloc(&t_emb_mid_f16_, H * sizeof(__half)));
+        OMX_CUDA_CHECK(cudaMalloc(&silu_t_emb_f16_, H * sizeof(__half)));
+    }
+
     ready_ = true;
     fprintf(stderr,
-            "[image_diffusion_cuda] Phase 3.1 init OK  device=%d  "
+            "[image_diffusion_cuda] Phase 3.3a init OK  device=%d  "
             "n_blocks=%d  hidden=%d  n_heads=%d  head_dim=%d  "
             "mlp_inter=%d  mod_dim=%d  text_hidden=%d  "
-            "uploaded=%.2f GiB  nonfinite=%zu\n",
+            "uploaded=%.2f GiB  nonfinite=%zu  pe_total_pos=%d\n",
             device_, cfg_.n_blocks, cfg_.hidden, cfg_.n_heads, cfg_.head_dim,
             cfg_.mlp_inter, cfg_.mod_dim, cfg_.text_hidden,
             (double)total_weight_bytes_ / (1024.0 * 1024.0 * 1024.0),
-            nonfinite_weight_count_);
+            nonfinite_weight_count_, pe_total_pos_);
     return true;
 }
 
@@ -462,34 +480,132 @@ bool ImageDiffusionCudaEngine::init_from_gguf(const std::string &dit_path,
 
 namespace {
 
-// Build a flat NEOX-mode RoPE table on host: cos/sin of theta * pos for each
-// of head_dim/2 frequencies. seq_total rows. Output is F16 host vectors that
-// the caller uploads to scratch_rope_{cos,sin}_.
-void build_rope_table_host(int seq_total, int head_dim, float theta,
-                            std::vector<__half> &cos_out,
-                            std::vector<__half> &sin_out) {
-    int half = head_dim / 2;
-    cos_out.resize((size_t)seq_total * half);
-    sin_out.resize((size_t)seq_total * half);
-    // Standard transformer freqs: inv_freq[i] = 1 / theta^(i / head_dim).
-    // (Joint multi-axis Qwen-Image RoPE uses temporal/h/w buckets, but for
-    // smoke-grade single-block forward a unit-axis index suffices — the
-    // output magnitudes are bounded the same way.)
-    std::vector<float> inv_freq(half);
-    for (int i = 0; i < half; ++i) {
-        float exp = (float)(2 * i) / (float)head_dim;
-        inv_freq[i] = 1.0f / std::pow(theta, exp);
+// ----------------------------------------------------------------------------
+// Phase 3.3a multi-axis NEOX RoPE table (Qwen-Image temporal=16 + h=56 + w=56).
+//
+// Output layout (caller passes vectors that get uploaded as F16):
+//   cos_out / sin_out : [pe_total_pos, head_dim/2]
+//   pe_total_pos       = max_txt_seq + (h_len * w_len)         (h=w=64 → 4096)
+//   pe rows 0..max_txt_seq               → txt positions (diagonal t=h=w)
+//   pe rows max_txt_seq..pe_total_pos    → img positions ((t=0, h=row, w=col))
+//
+// Mirrors `compute_qwen_rope_pe_host` in the Ascend reference
+// (image_diffusion_engine.cpp:510-624). Per-axis frequency convention follows
+// Qwen::Rope::linspace (rope.hpp:44-56):
+//   linspace(0, (axis_dim - 2) / axis_dim, axis_dim/2) → omega = 1/theta^scale
+// Each axis contributes axis_dim/2 d_pairs sequentially in the head_dim/2
+// packing: [0..axes_t/2-1]=T, [axes_t/2..axes_t/2+axes_h/2-1]=H, [...rest..]=W.
+// scale_rope=true in qwen_image: h ids = [-h_len/2..h_len/2-1], same for w.
+// txt id starts at max(h_len, w_len) so the txt range never collides with img.
+// ----------------------------------------------------------------------------
+void build_qwen_rope_pe_host_3axis(const ominix_cuda::ImageDiffusionConfig &cfg,
+                                    std::vector<__half> &cos_out,
+                                    std::vector<__half> &sin_out,
+                                    int &pe_total_pos_out) {
+    const int axes_t = cfg.rope_axes_temporal;
+    const int axes_h = cfg.rope_axes_h;
+    const int axes_w = cfg.rope_axes_w;
+    const int head_dim = cfg.head_dim;
+    const int half = head_dim / 2;
+
+    // Patch grid corresponding to max_img_seq (default 4096 → 64×64).
+    int h_len = (int)std::lround(std::sqrt((double)cfg.max_img_seq));
+    int w_len = h_len;
+    while (h_len * w_len < cfg.max_img_seq) ++h_len;
+    const int img_tokens = h_len * w_len;
+    const int ctx_len    = cfg.max_txt_seq;
+    const int txt_start  = std::max(h_len, w_len);
+
+    pe_total_pos_out = ctx_len + img_tokens;
+    cos_out.assign((size_t)pe_total_pos_out * half, __float2half(1.0f));
+    sin_out.assign((size_t)pe_total_pos_out * half, __float2half(0.0f));
+
+    // axis_omega: per-axis frequencies. omega[i] = 1 / theta^scale where
+    // scale = linspace(0, (d-2)/d, d/2)[i] = end_scale * i/(half_axis-1).
+    auto axis_omega = [&](int axis_dim, std::vector<float> &omega) {
+        const int half_axis = axis_dim / 2;
+        omega.assign(half_axis, 0.0f);
+        if (half_axis == 0) return;
+        if (half_axis == 1) { omega[0] = 1.0f; return; }
+        const float end_scale = (axis_dim - 2.0f) / (float)axis_dim;
+        for (int i = 0; i < half_axis; ++i) {
+            const float scale = end_scale * (float)i / (float)(half_axis - 1);
+            omega[i] = 1.0f / std::pow(cfg.rope_theta, scale);
+        }
+    };
+    std::vector<float> omega_t, omega_h, omega_w;
+    axis_omega(axes_t, omega_t);
+    axis_omega(axes_h, omega_h);
+    axis_omega(axes_w, omega_w);
+
+    auto pe_set = [&](int pos, int dpair, float a) {
+        size_t idx = (size_t)pos * half + (size_t)dpair;
+        cos_out[idx] = __float2half(std::cos(a));
+        sin_out[idx] = __float2half(std::sin(a));
+    };
+
+    // Txt positions: diagonal t=h=w=(txt_start + i).
+    for (int i = 0; i < ctx_len; ++i) {
+        const float p = (float)(txt_start + i);
+        int dp = 0;
+        for (size_t j = 0; j < omega_t.size(); ++j, ++dp) pe_set(i, dp, p * omega_t[j]);
+        for (size_t j = 0; j < omega_h.size(); ++j, ++dp) pe_set(i, dp, p * omega_h[j]);
+        for (size_t j = 0; j < omega_w.size(); ++j, ++dp) pe_set(i, dp, p * omega_w[j]);
     }
-    for (int p = 0; p < seq_total; ++p) {
-        for (int i = 0; i < half; ++i) {
-            float a = (float)p * inv_freq[i];
-            cos_out[(size_t)p * half + i] = __float2half(std::cos(a));
-            sin_out[(size_t)p * half + i] = __float2half(std::sin(a));
+
+    // Img positions: (t=0, h=h_start+r, w=w_start+c). scale_rope=true.
+    const int h_start = -h_len / 2;
+    const int w_start = -w_len / 2;
+    for (int r = 0; r < h_len; ++r) {
+        const float h_id = (float)(h_start + r);
+        for (int c = 0; c < w_len; ++c) {
+            const float w_id = (float)(w_start + c);
+            const int pos = ctx_len + r * w_len + c;
+            if (pos >= pe_total_pos_out) break;
+            int dp = 0;
+            const float t_id = 0.0f;
+            for (size_t j = 0; j < omega_t.size(); ++j, ++dp) pe_set(pos, dp, t_id * omega_t[j]);
+            for (size_t j = 0; j < omega_h.size(); ++j, ++dp) pe_set(pos, dp, h_id * omega_h[j]);
+            for (size_t j = 0; j < omega_w.size(); ++j, ++dp) pe_set(pos, dp, w_id * omega_w[j]);
         }
     }
 }
 
+// Host sinusoidal timestep embedding [dim]. Matches the ggml CPU reference
+// (`ggml_compute_forward_timestep_embedding_f32`) and the Ascend port's
+// `host_timestep_embedding_f32` (image_diffusion_engine.cpp:4621-4636):
+//   out = [cos(arg_0), .., cos(arg_half-1), sin(arg_0), .., sin(arg_half-1)]
+//   arg_j = timestep * exp(-log(max_period) * j / half),  half = dim/2
+void host_timestep_embedding_f32(float timestep, int dim, int max_period,
+                                  std::vector<float> &out) {
+    out.assign((size_t)dim, 0.0f);
+    const int half = dim / 2;
+    for (int j = 0; j < half; ++j) {
+        float freq = std::exp(-std::log((float)max_period) * (float)j /
+                               (float)half);
+        float arg  = timestep * freq;
+        out[(size_t)j]        = std::cos(arg);
+        out[(size_t)j + half] = std::sin(arg);
+    }
+    if (dim % 2 != 0) out[(size_t)2 * half] = 0.0f;
+}
+
 }  // namespace
+
+bool ImageDiffusionCudaEngine::build_pe_table_() {
+    std::vector<__half> cos_h, sin_h;
+    int total_pos = 0;
+    build_qwen_rope_pe_host_3axis(cfg_, cos_h, sin_h, total_pos);
+    pe_total_pos_ = total_pos;
+    const size_t bytes = cos_h.size() * sizeof(__half);
+    OMX_CUDA_CHECK(cudaMalloc(&pe_cos_dev_, bytes));
+    OMX_CUDA_CHECK(cudaMalloc(&pe_sin_dev_, bytes));
+    OMX_CUDA_CHECK(cudaMemcpy(pe_cos_dev_, cos_h.data(), bytes,
+                                cudaMemcpyHostToDevice));
+    OMX_CUDA_CHECK(cudaMemcpy(pe_sin_dev_, sin_h.data(), bytes,
+                                cudaMemcpyHostToDevice));
+    return true;
+}
 
 bool ImageDiffusionCudaEngine::ensure_scratch_(int img_seq_len, int txt_seq_len) {
     if (scratch_img_seq_ == img_seq_len && scratch_txt_seq_ == txt_seq_len &&
@@ -505,11 +621,9 @@ bool ImageDiffusionCudaEngine::ensure_scratch_(int img_seq_len, int txt_seq_len)
     re(&scratch_img_mlp_);  re(&scratch_txt_mlp_);
     re(&scratch_img_proj_); re(&scratch_txt_proj_);
     re(&scratch_mod_vec_f16_);
-    re(&scratch_rope_cos_); re(&scratch_rope_sin_);
 
     const size_t H        = (size_t)cfg_.hidden;
     const size_t MLP      = (size_t)cfg_.mlp_inter;
-    const size_t HD       = (size_t)cfg_.head_dim;
     const size_t img_seq  = (size_t)img_seq_len;
     const size_t txt_seq  = (size_t)txt_seq_len;
     const size_t seq_tot  = img_seq + txt_seq;
@@ -538,11 +652,99 @@ bool ImageDiffusionCudaEngine::ensure_scratch_(int img_seq_len, int txt_seq_len)
     ok = ok && alloc(&scratch_img_proj_,    img_seq * H   * hsz);
     ok = ok && alloc(&scratch_txt_proj_,    txt_seq * H   * hsz);
     ok = ok && alloc(&scratch_mod_vec_f16_, 12 * H        * hsz);
-    ok = ok && alloc(&scratch_rope_cos_,    seq_tot * (HD / 2) * hsz);
-    ok = ok && alloc(&scratch_rope_sin_,    seq_tot * (HD / 2) * hsz);
     if (!ok) return false;
     scratch_img_seq_ = img_seq_len;
     scratch_txt_seq_ = txt_seq_len;
+    return true;
+}
+
+// Phase 3.3a: derive silu_t_emb_f16_ from a scalar timestep.
+// Pipeline: sinusoidal[256] (host) → t_emb_in_f16_ (dev, F16) → time_lin1
+// (cuBLAS GEMM, +F32 bias) → t_emb_mid_f16_ → silu in-place → time_lin2
+// → silu_t_emb_f16_ → silu in-place. Output = silu(t_emb) ready for the
+// per-block img_mod / txt_mod GEMMs.
+bool ImageDiffusionCudaEngine::compute_t_emb_(float timestep) {
+    const int H = cfg_.hidden;
+    const int T = cfg_.timestep_inner;
+
+    // 1. Sinusoidal embedding on host, upload to device, cast F32→F16.
+    std::vector<float> t_sinu_f32;
+    host_timestep_embedding_f32(timestep, T, /*max_period=*/10000, t_sinu_f32);
+    std::vector<__half> t_sinu_f16(T);
+    for (int i = 0; i < T; ++i) t_sinu_f16[i] = __float2half(t_sinu_f32[i]);
+    OMX_CUDA_CHECK(cudaMemcpyAsync(t_emb_in_f16_, t_sinu_f16.data(),
+                                     T * sizeof(__half),
+                                     cudaMemcpyHostToDevice, stream_));
+
+    // 2. time_lin1: [1, T] @ time_lin1_w[H, T]^T → [1, H] (+ F32 bias).
+    auto gemm = [&](const __half *X, const __half *W, __half *Y,
+                     int M, int K, int N, const float *bias) -> bool {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            cublas_,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            W, CUDA_R_16F, K,
+            X, CUDA_R_16F, K,
+            &beta,
+            Y, CUDA_R_16F, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[image_diffusion_cuda] t_emb GemmEx failed: %d\n",
+                    (int)st);
+            return false;
+        }
+        if (bias) launch_add_bias_f32_f16(Y, bias, M, N, stream_);
+        return true;
+    };
+
+    if (!gemm((const __half *)t_emb_in_f16_,
+              (const __half *)time_lin1_w_,
+              (__half *)t_emb_mid_f16_,
+              /*M=*/1, /*K=*/T, /*N=*/H,
+              (const float *)time_lin1_b_)) return false;
+
+    // 3. SiLU in place.
+    launch_silu_f16((__half *)t_emb_mid_f16_, H, stream_);
+
+    // 4. time_lin2: [1, H] → [1, H] (+ F32 bias).
+    if (!gemm((const __half *)t_emb_mid_f16_,
+              (const __half *)time_lin2_w_,
+              (__half *)silu_t_emb_f16_,
+              /*M=*/1, /*K=*/H, /*N=*/H,
+              (const float *)time_lin2_b_)) return false;
+
+    // 5. SiLU in place — this is the final silu(t_emb) the per-block
+    //    img_mod / txt_mod GEMMs consume.
+    launch_silu_f16((__half *)silu_t_emb_f16_, H, stream_);
+
+    // Phase 3.3a smoke probe: dump silu_t_emb stats to understand
+    // mod_vec amplification at a given timestep.
+    if (const char *e = std::getenv("OMINIX_CUDA_DUMP_TEMB"); e && e[0] == '1') {
+        std::vector<__half> h(H);
+        cudaStreamSynchronize(stream_);
+        cudaMemcpy(h.data(), silu_t_emb_f16_, H * sizeof(__half),
+                    cudaMemcpyDeviceToHost);
+        double sum_abs = 0.0, max_abs = 0.0;
+        size_t n_nan = 0, n_inf = 0;
+        for (auto v : h) {
+            float f = __half2float(v);
+            if (std::isnan(f)) { ++n_nan; continue; }
+            if (std::isinf(f)) { ++n_inf; continue; }
+            double a = std::fabs((double)f);
+            sum_abs += a;
+            if (a > max_abs) max_abs = a;
+        }
+        size_t valid = (size_t)H - n_nan - n_inf;
+        fprintf(stderr,
+                "[image_diffusion_cuda] silu_t_emb t=%.2f  mean_abs=%.4g "
+                " max_abs=%.4g  NaN=%zu Inf=%zu\n",
+                timestep, valid > 0 ? sum_abs / valid : 0.0, max_abs,
+                n_nan, n_inf);
+    }
     return true;
 }
 
@@ -551,7 +753,7 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
                                               int img_seq_len,
                                               const float *txt_in,
                                               int txt_seq_len,
-                                              const float *mod_vec,
+                                              float timestep,
                                               float *img_out, float *txt_out) {
     if (!ready_) {
         fprintf(stderr, "[image_diffusion_cuda] forward_block: engine not ready\n");
@@ -560,6 +762,16 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
     if (block_idx < 0 || block_idx >= cfg_.n_blocks) {
         fprintf(stderr, "[image_diffusion_cuda] forward_block: bad block_idx %d\n",
                 block_idx);
+        return false;
+    }
+    if (img_seq_len > cfg_.max_img_seq) {
+        fprintf(stderr, "[image_diffusion_cuda] img_seq_len=%d > max_img_seq=%d\n",
+                img_seq_len, cfg_.max_img_seq);
+        return false;
+    }
+    if (txt_seq_len > cfg_.max_txt_seq) {
+        fprintf(stderr, "[image_diffusion_cuda] txt_seq_len=%d > max_txt_seq=%d\n",
+                txt_seq_len, cfg_.max_txt_seq);
         return false;
     }
     if (!ensure_scratch_(img_seq_len, txt_seq_len)) return false;
@@ -579,36 +791,23 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
     cudaStream_t s = stream_;
 
     // ---- Upload inputs (F32 host -> F16 device) ----
-    // img_in [img_seq, H], txt_in [txt_seq, H], mod_vec [12*H].
+    // img_in [img_seq, H], txt_in [txt_seq, H].  mod_vec is derived internally
+    // from `timestep` (Phase 3.3a Gate B + C).
     {
         std::vector<__half> img_h((size_t)img_seq * H);
         std::vector<__half> txt_h((size_t)txt_seq * H);
-        std::vector<__half> mod_h((size_t)12 * H);
         for (size_t i = 0; i < img_h.size(); ++i) img_h[i] = __float2half(img_in[i]);
         for (size_t i = 0; i < txt_h.size(); ++i) txt_h[i] = __float2half(txt_in[i]);
-        for (size_t i = 0; i < mod_h.size(); ++i) mod_h[i] = __float2half(mod_vec[i]);
         OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_img_f16_, img_h.data(),
                                          img_h.size() * sizeof(__half),
                                          cudaMemcpyHostToDevice, s));
         OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_txt_f16_, txt_h.data(),
                                          txt_h.size() * sizeof(__half),
                                          cudaMemcpyHostToDevice, s));
-        OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_mod_vec_f16_, mod_h.data(),
-                                         mod_h.size() * sizeof(__half),
-                                         cudaMemcpyHostToDevice, s));
     }
 
-    // ---- Build + upload RoPE table ----
-    {
-        std::vector<__half> cos_h, sin_h;
-        build_rope_table_host(seq_tot, HD, cfg_.rope_theta, cos_h, sin_h);
-        OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_rope_cos_, cos_h.data(),
-                                         cos_h.size() * sizeof(__half),
-                                         cudaMemcpyHostToDevice, s));
-        OMX_CUDA_CHECK(cudaMemcpyAsync(scratch_rope_sin_, sin_h.data(),
-                                         sin_h.size() * sizeof(__half),
-                                         cudaMemcpyHostToDevice, s));
-    }
+    // ---- Phase 3.3a Gate B: compute silu(t_emb) from timestep ----
+    if (!compute_t_emb_(timestep)) return false;
 
     // Convenience pointer aliases.
     __half *img_resid = (__half *)scratch_img_f16_;   // [img_seq, H]
@@ -676,10 +875,28 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
     };
 
     // -----------------------------------------------------------------------
+    // 0. Phase 3.3a Gate C — derive mod_vec from silu(t_emb).
+    //    img_mod_w  : F16 [mod_dim=6H, H]  →  silu_t_emb @ img_mod_w^T
+    //                + img_mod_b  →  scratch_mod_vec_f16_[0..6H]
+    //    txt_mod_w  : F16 [mod_dim=6H, H]  →  silu_t_emb @ txt_mod_w^T
+    //                + txt_mod_b  →  scratch_mod_vec_f16_[6H..12H]
+    //    The 6 chunks per stream lay out as
+    //    [scale1, shift1, gate1, scale2, shift2, gate2] (matches the
+    //    `mchunk()` accessor below — img occupies chunks 0..5, txt 6..11).
+    // -----------------------------------------------------------------------
+    if (!gemm_f16((const __half *)silu_t_emb_f16_,
+                    (const __half *)lw.img_mod_w,
+                    mod_h_dev,
+                    /*M=*/1, /*K=*/H, /*N=*/cfg_.mod_dim,
+                    (const float *)lw.img_mod_b)) return false;
+    if (!gemm_f16((const __half *)silu_t_emb_f16_,
+                    (const __half *)lw.txt_mod_w,
+                    mod_h_dev + (size_t)cfg_.mod_dim,
+                    /*M=*/1, /*K=*/H, /*N=*/cfg_.mod_dim,
+                    (const float *)lw.txt_mod_b)) return false;
+
+    // -----------------------------------------------------------------------
     // 1. LayerNorm1 + AdaLN-modulate(scale1, shift1) for both streams.
-    //    Skip the silu(t_emb) + img_mod/txt_mod linear: caller pre-supplies
-    //    the 12-chunk mod_vec. (Phase 3.2 smoke; Phase 3.3 wires the silu+
-    //    linear to derive mod_vec from t_emb.)
     // -----------------------------------------------------------------------
     launch_layernorm_noaffine_f16(img_resid, img_norm, img_seq, H, ln_eps, s);
     launch_adaln_modulate_f16(img_norm, img_scale1, img_shift1,
@@ -721,15 +938,28 @@ bool ImageDiffusionCudaEngine::forward_block(int block_idx,
                                   K_img, img_seq, NH, HD, rms_eps, s);
 
     // -----------------------------------------------------------------------
-    // 4. NEOX joint RoPE on Q / K. The cos/sin tables span the joint
-    //    seq_total: rows 0..txt_seq are txt, rows txt_seq..seq_tot are img.
+    // 4. Phase 3.3a Gate A — multi-axis NEOX RoPE on Q / K.
+    //    Joint sequence layout: rows 0..txt_seq = txt, rows txt_seq..seq_tot
+    //    = img.  pe-table layout: rows 0..max_txt_seq = txt slots,
+    //    rows max_txt_seq..pe_total_pos = img slots.  → txt portion uses
+    //    pe_off=0, img portion uses pe_off=max_txt_seq.
     // -----------------------------------------------------------------------
-    launch_rope_neox_seq_f16(Q_full, (const __half *)scratch_rope_cos_,
-                                (const __half *)scratch_rope_sin_, Q_full,
-                                seq_tot, NH, HD, s);
-    launch_rope_neox_seq_f16(K_full, (const __half *)scratch_rope_cos_,
-                                (const __half *)scratch_rope_sin_, K_full,
-                                seq_tot, NH, HD, s);
+    {
+        const __half *pe_cos = (const __half *)pe_cos_dev_;
+        const __half *pe_sin = (const __half *)pe_sin_dev_;
+        // txt portion (rows 0..txt_seq).
+        launch_rope_neox_3axis_f16(Q_full, pe_cos, pe_sin, Q_full,
+                                     txt_seq, NH, HD, /*pe_off=*/0, s);
+        launch_rope_neox_3axis_f16(K_full, pe_cos, pe_sin, K_full,
+                                     txt_seq, NH, HD, /*pe_off=*/0, s);
+        // img portion (rows txt_seq..seq_tot, pe rows max_txt_seq..).
+        launch_rope_neox_3axis_f16(Q_img, pe_cos, pe_sin, Q_img,
+                                     img_seq, NH, HD,
+                                     /*pe_off=*/cfg_.max_txt_seq, s);
+        launch_rope_neox_3axis_f16(K_img, pe_cos, pe_sin, K_img,
+                                     img_seq, NH, HD,
+                                     /*pe_off=*/cfg_.max_txt_seq, s);
+    }
 
     // -----------------------------------------------------------------------
     // 5. Joint cross-attention (smoke-grade naive kernel).

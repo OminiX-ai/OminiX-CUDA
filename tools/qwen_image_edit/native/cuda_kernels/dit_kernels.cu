@@ -137,6 +137,46 @@ __global__ void rope_neox_seq_kernel(const __half *x, const __half *cos,
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3.3a multi-axis NEOX RoPE.  Same body as rope_neox_seq_kernel but
+// indexes the pe-table with a fixed `pe_off` row offset.
+// ---------------------------------------------------------------------------
+__global__ void rope_neox_3axis_kernel(const __half *x, const __half *cos,
+                                        const __half *sin, __half *y,
+                                        int n_heads, int head_dim,
+                                        int pe_off) {
+    int row  = blockIdx.y;
+    int head = blockIdx.x;
+    int tid  = threadIdx.x;
+    int half = head_dim / 2;
+
+    size_t off = ((size_t)row * n_heads + head) * head_dim;
+    const __half *xv = x + off;
+    __half *yv       = y + off;
+    const __half *cr = cos + (size_t)(pe_off + row) * half;
+    const __half *sr = sin + (size_t)(pe_off + row) * half;
+
+    for (int j = tid; j < half; j += blockDim.x) {
+        float xl = __half2float(xv[j]);
+        float xh = __half2float(xv[j + half]);
+        float c  = __half2float(cr[j]);
+        float s  = __half2float(sr[j]);
+        yv[j]        = __float2half(xl * c - xh * s);
+        yv[j + half] = __float2half(xl * s + xh * c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SiLU (swish) in place: y = x * sigmoid(x).
+// ---------------------------------------------------------------------------
+__global__ void silu_kernel(__half *x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = __half2float(x[idx]);
+    float y = v / (1.0f + __expf(-v));
+    x[idx] = __float2half(y);
+}
+
+// ---------------------------------------------------------------------------
 // GELU-tanh in place.
 //   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 // ---------------------------------------------------------------------------
@@ -341,6 +381,27 @@ void launch_rope_neox_seq_f16(const __half *x, const __half *cos,
     dim3 block(threads);
     rope_neox_seq_kernel<<<grid, block, 0, stream>>>(x, cos, sin, y,
                                                       n_heads, head_dim);
+}
+
+void launch_rope_neox_3axis_f16(const __half *x, const __half *cos,
+                                const __half *sin, __half *y,
+                                int rows, int n_heads, int head_dim,
+                                int pe_off, cudaStream_t stream) {
+    if (rows <= 0 || n_heads <= 0 || head_dim <= 0) return;
+    int half = head_dim / 2;
+    int threads = half < 256 ? half : 256;
+    dim3 grid(n_heads, rows);
+    dim3 block(threads);
+    rope_neox_3axis_kernel<<<grid, block, 0, stream>>>(x, cos, sin, y,
+                                                        n_heads, head_dim,
+                                                        pe_off);
+}
+
+void launch_silu_f16(__half *x, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks  = (n + threads - 1) / threads;
+    silu_kernel<<<blocks, threads, 0, stream>>>(x, n);
 }
 
 void launch_gelu_tanh_f16(__half *x, int n, cudaStream_t stream) {

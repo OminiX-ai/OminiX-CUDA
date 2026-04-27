@@ -69,6 +69,14 @@ struct ImageDiffusionConfig {
     float ln_eps       = 1e-6f;    // LayerNorm in DiT (affine=false in some)
     float rms_norm_eps = 1e-6f;
     float rope_theta   = 10000.0f;
+
+    // ---- Phase 3.3a multi-axis RoPE config ----
+    // Qwen-Image axial assignment: temporal=16 + h=56 + w=56 = 128 = head_dim.
+    int rope_axes_temporal = 16;
+    int rope_axes_h        = 56;
+    int rope_axes_w        = 56;
+    int max_txt_seq        = 256;   // pe_table txt slot count
+    int max_img_seq        = 4096;  // pe_table img slot count (64*64 patch grid)
 };
 
 // Per-block weight pointers. Names mirror the diffusers / GGUF tensor schema:
@@ -141,25 +149,24 @@ public:
                         const std::string &vae_path = "",
                         int device = 0);
 
-    // Phase 3.2 — single-block joint forward: img/txt streams in/out, plus
-    // modulation vector. Inputs/outputs are F32 host buffers:
+    // Phase 3.3a — single-block joint forward.
+    //
+    // CHANGED FROM PHASE 3.2 (commit 9d9ded58): the caller no longer
+    // synthesizes the per-block 12×hidden mod_vec. Instead the engine derives
+    // it internally from `timestep` via the t_emb chain (sinusoidal[256] →
+    // time_lin1 → silu → time_lin2 → silu → linear-into-mod_vec). The
+    // multi-axis RoPE pe-table is precomputed at init.
+    //
     //   img_in / img_out : [img_seq_len, hidden]  F32
     //   txt_in / txt_out : [txt_seq_len, hidden]  F32
-    //   mod_vec          : [12 * hidden]          F32
-    //                       layout: [img_scale1, img_shift1, img_gate1,
-    //                                img_scale2, img_shift2, img_gate2,
-    //                                txt_scale1, txt_shift1, txt_gate1,
-    //                                txt_scale2, txt_shift2, txt_gate2]
-    //                       (mirrors Ascend's "scale-first" empirical legacy
-    //                       chunk binding — see Ascend ref §5.5.7. Phase 3.2
-    //                       smoke ingests synthetic mod, parity is Phase 3.3.)
+    //   timestep         : float, in the canonical sigma_s * 1000 range
     //   block_idx        : 0..n_blocks-1
-    // Returns true on success, false on any device / cuBLAS error. Output
-    // buffers are populated only on true.
+    //
+    // Returns true on success.
     bool forward_block(int block_idx,
                        const float *img_in, int img_seq_len,
                        const float *txt_in, int txt_seq_len,
-                       const float *mod_vec,
+                       float timestep,
                        float *img_out, float *txt_out);
 
     // Phase 3.3 — proj_out / norm_out post-final-block.
@@ -226,10 +233,23 @@ private:
     void *scratch_img_proj_    = nullptr;  // F16 [img_seq, H] (post out-proj)
     void *scratch_txt_proj_    = nullptr;  // F16 [txt_seq, H]
     void *scratch_mod_vec_f16_ = nullptr;  // F16 [12 * H]
-    void *scratch_rope_cos_    = nullptr;  // F16 [seq_total, head_dim/2]
-    void *scratch_rope_sin_    = nullptr;  // F16 [seq_total, head_dim/2]
+
+    // ---- Phase 3.3a multi-axis RoPE pe-table (init-time, persistent) -------
+    // Layout:  cos/sin shape = [pe_total_pos, head_dim/2]
+    //   pe row 0..max_txt_seq          → txt positions (diagonal t=h=w)
+    //   pe row max_txt_seq..total      → img positions ((t=0, h=row, w=col))
+    void *pe_cos_dev_   = nullptr;         // F16 [pe_total_pos, head_dim/2]
+    void *pe_sin_dev_   = nullptr;         // F16 [pe_total_pos, head_dim/2]
+    int   pe_total_pos_ = 0;
+
+    // ---- Phase 3.3a t_emb scratch (init-time, persistent) ------------------
+    void *t_emb_in_f16_   = nullptr;       // F16 [256]    (sinusoidal in)
+    void *t_emb_mid_f16_  = nullptr;       // F16 [hidden] (post time_lin1)
+    void *silu_t_emb_f16_ = nullptr;       // F16 [hidden] (post time_lin2 + silu)
 
     bool ensure_scratch_(int img_seq_len, int txt_seq_len);
+    bool build_pe_table_();
+    bool compute_t_emb_(float timestep);
 
     // Helpers
     void alloc_dev_(void **ptr, size_t bytes);
