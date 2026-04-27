@@ -669,4 +669,33 @@ if(QWEN_TTS_CUDA)
     target_compile_definitions(test_speech_tokenizer_decoder_init PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_compile_features   (test_speech_tokenizer_decoder_init PRIVATE cxx_std_17)
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7a speech-decoder smoke ENABLED")
+    # ---------------------------------------------------------------------
+    # Phase 2.7d E2E smoke harness — test_qwen_tts_e2e
+    #
+    # Drives the full text -> codec tokens -> audio waveform pipeline:
+    #   text -> BPE -> seed codec token -> TalkerCudaEngine autoreg ->
+    #   CodePredictor (15 acoustic groups, Pattern B sequential) ->
+    #   SpeechTokenizerDecoder.decode_audio -> WAV save.
+    # ---------------------------------------------------------------------
+    add_executable(test_qwen_tts_e2e
+        native/test_qwen_tts_e2e.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_qwen_tts_e2e PUBLIC
+                                                              ggml qwen_common qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (test_qwen_tts_e2e PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas
+                                                              qwen_tts_cuda_kernels)
+    target_include_directories(test_qwen_tts_e2e PUBLIC  .)
+    target_include_directories(test_qwen_tts_e2e PRIVATE
+                                                              ../.. ../../vendor native
+                                                              ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_qwen_tts_e2e PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_qwen_tts_e2e PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_qwen_tts_e2e PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_qwen_tts_e2e PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7d E2E smoke ENABLED")
 endif()
