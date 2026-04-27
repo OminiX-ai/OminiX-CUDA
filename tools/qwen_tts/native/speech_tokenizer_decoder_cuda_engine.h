@@ -18,8 +18,9 @@
 //     vocoder Conv1d (1024→1536) + 4 SnakeBeta blocks                 <-- 2.7c
 //     final Conv1d (96→1) → audio @ 24kHz
 //
-// Phase 2.7a deliverable: GGUF parse + RVQ decode only. The other stages
-// abort with a clear message until 2.7b / 2.7c land.
+// Phase 2.7a deliverable: GGUF parse + RVQ decode only. Phase 2.7b adds
+// pre_conv (causal Conv1d 512→1024 k=3) + 2× upsample blocks
+// (ConvTranspose1d k=2 s=2 + ConvNeXt). Vocoder lands in 2.7c.
 // ============================================================================
 
 #include <cuda_runtime.h>
@@ -84,7 +85,9 @@ public:
     bool rvq_decode(const int *codes, int n_codebooks, int T,
                     std::vector<float> &out);
 
-    // Phase 2.7a stub. Aborts with std::abort() and a clear log line.
+    // Phase 2.7b decode: codes -> RVQ -> pre_conv -> 2x upsample blocks.
+    // Returns row-major [4*T, latent_dim=1024] F32. Vocoder (2.7c) wraps this.
+    // Logs per-stage stats when env QWEN_TTS_DEC_DEBUG=1.
     std::vector<float> decode(const int *codes, int n_codebooks, int T);
 
     const DecoderConfig &config() const { return config_; }

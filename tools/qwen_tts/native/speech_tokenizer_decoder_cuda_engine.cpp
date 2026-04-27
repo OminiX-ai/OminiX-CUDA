@@ -27,6 +27,7 @@
 // ============================================================================
 
 #include "speech_tokenizer_decoder_cuda_engine.h"
+#include "cuda_kernels/cuda_kernels.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -35,6 +36,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -204,6 +206,29 @@ void precompute_codebook_norm(const RVQCodebookHost &cb,
 // these only for the RVQ output_proj GEMM; later phases reuse them.
 // ---------------------------------------------------------------------------
 
+struct UpsampleBlockDev {
+    // ConvTranspose1d k=2 s=2 (rearranged to [K, C_out, C_in] row-major,
+    // K outer, C_in fastest — matches launch_conv_transpose1d_k2s2_f32).
+    float *up_w = nullptr;   // [2, C_out, C_in] = [2, 1024, 1024]
+    float *up_b = nullptr;   // [C_out]
+
+    // ConvNeXt: dwconv k=7 (rearranged to [K, C] row-major, k outer, c fastest).
+    float *dw_w = nullptr;       // [7, 1024]
+    float *dw_b = nullptr;       // [1024]
+    // LayerNorm gamma/beta.
+    float *norm_w = nullptr;     // [1024]
+    float *norm_b = nullptr;     // [1024]
+    // pwconv1: nn.Linear(1024 -> 4096); GGUF stores PyTorch [4096, 1024]
+    // row-major bytes (so col-major view = [1024, 4096], lda=1024 in our gemm).
+    float *pw1_w = nullptr;      // [4096, 1024] PyTorch row-major
+    float *pw1_b = nullptr;      // [4096]
+    // pwconv2: nn.Linear(4096 -> 1024); PyTorch [1024, 4096] row-major.
+    float *pw2_w = nullptr;      // [1024, 4096] PyTorch row-major
+    float *pw2_b = nullptr;      // [1024]
+    // ConvNeXt residual scale.
+    float *gamma = nullptr;      // [1024]
+};
+
 struct DecoderCudaContext {
     cublasHandle_t cublas = nullptr;
     cudaStream_t stream = nullptr;
@@ -216,6 +241,25 @@ struct DecoderCudaContext {
     void *first_proj_w_dev = nullptr; // F32 [rvq_out_dim, codebook_dim]
     void *rest_proj_w_dev  = nullptr; // F32 [rvq_out_dim, codebook_dim]
     int scratch_T = 0;                // current allocated T
+
+    // ---- Phase 2.7b: pre_conv weights (rearranged on host before upload) ----
+    // pre_conv: causal Conv1d 512 -> 1024, kernel=3.
+    // Stored as row-major [K*C_in, C_out] (k outer, ic fastest within k-block,
+    // oc fastest globally) so the cuBLAS gemm against im2col [T, K*C_in] is
+    // a straight Sgemm(N, N, C_out, T, K*C_in, ...).
+    float *pre_conv_w = nullptr;    // [K*C_in, C_out] = [1536, 1024]
+    float *pre_conv_b = nullptr;    // [C_out=1024]
+
+    // ---- Phase 2.7b: 2x upsample block weights ----
+    UpsampleBlockDev up[2];
+
+    // ---- Phase 2.7b: device scratch buffers for the forward path ----
+    // Two ping-pong I/O buffers sized for the worst case [4*T_max, 4096]
+    // (the pwconv1 expansion). T grows 1 -> 4x through 2 upsample stages.
+    float *buf_a = nullptr;     // [4*T, 4096]
+    float *buf_b = nullptr;     // [4*T, 4096]
+    float *im2col_buf = nullptr;// [T, K*C_in]  (pre_conv only, T worst case)
+    int scratch_T_fwd = 0;      // T used to size buf_a / buf_b / im2col_buf
 };
 
 // Stash the context as a heap-allocated opaque blob hung off `ready_`.
@@ -264,6 +308,25 @@ SpeechTokenizerDecoderCudaEngine::~SpeechTokenizerDecoderCudaEngine() {
         if (ctx->rest_proj_dev)    cudaFree(ctx->rest_proj_dev);
         if (ctx->first_proj_w_dev) cudaFree(ctx->first_proj_w_dev);
         if (ctx->rest_proj_w_dev)  cudaFree(ctx->rest_proj_w_dev);
+        if (ctx->pre_conv_w) cudaFree(ctx->pre_conv_w);
+        if (ctx->pre_conv_b) cudaFree(ctx->pre_conv_b);
+        for (int i = 0; i < 2; ++i) {
+            auto &u = ctx->up[i];
+            if (u.up_w) cudaFree(u.up_w);
+            if (u.up_b) cudaFree(u.up_b);
+            if (u.dw_w) cudaFree(u.dw_w);
+            if (u.dw_b) cudaFree(u.dw_b);
+            if (u.norm_w) cudaFree(u.norm_w);
+            if (u.norm_b) cudaFree(u.norm_b);
+            if (u.pw1_w) cudaFree(u.pw1_w);
+            if (u.pw1_b) cudaFree(u.pw1_b);
+            if (u.pw2_w) cudaFree(u.pw2_w);
+            if (u.pw2_b) cudaFree(u.pw2_b);
+            if (u.gamma) cudaFree(u.gamma);
+        }
+        if (ctx->buf_a) cudaFree(ctx->buf_a);
+        if (ctx->buf_b) cudaFree(ctx->buf_b);
+        if (ctx->im2col_buf) cudaFree(ctx->im2col_buf);
         if (ctx->cublas) cublasDestroy(ctx->cublas);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         delete ctx;
@@ -416,6 +479,192 @@ bool SpeechTokenizerDecoderCudaEngine::init_from_gguf(
                                proj_bytes, cudaMemcpyHostToDevice));
 
     g_ctx_set(this, ctx);
+
+    // ------------------------------------------------------------------
+    // Phase 2.7b: load pre_conv + 2x upsample block weights to device.
+    // ------------------------------------------------------------------
+    auto upload_f32 = [&](const std::vector<float> &h, float **dev,
+                          const char *what) -> bool {
+        size_t bytes = h.size() * sizeof(float);
+        cudaError_t e = cudaMalloc(dev, bytes);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[stdec_cuda] cudaMalloc %s (%zu B): %s\n",
+                    what, bytes, cudaGetErrorString(e));
+            return false;
+        }
+        e = cudaMemcpy(*dev, h.data(), bytes, cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[stdec_cuda] cudaMemcpy %s: %s\n",
+                    what, cudaGetErrorString(e));
+            return false;
+        }
+        return true;
+    };
+
+    // ---- pre_conv ----
+    // GGUF weight shape [K=3, C_in=512, C_out=1024], axis-0 fastest. Bytes
+    // are PyTorch row-major [C_out, C_in, K] (k fastest).
+    // We rearrange into [K*C_in, C_out] row-major (oc fastest within slot,
+    // outer index = k*C_in + ic). cuBLAS Sgemm(N, N, C_out, T, K*C_in, ...)
+    // then matches the im2col output [T, K*C_in] row-major produced by
+    // launch_causal_conv1d_im2col_f32.
+    {
+        const int K = 3, C_in = 512, C_out = config_.latent_dim;  // 1024
+        std::vector<float> w_pt;  // [C_out, C_in, K] PyTorch row-major
+        if (!load_tensor_f32(ggml_ctx, "pre_conv.conv.weight",
+                              (size_t)K * C_in * C_out, w_pt)) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        std::vector<float> w_flat((size_t)K * C_in * C_out);
+        for (int k = 0; k < K; ++k) {
+            for (int ic = 0; ic < C_in; ++ic) {
+                for (int oc = 0; oc < C_out; ++oc) {
+                    w_flat[((size_t)k * C_in + ic) * C_out + oc] =
+                        w_pt[((size_t)oc * C_in + ic) * K + k];
+                }
+            }
+        }
+        if (!upload_f32(w_flat, &ctx->pre_conv_w, "pre_conv.weight")) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        std::vector<float> b;
+        if (!load_tensor_f32(ggml_ctx, "pre_conv.conv.bias",
+                              (size_t)C_out, b)) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+        if (!upload_f32(b, &ctx->pre_conv_b, "pre_conv.bias")) {
+            gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+        }
+    }
+
+    // ---- 2 upsample blocks ----
+    // ConvTranspose1d k=2 s=2: GGUF weight shape [K=2, 1024, 1024], axis-0
+    // fastest -> bytes are PyTorch row-major [in_ch, out_ch, K] (k fastest).
+    // launch_conv_transpose1d_k2s2_f32 expects [K, C_out, C_in] row-major
+    // (C_in fastest). Rearrange.
+    //
+    // dwconv k=7: GGUF [K=7, 1, 1024]. Bytes: row-major [C, 1, K] (k fastest)
+    // i.e. for each channel c the K kernel taps live contiguously. The
+    // launch_depthwise_conv1d_causal_f32 kernel reads `w[k*C + c]`, so we
+    // rearrange to [K, C] row-major (k outer, c fastest).
+    //
+    // pwconv1 [4096, 1024] / pwconv2 [1024, 4096]: stored as PyTorch
+    // [out, in] row-major bytes — uploaded as-is, used with cublasSgemm(T, N).
+    const int C = config_.latent_dim;        // 1024
+    const int FFN = 4 * C;                    // 4096
+    for (int b_idx = 0; b_idx < 2; ++b_idx) {
+        const std::string bp = "upsample." + std::to_string(b_idx) + ".";
+        auto &u = ctx->up[b_idx];
+
+        // up.weight + bias  (ConvTranspose1d k=2 s=2)
+        {
+            const int K = 2;
+            std::vector<float> w_pt;  // [in_ch=C, out_ch=C, K] row-major
+            if (!load_tensor_f32(ggml_ctx, (bp + "0.conv.weight").c_str(),
+                                  (size_t)K * C * C, w_pt)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            std::vector<float> w_flat((size_t)K * C * C);
+            for (int k = 0; k < K; ++k) {
+                for (int oc = 0; oc < C; ++oc) {
+                    for (int ic = 0; ic < C; ++ic) {
+                        w_flat[((size_t)k * C + oc) * C + ic] =
+                            w_pt[((size_t)ic * C + oc) * K + k];
+                    }
+                }
+            }
+            if (!upload_f32(w_flat, &u.up_w, "up.weight")) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            std::vector<float> bv;
+            if (!load_tensor_f32(ggml_ctx, (bp + "0.conv.bias").c_str(),
+                                  (size_t)C, bv)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            if (!upload_f32(bv, &u.up_b, "up.bias")) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+        }
+
+        // dwconv.weight + bias  (depthwise k=7)
+        {
+            const int K = 7;
+            std::vector<float> w_pt;  // [C, 1, K] row-major (c outer, k fastest)
+            if (!load_tensor_f32(ggml_ctx,
+                                  (bp + "1.dwconv.conv.weight").c_str(),
+                                  (size_t)K * C, w_pt)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            std::vector<float> w_flat((size_t)K * C);
+            for (int k = 0; k < K; ++k) {
+                for (int c = 0; c < C; ++c) {
+                    w_flat[(size_t)k * C + c] = w_pt[(size_t)c * K + k];
+                }
+            }
+            if (!upload_f32(w_flat, &u.dw_w, "dwconv.weight")) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            std::vector<float> bv;
+            if (!load_tensor_f32(ggml_ctx,
+                                  (bp + "1.dwconv.conv.bias").c_str(),
+                                  (size_t)C, bv)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            if (!upload_f32(bv, &u.dw_b, "dwconv.bias")) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+        }
+
+        // norm.weight, norm.bias (LayerNorm gamma/beta)
+        {
+            std::vector<float> g, b;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.norm.weight").c_str(),
+                                  (size_t)C, g)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.norm.bias").c_str(),
+                                  (size_t)C, b)) {
+                gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false;
+            }
+            if (!upload_f32(g, &u.norm_w, "norm.weight")) return false;
+            if (!upload_f32(b, &u.norm_b, "norm.bias")) return false;
+        }
+
+        // pwconv1: [4096, 1024] PyTorch -- store as-is.
+        {
+            std::vector<float> w;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.pwconv1.weight").c_str(),
+                                  (size_t)FFN * C, w)) return false;
+            if (!upload_f32(w, &u.pw1_w, "pwconv1.weight")) return false;
+            std::vector<float> bv;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.pwconv1.bias").c_str(),
+                                  (size_t)FFN, bv)) return false;
+            if (!upload_f32(bv, &u.pw1_b, "pwconv1.bias")) return false;
+        }
+
+        // pwconv2: [1024, 4096] PyTorch -- store as-is.
+        {
+            std::vector<float> w;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.pwconv2.weight").c_str(),
+                                  (size_t)C * FFN, w)) return false;
+            if (!upload_f32(w, &u.pw2_w, "pwconv2.weight")) return false;
+            std::vector<float> bv;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.pwconv2.bias").c_str(),
+                                  (size_t)C, bv)) return false;
+            if (!upload_f32(bv, &u.pw2_b, "pwconv2.bias")) return false;
+        }
+
+        // gamma: [C]
+        {
+            std::vector<float> g;
+            if (!load_tensor_f32(ggml_ctx, (bp + "1.gamma").c_str(),
+                                  (size_t)C, g)) return false;
+            if (!upload_f32(g, &u.gamma, "gamma")) return false;
+        }
+    }
+
+    printf("[stdec_cuda] pre_conv + 2x upsample weights uploaded "
+           "(C=%d, FFN=%d)\n", C, FFN);
 
     // We keep ggml_ctx alive only long enough to copy weights — done. Free.
     gguf_free(gguf_ctx);
@@ -578,15 +827,273 @@ bool SpeechTokenizerDecoderCudaEngine::rvq_decode(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2.7b forward path helpers.
+//
+// All operate on row-major [T, C] device buffers with C fastest. cuBLAS is
+// addressed using the standard "cublas col-major == row-major with axes
+// transposed" trick — see init_from_gguf for the per-weight layout.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Ensure the scratch buffers buf_a / buf_b / im2col_buf are sized for the
+// peak intermediate footprint (4*T_in × FFN=4096 floats).
+bool ensure_scratch(DecoderCudaContext *ctx, int T_in,
+                     int C, int FFN) {
+    int T_max = 4 * T_in;
+    if (ctx->scratch_T_fwd >= T_in && ctx->buf_a && ctx->buf_b &&
+        ctx->im2col_buf) {
+        return true;
+    }
+    if (ctx->buf_a)      cudaFree(ctx->buf_a);
+    if (ctx->buf_b)      cudaFree(ctx->buf_b);
+    if (ctx->im2col_buf) cudaFree(ctx->im2col_buf);
+    ctx->buf_a = ctx->buf_b = ctx->im2col_buf = nullptr;
+
+    size_t buf_bytes = (size_t)T_max * FFN * sizeof(float);
+    cudaError_t e;
+    e = cudaMalloc((void**)&ctx->buf_a, buf_bytes);
+    if (e != cudaSuccess) { fprintf(stderr,"[stdec_cuda] scratch buf_a: %s\n",
+                                     cudaGetErrorString(e)); return false; }
+    e = cudaMalloc((void**)&ctx->buf_b, buf_bytes);
+    if (e != cudaSuccess) { fprintf(stderr,"[stdec_cuda] scratch buf_b: %s\n",
+                                     cudaGetErrorString(e)); return false; }
+    // im2col only needed for pre_conv: [T, K=3 * C_in=512] = T * 1536 floats
+    size_t im2_bytes = (size_t)T_in * 3 * 512 * sizeof(float);
+    e = cudaMalloc((void**)&ctx->im2col_buf, im2_bytes);
+    if (e != cudaSuccess) { fprintf(stderr,"[stdec_cuda] scratch im2col: %s\n",
+                                     cudaGetErrorString(e)); return false; }
+    ctx->scratch_T_fwd = T_in;
+    (void)C;
+    return true;
+}
+
+// Print min/max/mean/std + nan/inf for a device buffer of `n` F32 elems.
+// Returns 0 on clean, 1 if NaN/Inf detected.
+int dev_stats(const char *tag, const float *dev, size_t n,
+               cudaStream_t stream) {
+    std::vector<float> h(n);
+    cudaMemcpyAsync(h.data(), dev, n * sizeof(float),
+                     cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    int n_nan = 0, n_inf = 0;
+    double sum = 0, sum2 = 0;
+    float vmin = +1e30f, vmax = -1e30f;
+    for (size_t i = 0; i < n; ++i) {
+        float v = h[i];
+        if (std::isnan(v)) ++n_nan;
+        if (std::isinf(v)) ++n_inf;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+        sum  += v;
+        sum2 += (double)v * v;
+    }
+    double mean = sum / (double)n;
+    double var  = std::max(0.0, sum2 / (double)n - mean * mean);
+    double std  = std::sqrt(var);
+    fprintf(stderr,
+            "[stdec_cuda] %s: n=%zu nan=%d inf=%d min=%.4f max=%.4f "
+            "mean=%.4f std=%.4f\n",
+            tag, n, n_nan, n_inf, vmin, vmax, mean, std);
+    return (n_nan || n_inf) ? 1 : 0;
+}
+
+}  // namespace
+
 std::vector<float> SpeechTokenizerDecoderCudaEngine::decode(
     const int *codes, int n_codebooks, int T) {
-    (void)codes;
-    (void)n_codebooks;
-    (void)T;
-    fprintf(stderr,
-            "[stdec_cuda] decode() not implemented in Phase 2.7a "
-            "(scaffold + RVQ only). pre_conv=2.7b, vocoder=2.7c. ABORT.\n");
-    std::abort();
+
+    if (!ready_) {
+        fprintf(stderr, "[stdec_cuda] decode() called before init\n");
+        return {};
+    }
+    DecoderCudaContext *ctx = g_ctx_for(this);
+    if (!ctx) {
+        fprintf(stderr, "[stdec_cuda] decode(): no CUDA context\n");
+        return {};
+    }
+    const int C   = config_.latent_dim;       // 1024
+    const int FFN = 4 * C;                     // 4096
+    const int C_rvq = config_.rvq_out_dim;     // 512
+    const int K_pre = 3;
+    const bool dbg = (std::getenv("QWEN_TTS_DEC_DEBUG") != nullptr);
+
+    auto t_total0 = std::chrono::steady_clock::now();
+
+    // --- 1. RVQ decode (host gather + cuBLAS GEMM) → [T, 512] host F32 ----
+    std::vector<float> rvq_out;
+    if (!rvq_decode(codes, n_codebooks, T, rvq_out)) {
+        fprintf(stderr, "[stdec_cuda] decode: rvq_decode failed\n");
+        return {};
+    }
+    // rvq_out is row-major [T, 512] (rvq_out_dim fastest, T outer). Confirmed
+    // by the layout comments in rvq_decode().
+    if (dbg) {
+        fprintf(stderr,
+                "[stdec_cuda] rvq_decode -> [T=%d, %d] (host)\n", T, C_rvq);
+    }
+
+    // --- Scratch sizing -------------------------------------------------
+    if (!ensure_scratch(ctx, T, C, FFN)) return {};
+
+    // Upload rvq_out to device (buf_a).
+    cudaMemcpyAsync(ctx->buf_a, rvq_out.data(),
+                     (size_t)T * C_rvq * sizeof(float),
+                     cudaMemcpyHostToDevice, ctx->stream);
+
+    // --- 2. pre_conv: causal Conv1d 512 -> 1024, k=3 --------------------
+    auto t_pre0 = std::chrono::steady_clock::now();
+    {
+        // im2col(buf_a [T, 512]) -> im2col_buf [T, 3*512=1536]
+        launch_causal_conv1d_im2col_f32(ctx->buf_a, ctx->im2col_buf,
+                                          T, C_rvq, K_pre, ctx->stream);
+        // gemm: out[T, C] (row-major) = im2col[T, K*C_in] @ W[K*C_in, C]
+        // cuBLAS view (col-major):  C[C, T] = W_colmaj[C, K*C_in] · im2col_colmaj[K*C_in, T]
+        // W stored row-major [K*C_in, C] => col-major [C, K*C_in]. opA = N.
+        // im2col stored row-major [T, K*C_in] => col-major [K*C_in, T]. opB = N.
+        const float alpha = 1.0f, beta = 0.0f;
+        int M = C, N = T, Kk = K_pre * C_rvq;
+        cublasSgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                     M, N, Kk,
+                     &alpha,
+                     ctx->pre_conv_w, M,
+                     ctx->im2col_buf, Kk,
+                     &beta,
+                     ctx->buf_b, M);
+        // bias add: buf_b += pre_conv_b broadcast over [T, C]
+        launch_bias_add_f32(ctx->buf_b, ctx->pre_conv_b, ctx->buf_b,
+                              T, C, ctx->stream);
+    }
+    cudaStreamSynchronize(ctx->stream);
+    auto t_pre1 = std::chrono::steady_clock::now();
+    if (dbg) {
+        dev_stats("pre_conv", ctx->buf_b, (size_t)T * C, ctx->stream);
+    }
+
+    // buf_b now holds [T, C=1024]. Upsample blocks ping-pong.
+    float *cur = ctx->buf_b;
+    float *nxt = ctx->buf_a;
+    int T_cur = T;
+
+    auto upsample_block = [&](int idx) -> bool {
+        auto &u = ctx->up[idx];
+        // ---- ConvTranspose1d k=2 s=2: cur [T_cur, C] -> nxt [2*T_cur, C] ----
+        launch_conv_transpose1d_k2s2_f32(cur, u.up_w, u.up_b, nxt,
+                                            T_cur, C, C, ctx->stream);
+        T_cur *= 2;
+        std::swap(cur, nxt);   // cur = post-transconv [2*T, C], nxt scratch
+        // We need a stable residual = post-up tensor. Stash to nxt via copy
+        // (we'll overwrite cur in the ConvNeXt subgraph).
+        cudaMemcpyAsync(nxt, cur, (size_t)T_cur * C * sizeof(float),
+                         cudaMemcpyDeviceToDevice, ctx->stream);
+        float *residual = nxt;   // [T_cur, C]
+        // We need a third buffer for the ConvNeXt expansion (FFN=4096).
+        // Reuse the im2col scratch for the [T_cur, C] dwconv intermediate
+        // since pre_conv's im2col (T*1536) is already smaller than 2T*1024
+        // for T>=2; we'll re-alloc if too small.
+        // Worst-case T_cur*FFN > buf size -> ensure_scratch sized us at 4*T*FFN.
+        // Use a local: route through buf_a/buf_b ping-pong when residual is
+        // pinned to nxt — but since we swapped, buf_a and buf_b are 'cur'
+        // (currently holds post-up) and 'nxt' (residual). We need a third
+        // for the FFN expansion. Allocate a one-shot scratch.
+        // Reuse im2col_buf (large enough — it was sized for T*K*C_in=T*1536
+        // floats; for T_cur=2T at idx=0 that's 4*T*1536 which exceeds the
+        // 2*T*FFN=8*T*1024 we need? 4*T*1536 = 6144*T vs 8192*T -- not
+        // enough). Use a transient cudaMalloc; T*FFN at T_cur=4T is 4T*4096
+        // = 16K*T floats which is only ~512KB at T=8. Cheap.
+        float *ffn_buf = nullptr;
+        size_t ffn_bytes = (size_t)T_cur * FFN * sizeof(float);
+        cudaError_t e = cudaMalloc((void**)&ffn_buf, ffn_bytes);
+        if (e != cudaSuccess) {
+            fprintf(stderr,"[stdec_cuda] up%d ffn malloc: %s\n",
+                    idx, cudaGetErrorString(e));
+            return false;
+        }
+        // ---- dwconv k=7 (causal) on `cur` -> overwrite `cur` ----
+        // Order: dw -> norm -> pw1 -> gelu -> pw2 -> *gamma -> + residual
+        launch_depthwise_conv1d_causal_f32(cur, u.dw_w, u.dw_b, cur,
+                                              T_cur, C, 7, ctx->stream);
+        // ---- LayerNorm (affine) over channel axis ----
+        launch_layernorm_f32(cur, u.norm_w, u.norm_b, cur,
+                              T_cur, C, 1e-6f, ctx->stream);
+        // ---- pwconv1: cur [T_cur, C] -> ffn_buf [T_cur, FFN] ----
+        // Linear weight stored as PyTorch [FFN, C] row-major bytes
+        // (== col-major [C, FFN]). We want col-major C[FFN, T] = W^T_colmaj * X.
+        //   opA=T, A=u.pw1_w, lda=C  -> A becomes [FFN, C] col-major.
+        //   opB=N, B=cur, ldb=C       -> B becomes [C, T] col-major.
+        //   ldc=FFN.
+        {
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         FFN, T_cur, C,
+                         &alpha,
+                         u.pw1_w, C,
+                         cur, C,
+                         &beta,
+                         ffn_buf, FFN);
+            launch_bias_add_f32(ffn_buf, u.pw1_b, ffn_buf,
+                                  T_cur, FFN, ctx->stream);
+        }
+        // ---- GELU (in-place over [T_cur*FFN]) ----
+        launch_gelu_erf_f32(ffn_buf, ffn_buf, T_cur * FFN, ctx->stream);
+        // ---- pwconv2: ffn_buf [T_cur, FFN] -> cur [T_cur, C] ----
+        // Linear weight [C, FFN] PyTorch row-major bytes (== col-major [FFN, C]).
+        //   opA=T, A=u.pw2_w, lda=FFN -> [C, FFN] col-major.
+        //   opB=N, B=ffn_buf, ldb=FFN
+        //   ldc=C
+        {
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         C, T_cur, FFN,
+                         &alpha,
+                         u.pw2_w, FFN,
+                         ffn_buf, FFN,
+                         &beta,
+                         cur, C);
+            launch_bias_add_f32(cur, u.pw2_b, cur,
+                                  T_cur, C, ctx->stream);
+        }
+        // ---- gamma scaling ----
+        launch_channel_scale_f32(cur, u.gamma, cur, T_cur, C, ctx->stream);
+        // ---- residual add: cur += residual (= nxt) ----
+        launch_add_f32(cur, residual, cur, T_cur * C, ctx->stream);
+        cudaFree(ffn_buf);
+        return true;
+    };
+
+    // --- 3. upsample[0] (T -> 2T) -----------------------------------------
+    auto t_up0_0 = std::chrono::steady_clock::now();
+    if (!upsample_block(0)) return {};
+    cudaStreamSynchronize(ctx->stream);
+    auto t_up0_1 = std::chrono::steady_clock::now();
+    if (dbg) dev_stats("upsample[0]", cur, (size_t)T_cur * C, ctx->stream);
+
+    // --- 4. upsample[1] (2T -> 4T) ----------------------------------------
+    auto t_up1_0 = std::chrono::steady_clock::now();
+    if (!upsample_block(1)) return {};
+    cudaStreamSynchronize(ctx->stream);
+    auto t_up1_1 = std::chrono::steady_clock::now();
+    if (dbg) dev_stats("upsample[1]", cur, (size_t)T_cur * C, ctx->stream);
+
+    // --- 5. D2H output [4T, C] --------------------------------------------
+    std::vector<float> out((size_t)T_cur * C);
+    cudaMemcpyAsync(out.data(), cur, out.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost, ctx->stream);
+    cudaStreamSynchronize(ctx->stream);
+
+    auto t_total1 = std::chrono::steady_clock::now();
+    if (dbg) {
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        fprintf(stderr,
+                "[stdec_cuda] timings: pre_conv=%.2f ms up0=%.2f ms "
+                "up1=%.2f ms total=%.2f ms (T_in=%d T_out=%d)\n",
+                ms(t_pre0, t_pre1), ms(t_up0_0, t_up0_1),
+                ms(t_up1_0, t_up1_1), ms(t_total0, t_total1),
+                T, T_cur);
+    }
+    return out;
 }
 
 }  // namespace ominix_cuda

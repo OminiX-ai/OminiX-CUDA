@@ -640,6 +640,10 @@ if(QWEN_TTS_CUDA)
     # ---------------------------------------------------------------------
     add_library(qwen_tts_speech_decoder_cuda STATIC
         native/speech_tokenizer_decoder_cuda_engine.cpp
+        native/cuda_kernels/decoder_ops.cu
+    )
+    set_target_properties(qwen_tts_speech_decoder_cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
     )
     target_link_libraries     (qwen_tts_speech_decoder_cuda PUBLIC ggml)
     target_link_libraries     (qwen_tts_speech_decoder_cuda PRIVATE

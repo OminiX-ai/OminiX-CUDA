@@ -118,6 +118,57 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // ------------------------------------------------------------------
+    // Phase 2.7b: decode() — RVQ -> pre_conv -> 2x upsample -> [4T, 1024].
+    // Reuses the codes built above; upgrades the smoke from RVQ-only to the
+    // full forward path through the upsample blocks (vocoder = 2.7c).
+    // ------------------------------------------------------------------
+    printf("[smoke] Phase 2.7b decode() (T=%d -> 4T=%d, latent=%d)\n",
+           T, 4 * T, cfg.latent_dim);
+    std::vector<float> dec = eng.decode(codes.data(), n_q, T);
+    size_t expected_dec = (size_t)4 * T * cfg.latent_dim;
+    if (dec.size() != expected_dec) {
+        fprintf(stderr, "[smoke] decode bad size: got %zu, want %zu\n",
+                dec.size(), expected_dec);
+        return 1;
+    }
+    {
+        int dn_nan = 0, dn_inf = 0;
+        double dsum = 0.0, dsum2 = 0.0;
+        float dvmin = +1e30f, dvmax = -1e30f;
+        for (size_t i = 0; i < dec.size(); ++i) {
+            float v = dec[i];
+            if (std::isnan(v)) ++dn_nan;
+            if (std::isinf(v)) ++dn_inf;
+            dsum  += v;
+            dsum2 += (double)v * v;
+            if (v < dvmin) dvmin = v;
+            if (v > dvmax) dvmax = v;
+        }
+        double dn = (double)dec.size();
+        double dmean = dsum / dn;
+        double dvar  = std::max(0.0, dsum2 / dn - dmean * dmean);
+        double dstd  = std::sqrt(dvar);
+        printf("[smoke] decode OK: shape=[%d, %d] elems=%zu\n",
+               4 * T, cfg.latent_dim, dec.size());
+        printf("[smoke] decode stats: nan=%d inf=%d min=%.4f max=%.4f "
+               "mean=%.4f std=%.4f\n",
+               dn_nan, dn_inf, dvmin, dvmax, dmean, dstd);
+        printf("[smoke] decode head[0..8]: ");
+        for (int i = 0; i < 8 && (size_t)i < dec.size(); ++i) {
+            printf("%.4f ", dec[i]);
+        }
+        printf("\n");
+        if (dn_nan > 0 || dn_inf > 0) {
+            fprintf(stderr, "[smoke] FAIL: decode nan/inf\n");
+            return 1;
+        }
+        if (dvmax == 0.0f && dvmin == 0.0f) {
+            fprintf(stderr, "[smoke] FAIL: decode all zeros\n");
+            return 1;
+        }
+    }
+
     printf("[smoke] PASS\n");
     return 0;
 }
