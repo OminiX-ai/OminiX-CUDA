@@ -86,6 +86,20 @@ int main(int argc, char **argv) {
     } else {
         MelSpectrogram mel_spec(/*sample_rate=*/16000, /*n_fft=*/400,
                                  /*hop_length=*/160, /*n_mels=*/eng.num_mel_bins());
+        // Phase 4.6: load HF whisper filterbank (slaney) — built-in HTK bank
+        // diverges from HF reference (cossim ~0.07 on filters).
+        {
+            const char *envp = std::getenv("OMINIX_ASR_MEL_FILTERS");
+            std::string mfp = envp && *envp
+                ? std::string(envp)
+                : std::string("tools/qwen_asr/verify_data/mel_filters_whisper.npy");
+            if (!mel_spec.load_mel_filterbank(mfp)) {
+                fprintf(stderr,
+                        "[smoke] WARN: failed to load mel filters from %s — "
+                        "proceeding with built-in HTK (will diverge from HF).\n",
+                        mfp.c_str());
+            }
+        }
         if (!mel_spec.compute(audio.samples, mel, mel_T)) {
             fprintf(stderr, "[smoke] mel_spec.compute FAILED\n");
             return 1;

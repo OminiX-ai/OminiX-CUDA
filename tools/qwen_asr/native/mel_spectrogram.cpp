@@ -5,9 +5,23 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
+
+// Phase 4.6 bisect: dump stage to $OMINIX_ASR_MEL_DUMP_DIR/<name>.bin if env set
+static void mel_dump_stage(const char *name, const float *data, size_t n) {
+    const char *dir = std::getenv("OMINIX_ASR_MEL_DUMP_DIR");
+    if (!dir || !*dir) return;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE *f = std::fopen(path, "wb");
+    if (!f) { std::fprintf(stderr, "mel_dump_stage: cannot open %s\n", path); return; }
+    std::fwrite(data, sizeof(float), n, f);
+    std::fclose(f);
+    std::fprintf(stderr, "mel_dump_stage: wrote %s (%zu floats)\n", path, n);
+}
 
 // ============================================================================
 // Mel scale conversion (HTK formula)
@@ -130,6 +144,9 @@ bool MelSpectrogram::compute(const std::vector<float> &audio,
         padded_audio[pad_amount + (int)audio.size() + i] = audio[src_idx];
     }
 
+    mel_dump_stage("cpp_s1_padded", padded_audio.data(), padded_audio.size());
+    mel_dump_stage("cpp_s2_hann", hann_window_.data(), hann_window_.size());
+
     // ========================================================================
     // Step 2: Compute STFT frames
     // WhisperFeatureExtractor drops the last frame: log_spec = log_spec[:, :-1]
@@ -158,6 +175,15 @@ bool MelSpectrogram::compute(const std::vector<float> &audio,
     std::vector<float> frame(n_fft_);
     std::vector<kiss_fft_cpx> fft_out(n_freqs);
 
+    bool dump = std::getenv("OMINIX_ASR_MEL_DUMP_DIR") != nullptr;
+    // For dump: layout matches Python (T, n_freqs)
+    std::vector<float> dump_stft_real, dump_stft_imag, dump_power;
+    if (dump) {
+        dump_stft_real.resize((size_t)num_frames * n_freqs);
+        dump_stft_imag.resize((size_t)num_frames * n_freqs);
+        dump_power.resize((size_t)num_frames * n_freqs);
+    }
+
     for (int t = 0; t < num_frames; t++) {
         int start = t * hop_length_;
 
@@ -173,6 +199,11 @@ bool MelSpectrogram::compute(const std::vector<float> &audio,
         // mel_spec[m, t] = sum_f(mel_filterbank[f, m] * |FFT[f]|^2)
         for (int f = 0; f < n_freqs; f++) {
             float power = fft_out[f].r * fft_out[f].r + fft_out[f].i * fft_out[f].i;
+            if (dump) {
+                dump_stft_real[(size_t)t * n_freqs + f] = fft_out[f].r;
+                dump_stft_imag[(size_t)t * n_freqs + f] = fft_out[f].i;
+                dump_power[(size_t)t * n_freqs + f] = power;
+            }
             // mel_filterbank layout: (n_freqs, n_mels), index [f, m]
             const float *filters = mel_filterbank_.data() + f * n_mels_;
             for (int m = 0; m < n_mels_; m++) {
@@ -182,6 +213,13 @@ bool MelSpectrogram::compute(const std::vector<float> &audio,
     }
 
     kiss_fft_free(cfg);
+
+    if (dump) {
+        mel_dump_stage("cpp_s3_stft_real", dump_stft_real.data(), dump_stft_real.size());
+        mel_dump_stage("cpp_s3_stft_imag", dump_stft_imag.data(), dump_stft_imag.size());
+        mel_dump_stage("cpp_s4_power", dump_power.data(), dump_power.size());
+        mel_dump_stage("cpp_s5_mel_prelog", mel_spec.data(), mel_spec.size());
+    }
 
     // ========================================================================
     // Step 3: Log mel + Whisper normalization
@@ -208,6 +246,8 @@ bool MelSpectrogram::compute(const std::vector<float> &audio,
 
     printf("MelSpectrogram: %d frames, %d mels, global_max=%.4f\n",
            num_frames, n_mels_, global_max);
+
+    mel_dump_stage("cpp_s7_final", output.data(), output.size());
 
     return true;
 }

@@ -151,6 +151,19 @@ int main(int argc, char **argv) {
     params.device             = 0;
     params.max_new_tokens     = max_new_tokens;
 
+    // Phase 4.6: HF whisper-style mel filterbank (slaney scale, norm=slaney).
+    // OMINIX_ASR_MEL_FILTERS env overrides; otherwise fall back to bundled
+    // verify_data path. The C++-computed HTK filterbank does NOT match HF.
+    {
+        const char *envp = std::getenv("OMINIX_ASR_MEL_FILTERS");
+        if (envp && *envp) {
+            params.mel_filters_path = envp;
+        } else {
+            params.mel_filters_path =
+                "tools/qwen_asr/verify_data/mel_filters_whisper.npy";
+        }
+    }
+
     ominix_cuda::AsrCudaEngine asr;
     if (!asr.init(params)) {
         fprintf(stderr, "[asr_e2e] AsrCudaEngine.init FAILED\n");
