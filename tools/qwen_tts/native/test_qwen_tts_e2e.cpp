@@ -59,6 +59,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -158,6 +160,116 @@ int argmax_f32(const float *logits, int lo, int hi) {
     return best;
 }
 
+// ============================================================================
+// Phase 2.8 — sampling (temperature + top-k + top-p + repetition penalty).
+// Mirrors Ascend tools/qwen_tts/talker.cpp::sample_token defaults
+// (temp=0.9, top_k=50, top_p=1.0, rep_penalty=1.05).
+// ============================================================================
+struct SamplingConfig {
+    float temperature        = 0.9f;
+    int   top_k              = 50;
+    float top_p              = 1.0f;
+    float repetition_penalty = 1.05f;
+    int   recent_window      = 64;
+    bool  do_sample          = true;
+    uint64_t seed            = 42;
+};
+
+// Read env var with fallback.
+static float env_f(const char *k, float def) {
+    const char *v = std::getenv(k);
+    if (!v || !*v) return def;
+    return (float)std::atof(v);
+}
+static int env_i(const char *k, int def) {
+    const char *v = std::getenv(k);
+    if (!v || !*v) return def;
+    return std::atoi(v);
+}
+static uint64_t env_u64(const char *k, uint64_t def) {
+    const char *v = std::getenv(k);
+    if (!v || !*v) return def;
+    return (uint64_t)std::strtoull(v, nullptr, 10);
+}
+
+SamplingConfig load_sampling_config_from_env() {
+    SamplingConfig c;
+    c.temperature        = env_f("OMINIX_TTS_TEMPERATURE",  c.temperature);
+    c.top_k              = env_i("OMINIX_TTS_TOP_K",        c.top_k);
+    c.top_p              = env_f("OMINIX_TTS_TOP_P",        c.top_p);
+    c.repetition_penalty = env_f("OMINIX_TTS_REP_PENALTY",  c.repetition_penalty);
+    c.seed               = env_u64("OMINIX_TTS_SEED",       c.seed);
+    int dos              = env_i("OMINIX_TTS_DO_SAMPLE",    c.do_sample ? 1 : 0);
+    c.do_sample          = (dos != 0);
+    return c;
+}
+
+// Apply repetition penalty to a recent window of tokens (Ascend style: divide
+// positive logits by penalty, multiply negative ones).
+void apply_repetition_penalty(float *logits, int vocab_size,
+                              const std::vector<int> &recent, int lo, int hi,
+                              float penalty) {
+    if (penalty == 1.0f) return;
+    for (int tok : recent) {
+        int t = tok + lo;  // map sub-vocab index to logit slot for predictor
+        if (t < lo || t >= hi) continue;
+        if (logits[t] > 0.0f) logits[t] /= penalty;
+        else                  logits[t] *= penalty;
+    }
+}
+
+// Sample one token from logits[lo..hi) with temperature/top-k/top-p.
+// Returns absolute index in [lo, hi). Greedy if !do_sample or temperature<=0.
+int sample_token(float *logits, int lo, int hi,
+                 const SamplingConfig &cfg, std::mt19937 &rng) {
+    if (!cfg.do_sample || cfg.temperature <= 0.0f) {
+        return argmax_f32(logits, lo, hi);
+    }
+    const float inv_t = 1.0f / cfg.temperature;
+    std::vector<std::pair<float,int>> cands;
+    cands.reserve(hi - lo);
+    for (int i = lo; i < hi; ++i) {
+        float l = logits[i] * inv_t;
+        if (l > -1e9f) cands.emplace_back(l, i);
+    }
+    if (cands.empty()) return argmax_f32(logits, lo, hi);
+
+    std::sort(cands.begin(), cands.end(),
+              [](const auto &a, const auto &b){ return a.first > b.first; });
+    if (cfg.top_k > 0 && cfg.top_k < (int)cands.size())
+        cands.resize(cfg.top_k);
+
+    // Softmax (subtract max for stability).
+    float mx = cands.front().first;
+    float sum = 0.0f;
+    for (auto &c : cands) { c.first = std::exp(c.first - mx); sum += c.first; }
+    if (sum <= 0.0f) return cands.front().second;
+    for (auto &c : cands) c.first /= sum;
+
+    // Top-p (nucleus) cutoff.
+    if (cfg.top_p < 1.0f) {
+        float cs = 0.0f;
+        int cutoff = (int)cands.size();
+        for (int i = 0; i < (int)cands.size(); ++i) {
+            cs += cands[i].first;
+            if (cs >= cfg.top_p) { cutoff = i + 1; break; }
+        }
+        cands.resize(cutoff);
+        sum = 0.0f;
+        for (auto &c : cands) sum += c.first;
+        for (auto &c : cands) c.first /= sum;
+    }
+
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    float r = u(rng);
+    float cs = 0.0f;
+    for (const auto &c : cands) {
+        cs += c.first;
+        if (r <= cs) return c.second;
+    }
+    return cands.back().second;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -175,6 +287,15 @@ int main(int argc, char **argv) {
     printf("[e2e] text='%s'\n", text.c_str());
     printf("[e2e] n_talker_steps=%d  n_predictor_steps=%d\n",
            n_talker_steps, n_predictor_steps);
+
+    // Phase 2.8 sampling config (env-overridable).
+    SamplingConfig samp = load_sampling_config_from_env();
+    printf("[e2e] sampling: do_sample=%d temp=%.2f top_k=%d top_p=%.2f "
+           "rep_penalty=%.2f recent_window=%d seed=%llu\n",
+           (int)samp.do_sample, samp.temperature, samp.top_k, samp.top_p,
+           samp.repetition_penalty, samp.recent_window,
+           (unsigned long long)samp.seed);
+    std::mt19937 rng((uint32_t)samp.seed);
 
     auto wall_t0 = std::chrono::high_resolution_clock::now();
 
@@ -306,15 +427,16 @@ int main(int argc, char **argv) {
     printf("[e2e] prefill: %.2f ms (%.2f TPS)\n",
            ms_prefill, prefill_len * 1000.0 / ms_prefill);
 
-    // First codec token: argmax over codec vocab from the codec_bos hidden.
+    // First codec token: sample over codec vocab from the codec_bos hidden.
     matvec_f32(t_lm_head_w.data(), hidden.data(), logits.data(), t_vocab, t_n_embd);
-    int first_tok = argmax_f32(logits.data(), 3, t_vocab);
+    // Repetition penalty has no history yet for the first token.
+    int first_tok = sample_token(logits.data(), 3, t_vocab, samp, rng);
 
     std::vector<int> semantic_tokens;
     semantic_tokens.reserve(n_talker_steps);
     semantic_tokens.push_back(first_tok);
 
-    // Continue autoreg.
+    // Continue autoreg with sampling + repetition penalty over recent window.
     int pos_cursor = prefill_len;
     int cur_tok = first_tok;
     bool hit_eos = false;
@@ -329,7 +451,15 @@ int main(int argc, char **argv) {
             }
         }
         matvec_f32(t_lm_head_w.data(), hidden.data(), logits.data(), t_vocab, t_n_embd);
-        int nxt = argmax_f32(logits.data(), 3, t_vocab);
+        // Build recent-window absolute-codec indices for rep penalty.
+        std::vector<int> recent_abs;
+        int from = std::max(0, (int)semantic_tokens.size() - samp.recent_window);
+        for (int i = from; i < (int)semantic_tokens.size(); ++i)
+            recent_abs.push_back(semantic_tokens[i]);
+        // apply_repetition_penalty here uses lo=0 so token id == logit slot.
+        apply_repetition_penalty(logits.data(), t_vocab, recent_abs,
+                                 0, t_vocab, samp.repetition_penalty);
+        int nxt = sample_token(logits.data(), 3, t_vocab, samp, rng);
         semantic_tokens.push_back(nxt);
         cur_tok = nxt;
         if (nxt == CODEC_EOS) { hit_eos = true; break; }
@@ -401,7 +531,13 @@ int main(int argc, char **argv) {
                         p_vocab, p_n_embd);
             int lo = g * 2048;
             int hi = lo + 2048;
-            int nxt = argmax_f32(p_logits.data(), lo, hi);
+            // Repetition penalty within this codebook over recent frames.
+            std::vector<int> recent_g;
+            int from = std::max(0, t - samp.recent_window);
+            for (int tt = from; tt < t; ++tt) recent_g.push_back(codes[g + 1][tt]);
+            apply_repetition_penalty(p_logits.data(), p_vocab, recent_g,
+                                     lo, hi, samp.repetition_penalty);
+            int nxt = sample_token(p_logits.data(), lo, hi, samp, rng);
             int acoustic_tok = nxt - lo;
             codes[g + 1][t] = acoustic_tok;
             p_cur = nxt;
