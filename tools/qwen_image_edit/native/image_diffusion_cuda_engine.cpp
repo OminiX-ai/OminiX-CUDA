@@ -28,6 +28,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1294,6 +1295,359 @@ bool ImageDiffusionCudaEngine::forward_dit(float timestep,
         OMX_CUDA_CHECK(cudaStreamSynchronize(s));
         for (size_t i = 0; i < h.size(); ++i) img_out[i] = __half2float(h[i]);
     }
+    return true;
+}
+
+// ============================================================================
+// Phase 3.3c — denoise(): host-orchestrated 20-step Euler-flow loop.
+//
+// Per-step structure mirrors Ascend `denoise_full` (image_diffusion_engine.cpp
+// L4780). The CUDA forward_dit() does the inner blocks + norm_out + proj_out;
+// the per-step front (patchify, img_in, txt_norm, txt_in) is materialized here
+// as host F32 → device GEMM dispatch → host F32 download for the unpatchify
+// + Euler update. At 1024² scale the per-step host roundtrip is ~50 MiB of
+// F32 traffic (img_seq * H = 4096 * 3072 = 12.6M F32 = ~48 MiB) which is
+// negligible compared to the 30+ s of compute.
+//
+// One-shot txt_norm + txt_in is hoisted out of the loop (text conditioning
+// is constant across all 20 steps).
+// ============================================================================
+
+namespace {
+
+// Host patchify: input `latent[B, C_lat, H_lat, W_lat]` row-major in W_lat.
+// Output `out[B, seq, patch²*C_lat]` row-major. seq = (H_lat/patch) * (W_lat/patch).
+static void host_patchify_latent(const float *latent,
+                                 int W_lat, int H_lat, int C_lat, int B,
+                                 int patch, std::vector<float> &out,
+                                 int &seq_out, int &token_dim_out) {
+    const int H_tok = H_lat / patch;
+    const int W_tok = W_lat / patch;
+    seq_out       = H_tok * W_tok;
+    token_dim_out = patch * patch * C_lat;
+    out.assign((size_t)B * seq_out * token_dim_out, 0.0f);
+    for (int b = 0; b < B; ++b) {
+        for (int ty = 0; ty < H_tok; ++ty) {
+            for (int tx = 0; tx < W_tok; ++tx) {
+                int tok = ty * W_tok + tx;
+                float *dst = &out[((size_t)b * seq_out + tok) * token_dim_out];
+                int k = 0;
+                for (int c = 0; c < C_lat; ++c) {
+                    for (int py = 0; py < patch; ++py) {
+                        for (int px = 0; px < patch; ++px) {
+                            int h = ty * patch + py;
+                            int w = tx * patch + px;
+                            size_t lat_idx = (((size_t)b * C_lat + c) * H_lat + h) * W_lat + w;
+                            dst[k++] = latent[lat_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Inverse of host_patchify_latent.
+static void host_unpatchify_latent(const float *tokens,
+                                   int W_lat, int H_lat, int C_lat, int B,
+                                   int patch, float *out_latent) {
+    const int H_tok = H_lat / patch;
+    const int W_tok = W_lat / patch;
+    const int seq   = H_tok * W_tok;
+    const int td    = patch * patch * C_lat;
+    std::memset(out_latent, 0, (size_t)B * C_lat * H_lat * W_lat * sizeof(float));
+    for (int b = 0; b < B; ++b) {
+        for (int ty = 0; ty < H_tok; ++ty) {
+            for (int tx = 0; tx < W_tok; ++tx) {
+                int tok = ty * W_tok + tx;
+                const float *src = &tokens[((size_t)b * seq + tok) * td];
+                int k = 0;
+                for (int c = 0; c < C_lat; ++c) {
+                    for (int py = 0; py < patch; ++py) {
+                        for (int px = 0; px < patch; ++px) {
+                            int h = ty * patch + py;
+                            int w = tx * patch + px;
+                            size_t lat_idx = (((size_t)b * C_lat + c) * H_lat + h) * W_lat + w;
+                            out_latent[lat_idx] = src[k++];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool ImageDiffusionCudaEngine::denoise(const float *initial_latent,
+                                        const float *ref_latent,
+                                        int W_lat, int H_lat, int C_lat,
+                                        const float *txt_cond, int txt_seq,
+                                        int joint_dim,
+                                        const float *sigmas, int n_steps,
+                                        float *out_latent,
+                                        double *per_step_ms) {
+    if (!ready_) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: engine not ready\n");
+        return false;
+    }
+    if (!initial_latent || !txt_cond || !sigmas || !out_latent || n_steps < 1) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: bad args\n");
+        return false;
+    }
+    const int H        = cfg_.hidden;
+    const int PATCH    = 2;                          // patch_size for patchify
+    const int IN_CH    = PATCH * PATCH * C_lat;       // 64 for C_lat=16
+    if (IN_CH != cfg_.patch_in) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: PATCH²*C_lat=%d != cfg.patch_in=%d\n",
+                IN_CH, cfg_.patch_in);
+        return false;
+    }
+    if (W_lat % PATCH != 0 || H_lat % PATCH != 0) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: W/H must be multiple of %d\n", PATCH);
+        return false;
+    }
+    if (joint_dim != cfg_.text_hidden) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: joint_dim=%d != text_hidden=%d\n",
+                joint_dim, cfg_.text_hidden);
+        return false;
+    }
+    if (txt_seq > cfg_.max_txt_seq) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: txt_seq=%d > max_txt_seq=%d\n",
+                txt_seq, cfg_.max_txt_seq);
+        return false;
+    }
+    const int img_tokens_init = (H_lat / PATCH) * (W_lat / PATCH);
+    const int img_tokens_ref  = ref_latent ? img_tokens_init : 0;
+    const int img_seq         = img_tokens_init + img_tokens_ref;
+    if (img_seq > cfg_.max_img_seq) {
+        fprintf(stderr, "[image_diffusion_cuda] denoise: img_seq=%d > max_img_seq=%d "
+                "(consider dropping ref or smaller H/W)\n",
+                img_seq, cfg_.max_img_seq);
+        return false;
+    }
+    fprintf(stderr, "[image_diffusion_cuda] denoise: W=%d H=%d C=%d img_tokens=%d+%d=%d "
+            "txt_seq=%d joint_dim=%d n_steps=%d\n",
+            W_lat, H_lat, C_lat, img_tokens_init, img_tokens_ref, img_seq,
+            txt_seq, joint_dim, n_steps);
+
+    cudaStream_t s = stream_;
+
+    // ----- One-shot text encoder projection on device. -----
+    // (a) txt_cond F32 [txt_seq, joint_dim] H2D.
+    // (b) RMSNorm(txt_cond, gamma=txt_norm_w_) → F32 [txt_seq, joint_dim]
+    //     (treat as rmsnorm_head with n_heads=1, head_dim=joint_dim).
+    // (c) txt_in matmul: F16 cast → GEMM → [txt_seq, H] F16 → cast back F32.
+    // (d) D2H to host buffer txt_in_f32_host[txt_seq * H], reused in loop.
+
+    void *dev_txt_cond_f32 = nullptr;
+    void *dev_txt_norm_f32 = nullptr;
+    void *dev_txt_norm_f16 = nullptr;
+    void *dev_txt_in_f16   = nullptr;
+    void *dev_txt_in_f32   = nullptr;
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_txt_cond_f32, (size_t)txt_seq * joint_dim * sizeof(float), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_txt_norm_f32, (size_t)txt_seq * joint_dim * sizeof(float), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_txt_norm_f16, (size_t)txt_seq * joint_dim * sizeof(__half), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_txt_in_f16,   (size_t)txt_seq * H * sizeof(__half), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_txt_in_f32,   (size_t)txt_seq * H * sizeof(float),  s));
+
+    OMX_CUDA_CHECK(cudaMemcpyAsync(dev_txt_cond_f32, txt_cond,
+                                   (size_t)txt_seq * joint_dim * sizeof(float),
+                                   cudaMemcpyHostToDevice, s));
+    // RMSNorm per-row over joint_dim, gamma F32 [joint_dim].
+    launch_rmsnorm_head_f32_g32((const float *)dev_txt_cond_f32,
+                                 (const float *)txt_norm_w_,
+                                 (float *)dev_txt_norm_f32,
+                                 txt_seq, /*n_heads=*/1, /*head_dim=*/joint_dim,
+                                 cfg_.rms_norm_eps, s);
+    // F32 → F16 for GEMM input.
+    launch_cast_f32_to_f16_2d((const float *)dev_txt_norm_f32,
+                               (__half *)dev_txt_norm_f16,
+                               txt_seq * joint_dim, s);
+    // txt_in: x[txt_seq, joint_dim] @ W[H, joint_dim]^T + b[H] → [txt_seq, H].
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+            cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+            /*N=*/H, /*M=*/txt_seq, /*K=*/joint_dim,
+            &alpha,
+            txt_in_w_, CUDA_R_16F, joint_dim,
+            dev_txt_norm_f16, CUDA_R_16F, joint_dim,
+            &beta,
+            dev_txt_in_f16, CUDA_R_16F, H,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[image_diffusion_cuda] denoise: txt_in GEMM failed: %d\n", (int)st);
+            return false;
+        }
+        launch_add_bias_f32_f16((__half *)dev_txt_in_f16, (const float *)txt_in_b_,
+                                txt_seq, H, s);
+    }
+    launch_cast_f16_to_f32_2d((const __half *)dev_txt_in_f16,
+                               (float *)dev_txt_in_f32,
+                               txt_seq * H, s);
+
+    std::vector<float> txt_in_f32_host((size_t)txt_seq * H, 0.0f);
+    OMX_CUDA_CHECK(cudaMemcpyAsync(txt_in_f32_host.data(), dev_txt_in_f32,
+                                   txt_in_f32_host.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, s));
+    OMX_CUDA_CHECK(cudaStreamSynchronize(s));
+
+    // ----- Preallocate per-step img_in projection device buffers. -----
+    void *dev_img_tok_f16  = nullptr;   // [img_seq, IN_CH] F16 input
+    void *dev_img_in_f16   = nullptr;   // [img_seq, H]     F16 GEMM out
+    void *dev_img_in_f32   = nullptr;   // [img_seq, H]     F32 cast out
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_img_tok_f16, (size_t)img_seq * IN_CH * sizeof(__half), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_img_in_f16,  (size_t)img_seq * H     * sizeof(__half), s));
+    OMX_CUDA_CHECK(cudaMallocAsync(&dev_img_in_f32,  (size_t)img_seq * H     * sizeof(float),  s));
+
+    // Patchify ref once.
+    std::vector<float> ref_tokens_f32;
+    if (ref_latent) {
+        int rs = 0, rtd = 0;
+        host_patchify_latent(ref_latent, W_lat, H_lat, C_lat, /*B=*/1,
+                              PATCH, ref_tokens_f32, rs, rtd);
+    }
+
+    std::vector<float> x_host((size_t)C_lat * H_lat * W_lat, 0.0f);
+    std::memcpy(x_host.data(), initial_latent, x_host.size() * sizeof(float));
+
+    std::vector<float> concat_tokens_f32((size_t)img_seq * IN_CH, 0.0f);
+    std::vector<__half> img_tok_f16_host((size_t)img_seq * IN_CH, 0);
+    std::vector<float> img_in_f32_host((size_t)img_seq * H, 0.0f);
+    // forward_dit writes img_seq * patch_in floats (one patch-sized vector
+    // per token, including the ref tail). At ref==null, img_seq == img_tokens_init.
+    std::vector<float> patch_out_host((size_t)img_seq * cfg_.patch_in, 0.0f);
+    std::vector<float> denoised_host((size_t)C_lat * H_lat * W_lat, 0.0f);
+
+    for (int step = 0; step < n_steps; ++step) {
+        auto t_step_0 = std::chrono::steady_clock::now();
+        const float sigma = sigmas[step];
+        const float t_val = sigma * 1000.0f;
+        fprintf(stderr, "[image_diffusion_cuda] denoise step=%d/%d sigma=%.4f t=%.1f\n",
+                step, n_steps, sigma, t_val);
+
+        // ---- (1) host patchify(x) + concat with ref ----
+        {
+            std::vector<float> init_tokens;
+            int rs = 0, rtd = 0;
+            host_patchify_latent(x_host.data(), W_lat, H_lat, C_lat, /*B=*/1,
+                                  PATCH, init_tokens, rs, rtd);
+            std::memcpy(concat_tokens_f32.data(), init_tokens.data(),
+                         init_tokens.size() * sizeof(float));
+            if (ref_latent) {
+                std::memcpy(concat_tokens_f32.data() + (size_t)img_tokens_init * IN_CH,
+                             ref_tokens_f32.data(),
+                             ref_tokens_f32.size() * sizeof(float));
+            }
+            for (size_t i = 0; i < img_tok_f16_host.size(); ++i) {
+                img_tok_f16_host[i] = __float2half(concat_tokens_f32[i]);
+            }
+            OMX_CUDA_CHECK(cudaMemcpyAsync(dev_img_tok_f16, img_tok_f16_host.data(),
+                                           img_tok_f16_host.size() * sizeof(__half),
+                                           cudaMemcpyHostToDevice, s));
+        }
+        // ---- (2) img_in: [img_seq, IN_CH] @ W[H, IN_CH]^T + b → [img_seq, H] F16 ----
+        {
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasStatus_t st = cublasGemmEx(
+                cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                /*N=*/H, /*M=*/img_seq, /*K=*/IN_CH,
+                &alpha,
+                img_in_w_, CUDA_R_16F, IN_CH,
+                dev_img_tok_f16, CUDA_R_16F, IN_CH,
+                &beta,
+                dev_img_in_f16, CUDA_R_16F, H,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[image_diffusion_cuda] denoise: img_in GEMM failed: %d\n", (int)st);
+                return false;
+            }
+            launch_add_bias_f32_f16((__half *)dev_img_in_f16, (const float *)img_in_b_,
+                                    img_seq, H, s);
+        }
+        launch_cast_f16_to_f32_2d((const __half *)dev_img_in_f16,
+                                   (float *)dev_img_in_f32,
+                                   img_seq * H, s);
+        // D2H → host F32 buffer used by forward_dit caller.
+        OMX_CUDA_CHECK(cudaMemcpyAsync(img_in_f32_host.data(), dev_img_in_f32,
+                                       img_in_f32_host.size() * sizeof(float),
+                                       cudaMemcpyDeviceToHost, s));
+        OMX_CUDA_CHECK(cudaStreamSynchronize(s));
+
+        // ---- (3) forward_dit (60 blocks + norm_out + proj_out) ----
+        bool ok = forward_dit(t_val,
+                               img_in_f32_host.data(), img_seq,
+                               txt_in_f32_host.data(), txt_seq,
+                               patch_out_host.data() /* will fill img_seq * PATCH_OUT */ );
+        if (!ok) {
+            fprintf(stderr, "[image_diffusion_cuda] denoise: forward_dit failed step=%d\n", step);
+            return false;
+        }
+        // forward_dit wrote img_seq tokens; we only keep the first img_tokens_init
+        // (the ref tail is dropped per Ascend reference, see denoise_full L4811).
+        // patch_out_host is sized for img_tokens_init only — that's fine because
+        // forward_dit currently writes the full img_seq output; we need to take
+        // only the init tokens. Resize a temp vector if needed.
+        if (img_tokens_ref > 0) {
+            // Re-issue the call into a larger buffer. Currently forward_dit writes
+            // [img_seq, PATCH_OUT]; we passed a buffer of [img_tokens_init, PATCH_OUT].
+            // To handle ref correctly we'd need a bigger buffer + slice. For
+            // ref==null case (the only one supported here) the buffer sizes match
+            // exactly so this branch never executes.
+        }
+
+        // ---- (4) host unpatchify → denoised [B, C_lat, H_lat, W_lat] ----
+        // patch_out_host holds [img_tokens_init, PATCH_OUT=64] F32, the model's
+        // raw "v" velocity prediction at the patchified shape.
+        host_unpatchify_latent(patch_out_host.data(),
+                                W_lat, H_lat, C_lat, /*B=*/1,
+                                PATCH, denoised_host.data());
+
+        // ---- (5) Euler step (Qwen-Image flow-matching, matches Ascend
+        //          denoise_full §5.5 reference). ----
+        // proj_out output IS the denoised prediction (NOT raw velocity).
+        //   d[j]  = (x[j] - denoised[j]) / sigma
+        //   x[j] += d[j] * (sigmas[s+1] - sigma)
+        // Phase 3.4d fix: previous code treated proj_out as v and applied
+        //   x_new = x + v*dt, which yielded ~97% pass-through (cossim
+        //   CUDA_out vs noised_init ≈ 0.97) and broke parity vs Ascend.
+        const float dt = sigmas[step + 1] - sigma;
+        if (sigma > 0.0f) {
+            const size_t nelt = x_host.size();
+            for (size_t j = 0; j < nelt; ++j) {
+                float d = (x_host[j] - denoised_host[j]) / sigma;
+                x_host[j] += d * dt;
+            }
+        }
+        // sigma==0 (terminal): no-op, keep x_host unchanged.
+
+        auto t_step_1 = std::chrono::steady_clock::now();
+        double step_ms = std::chrono::duration<double, std::milli>(t_step_1 - t_step_0).count();
+        if (per_step_ms) per_step_ms[step] = step_ms;
+        // Quick sanity probe (max-abs of x).
+        double mxa = 0.0;
+        for (float v : x_host) {
+            double a = std::fabs((double)v);
+            if (a > mxa) mxa = a;
+        }
+        fprintf(stderr, "[image_diffusion_cuda] denoise step=%d done  step_ms=%.0f  "
+                "x_host max_abs=%.4g  dt=%.4f\n",
+                step, step_ms, mxa, dt);
+    }
+
+    std::memcpy(out_latent, x_host.data(), x_host.size() * sizeof(float));
+
+    // Cleanup async device buffers.
+    cudaFreeAsync(dev_txt_cond_f32, s);
+    cudaFreeAsync(dev_txt_norm_f32, s);
+    cudaFreeAsync(dev_txt_norm_f16, s);
+    cudaFreeAsync(dev_txt_in_f16, s);
+    cudaFreeAsync(dev_txt_in_f32, s);
+    cudaFreeAsync(dev_img_tok_f16, s);
+    cudaFreeAsync(dev_img_in_f16, s);
+    cudaFreeAsync(dev_img_in_f32, s);
+    cudaStreamSynchronize(s);
     return true;
 }
 

@@ -76,7 +76,7 @@ struct ImageDiffusionConfig {
     int rope_axes_h        = 56;
     int rope_axes_w        = 56;
     int max_txt_seq        = 256;   // pe_table txt slot count
-    int max_img_seq        = 4096;  // pe_table img slot count (64*64 patch grid)
+    int max_img_seq        = 8192;  // pe_table img slot count (64*64 patch grid)
 };
 
 // Per-block weight pointers. Names mirror the diffusers / GGUF tensor schema:
@@ -188,6 +188,51 @@ public:
                      const float *img_in, int img_seq_len,
                      const float *txt_in, int txt_seq_len,
                      float *img_out);
+
+    // Phase 3.3c — full Euler-flow denoise loop with txt-encoder projection.
+    //
+    // Takes raw VAE-space latents and pre-computed text encoder hidden state
+    // (cond_c_crossattn from Qwen2.5-VL — see §5.5.28 of qie_q2_phase4_smoke).
+    //
+    //   initial_latent  : F32 [B, C_lat, H_lat, W_lat] = [1, 16, H_lat, W_lat]
+    //                     row-major in W_lat (Ascend / GGUF VAE convention).
+    //                     Should be the noised_init_latent at sigmas[0]
+    //                     (post-noise-scaling x_t, NOT clean latent).
+    //   ref_latent      : F32 [B, C_lat, H_lat, W_lat] or nullptr. NOTE:
+    //                     attaching ref doubles img_seq; engine's
+    //                     max_img_seq=4096 means ref is only viable at
+    //                     ≤ 512² (32×32 patch grid). Pass nullptr at 1024².
+    //   txt_cond        : F32 [txt_seq, joint_dim=text_hidden=3584] from
+    //                     Qwen2.5-VL hidden_states[-2] (post-vision pad).
+    //   txt_seq         : ≤ max_txt_seq (256). Padded inputs OK.
+    //   sigmas          : float[n_steps + 1]. Linear flow-matching schedule,
+    //                     sigmas[0]=1, sigmas[n_steps]=0.
+    //   n_steps         : Euler steps (canonical = 20).
+    //   out_latent      : F32 [B, C_lat, H_lat, W_lat] same layout as input.
+    //
+    // CFG is NOT applied (cfg_scale=1 implicit). For the first cat smoke
+    // we only run the cond branch — uncond doubles per-step wall and
+    // cfg=1.0 is what every published QIE-Edit baseline uses.
+    //
+    // Per-step flow (mirrors Ascend `denoise_full`, image_diffusion_engine.cpp
+    // L4780+):
+    //   1. compute t_emb (sigma * 1000)
+    //   2. host patchify(x) → upload F32 [img_seq, IN_CH=64]
+    //   3. img_in linear → [img_seq, H] F32
+    //   4. txt_norm(RMSNorm) + txt_in linear (one-shot before loop) →
+    //      [txt_seq, H] F32
+    //   5. forward_dit(t, img_proj, txt_proj) → [img_seq, PATCH_OUT=64] F32
+    //   6. host unpatchify → denoised [B, C_lat, H_lat, W_lat] F32
+    //   7. Euler: x += (x - denoised) / sigma * (sigmas[s+1] - sigmas[s])
+    //
+    // Returns true on success.
+    bool denoise(const float *initial_latent,
+                 const float *ref_latent,
+                 int W_lat, int H_lat, int C_lat,
+                 const float *txt_cond, int txt_seq, int joint_dim,
+                 const float *sigmas, int n_steps,
+                 float *out_latent,
+                 double *per_step_ms = nullptr);
 
     bool is_ready() const { return ready_; }
     int  n_blocks() const { return cfg_.n_blocks; }

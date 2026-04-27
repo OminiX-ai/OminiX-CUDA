@@ -131,3 +131,33 @@ endif()
 install(TARGETS test_image_diffusion_cuda_dit RUNTIME)
 message(STATUS "qwen_image_edit: Phase 3.3b 60-block smoke harness ENABLED "
                "(test_image_diffusion_cuda_dit)")
+
+# ---------------------------------------------------------------------------
+# Phase 3.3c E2E harness — test_image_diffusion_cuda_e2e (denoise loop)
+# ---------------------------------------------------------------------------
+add_executable(test_image_diffusion_cuda_e2e
+    native/test_image_diffusion_cuda_e2e.cpp
+    native/image_diffusion_cuda_engine.cpp
+)
+target_link_libraries     (test_image_diffusion_cuda_e2e PUBLIC  ggml qwen_common)
+target_link_libraries     (test_image_diffusion_cuda_e2e PRIVATE Threads::Threads
+                                                                   CUDA::cudart CUDA::cublas
+                                                                   qwen_image_edit_cuda_kernels)
+target_include_directories(test_image_diffusion_cuda_e2e PUBLIC  .)
+target_include_directories(test_image_diffusion_cuda_e2e PRIVATE
+    ../.. ../../vendor native
+    ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_image_diffusion_cuda_e2e PRIVATE
+    QWEN_IMAGE_EDIT_HAS_CUDA=1)
+target_compile_features   (test_image_diffusion_cuda_e2e PRIVATE cxx_std_17)
+if(OMINIX_CUDA_USE_CUDNN)
+    target_link_libraries     (test_image_diffusion_cuda_e2e PRIVATE CUDA::cudnn)
+    target_compile_definitions(test_image_diffusion_cuda_e2e PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+endif()
+if(BUILD_SHARED_LIBS)
+    set_target_properties(test_image_diffusion_cuda_e2e PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+endif()
+install(TARGETS test_image_diffusion_cuda_e2e RUNTIME)
+message(STATUS "qwen_image_edit: Phase 3.3c E2E harness ENABLED "
+               "(test_image_diffusion_cuda_e2e)")
