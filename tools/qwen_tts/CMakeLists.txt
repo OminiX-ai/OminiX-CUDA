@@ -627,4 +627,42 @@ if(QWEN_TTS_CUDA)
         target_compile_definitions(test_codec_cuda PRIVATE OMINIX_CUDA_USE_CUDNN=1)
     endif()
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.4 codec smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.7a — SpeechTokenizerDecoder scaffold + RVQ decode.
+    #
+    # Builds the SpeechTokenizerDecoderCudaEngine static lib (GGUF parse +
+    # RVQ decode only; pre_conv / pre_transformer / upsample / vocoder are
+    # scaffolded but abort) and a tiny smoke harness that drives init +
+    # rvq_decode against the qwen_tts_tokenizer_dec.gguf shipped on
+    # zgx-3675. Phase 2.7b will add pre_conv + upsample; 2.7c lands the
+    # SnakeBeta vocoder + final conv.
+    # ---------------------------------------------------------------------
+    add_library(qwen_tts_speech_decoder_cuda STATIC
+        native/speech_tokenizer_decoder_cuda_engine.cpp
+    )
+    target_link_libraries     (qwen_tts_speech_decoder_cuda PUBLIC ggml)
+    target_link_libraries     (qwen_tts_speech_decoder_cuda PRIVATE
+                                                              CUDA::cudart CUDA::cublas)
+    target_include_directories(qwen_tts_speech_decoder_cuda PUBLIC native)
+    target_include_directories(qwen_tts_speech_decoder_cuda PRIVATE
+                                                              ../.. ../../vendor)
+    target_compile_features   (qwen_tts_speech_decoder_cuda PUBLIC cxx_std_17)
+    set_target_properties     (qwen_tts_speech_decoder_cuda PROPERTIES
+                                                              POSITION_INDEPENDENT_CODE ON)
+
+    add_executable(test_speech_tokenizer_decoder_init
+        native/test_speech_tokenizer_decoder_init.cpp
+    )
+    target_link_libraries     (test_speech_tokenizer_decoder_init PUBLIC
+                                                              ggml qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (test_speech_tokenizer_decoder_init PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas)
+    target_include_directories(test_speech_tokenizer_decoder_init PUBLIC  .)
+    target_include_directories(test_speech_tokenizer_decoder_init PRIVATE
+                                                              ../.. ../../vendor native)
+    target_compile_definitions(test_speech_tokenizer_decoder_init PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_speech_tokenizer_decoder_init PRIVATE cxx_std_17)
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7a speech-decoder smoke ENABLED")
 endif()
