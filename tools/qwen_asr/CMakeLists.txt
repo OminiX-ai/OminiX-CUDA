@@ -142,6 +142,17 @@ if(QWEN_ASR_CUDA)
             "reuses TalkerCudaEngine).")
     endif()
 
+    # CUDA kernels static lib (audio-encoder-specific kernels).
+    enable_language(CUDA)
+    add_library(qwen_asr_cuda_kernels STATIC
+        native/cuda_kernels/audio_encoder_kernels.cu
+    )
+    set_target_properties(qwen_asr_cuda_kernels PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(qwen_asr_cuda_kernels PUBLIC
+        native native/cuda_kernels)
+
     # Static library: mel spectrogram (CPU) + audio encoder (CUDA) +
     # AsrCudaEngine (top-level orchestration).
     add_library(qwen_asr_cuda STATIC
@@ -153,7 +164,8 @@ if(QWEN_ASR_CUDA)
     target_link_libraries     (qwen_asr_cuda PUBLIC  ggml qwen_common)
     target_link_libraries     (qwen_asr_cuda PRIVATE Threads::Threads
                                                       CUDA::cudart CUDA::cublas
-                                                      qwen_tts_cuda_kernels)
+                                                      qwen_tts_cuda_kernels
+                                                      qwen_asr_cuda_kernels)
     target_include_directories(qwen_asr_cuda PUBLIC  native)
     target_include_directories(qwen_asr_cuda PRIVATE
         ../.. ../../vendor ${KISSFFT_DIR}
@@ -201,7 +213,31 @@ if(QWEN_ASR_CUDA)
         target_compile_definitions(test_qwen_asr_cuda_init PRIVATE
                                     OMINIX_CUDA_USE_CUDNN=1)
     endif()
+    # ---------------------------------------------------------------------
+    # Phase 4.2 smoke harness — test_audio_encoder_cuda
+    #
+    # Loads a WAV, computes mel on the CPU, calls AudioEncoderCudaEngine.encode,
+    # prints output stats and verifies NaN/Inf-freeness.
+    # ---------------------------------------------------------------------
+    add_executable(test_audio_encoder_cuda
+        native/test_audio_encoder_cuda.cpp
+    )
+    target_link_libraries     (test_audio_encoder_cuda PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_audio_encoder_cuda PRIVATE Threads::Threads
+                                                                 qwen_asr_cuda
+                                                                 qwen_asr_cuda_kernels
+                                                                 CUDA::cudart
+                                                                 CUDA::cublas
+                                                                 qwen_tts_cuda_kernels)
+    target_include_directories(test_audio_encoder_cuda PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tools)
+    target_compile_definitions(test_audio_encoder_cuda PRIVATE
+                                QWEN_ASR_HAS_CUDA=1)
+    target_compile_features   (test_audio_encoder_cuda PRIVATE cxx_std_17)
+
     message(STATUS
-        "qwen_asr: OminiX-CUDA Phase 4.1 ASR scaffold ENABLED "
-        "(qwen_asr_cuda + test_qwen_asr_cuda_init)")
+        "qwen_asr: OminiX-CUDA Phase 4.1+4.2 ASR ENABLED "
+        "(qwen_asr_cuda + test_qwen_asr_cuda_init + test_audio_encoder_cuda)")
 endif()

@@ -1,24 +1,28 @@
 #pragma once
 // ============================================================================
-// AudioEncoderCudaEngine — Phase 4.1 scaffold (init + GGUF parse only).
+// AudioEncoderCudaEngine — Phase 4.2 forward.
 //
 // Mirror of `AudioEncoder` from the Ascend reference
 // (OminiX-Ascend/tools/qwen_asr/audio_encoder.h). The Ascend implementation
-// uses ggml on the CPU/NPU; the CUDA version targets cuBLAS + custom CUDA
-// kernels and allocates all weight buffers via cudaMalloc once at init.
+// uses ggml on CPU/NPU; this CUDA version targets cuBLAS GemmEx + custom
+// CUDA kernels and allocates all weight buffers via cudaMalloc once at init.
 //
 // Architecture (Qwen3-ASR audio encoder):
-//   - 3× Conv2d (downsample, hidden=480, stride=2)
+//   - 3× Conv2d (downsample, hidden=480, stride=2, kernel=3, pad=1) → GELU-erf
 //   - Linear projection conv_out (7680 -> 1024)
-//   - Sinusoidal positional embedding (computed at init, not stored)
-//   - 24× Transformer encoder block (d_model=1024, heads=16, ffn=4096)
-//   - Output MLP: LayerNorm + Linear(1024,1024) + GELU + Linear(1024,2048)
+//   - Sinusoidal positional embedding (computed at init, uploaded to device)
+//   - 24× Transformer encoder block (Pre-LN), d_model=1024, heads=16,
+//     ffn=4096; full bidirectional attention (no mask, matches Python
+//     reference using SDPA with attention_mask=None / is_causal=False).
+//   - Output MLP: LayerNorm + Linear(1024,1024) + GELU-erf + Linear(1024,2048)
 //
-// Output: (num_frames=122 typical, output_dim=2048) F32 audio embeds
-// for split prefill into the Qwen3 28L text decoder.
+// Output: (num_frames, output_dim=2048) F32 audio embeds for split prefill
+// into the Qwen3 28L text decoder.
 //
-// Phase 4.1 scope: scaffold + GGUF parse + smoke. No forward yet.
-// Phase 4.2 (next dispatch) will land the actual forward kernels.
+// Phase 4.2 numeric strategy: F32 throughout (encoder activation footprint is
+// small enough that F32 storage is < 100MB at typical 122-frame sequences,
+// and F32 matches the Ascend ggml CPU reference exactly without dynamic-range
+// concerns).
 // ============================================================================
 
 #include <cuda_runtime.h>
@@ -30,8 +34,7 @@
 
 namespace ominix_cuda {
 
-// Per-layer transformer weight handles (device pointers). Phase 4.1 records
-// these pointers from the GGUF parse pass; Phase 4.2 will consume them.
+// Per-layer transformer weight handles (device pointers, all F32).
 struct AudioEncoderLayerCuda {
     // Self-attention.
     void *self_attn_layer_norm_w = nullptr;
@@ -58,17 +61,26 @@ public:
     AudioEncoderCudaEngine() = default;
     ~AudioEncoderCudaEngine();
 
-    // Phase 4.1 API surface (mirrors Ascend AudioEncoder::load).
-    //   - init_from_gguf: open GGUF, parse hparams, count layers, record
-    //     weight handles. Phase 4.1 records counts + dimensions and exits;
-    //     Phase 4.2 will additionally upload F16 weights to device memory.
+    // Init: open GGUF, parse hparams, upload all weights to device, prepare
+    // sinusoidal positional embeddings.
     bool init_from_gguf(const std::string &gguf_path, int device = 0);
 
-    // Phase 4.2 forward path (stub returns false in Phase 4.1).
+    // Forward (Phase 4.2):
     //   mel:        F32 host buffer, layout (n_mels, mel_T) row-major
     //   mel_T:      number of mel time frames (at hop=160, sr=16000)
-    //   output:     F32 host buffer, capacity >= num_frames * 2048
-    //   num_frames: out — encoder output frame count (typically 122)
+    //   output:     F32 host buffer, capacity >= num_frames * output_dim
+    //   num_frames: out — encoder output frame count
+    //
+    // Implementation mirrors Ascend AudioEncoder::encode:
+    //   1. Chunk mel along time into n_window*2-sized chunks (last chunk
+    //      gets the remainder).
+    //   2. Pad chunks to max_chunk_len → padded_mel batch.
+    //   3. Conv2d×3 stack with GELU-erf → conv_out_w_ projection
+    //      → (chunk_num, frames_per_chunk, d_model).
+    //   4. Compute valid frame counts via get_feat_extract_output_lengths,
+    //      add positional embedding, concat valid frames.
+    //   5. 24L pre-LN transformer (no mask) + final LayerNorm + proj1 →
+    //      GELU-erf → proj2.
     bool encode(const float *mel, int n_mels, int mel_T,
                 float *output, int &num_frames);
 
@@ -87,7 +99,7 @@ private:
     bool ready_  = false;
     int  device_ = 0;
 
-    // CUDA resources (allocated in init_from_gguf in Phase 4.2).
+    // CUDA resources.
     cublasHandle_t cublas_   = nullptr;
     cudaStream_t   stream_   = nullptr;
 
@@ -105,25 +117,52 @@ private:
     int mel_reduced_              = 16;
     int conv_out_dim_             = 7680;
 
-    // Conv2d weight device pointers.
-    void *conv2d1_w_ = nullptr, *conv2d1_b_ = nullptr;
-    void *conv2d2_w_ = nullptr, *conv2d2_b_ = nullptr;
-    void *conv2d3_w_ = nullptr, *conv2d3_b_ = nullptr;
+    // Conv2d weight device pointers (F32).
+    void *conv2d1_w_  = nullptr, *conv2d1_b_  = nullptr;
+    void *conv2d2_w_  = nullptr, *conv2d2_b_  = nullptr;
+    void *conv2d3_w_  = nullptr, *conv2d3_b_  = nullptr;
     void *conv_out_w_ = nullptr;
 
     std::vector<AudioEncoderLayerCuda> layers_;
 
-    // Output MLP.
+    // Output MLP (F32).
     void *ln_post_w_ = nullptr, *ln_post_b_ = nullptr;
     void *proj1_w_   = nullptr, *proj1_b_   = nullptr;
     void *proj2_w_   = nullptr, *proj2_b_   = nullptr;
 
-    // Sinusoidal positional embeddings (host buffer; uploaded in 4.2).
-    std::vector<float> pos_emb_;
+    // Sinusoidal positional embeddings (uploaded to device, F32).
+    void *pos_emb_dev_ = nullptr;
+
+    // Forward scratch (resized lazily by ensure_scratch_).
+    void *scratch_mel_       = nullptr;  // [chunk_num, 1, num_mel_bins, max_chunk_len]
+    void *scratch_im2col_    = nullptr;  // im2col workspace (largest of 3 convs)
+    void *scratch_conv1_     = nullptr;  // [chunk_num, h1, w1, downsample_hidden]
+    void *scratch_conv2_     = nullptr;  // [chunk_num, h2, w2, downsample_hidden]
+    void *scratch_conv3_     = nullptr;  // [chunk_num, h3, w3, downsample_hidden]
+    void *scratch_conv_proj_ = nullptr;  // [chunk_num, frames_per_chunk, d_model]
+    void *scratch_concat_    = nullptr;  // [total_valid_frames, d_model]
+    void *scratch_resid_     = nullptr;  // [total_valid_frames, d_model] (transformer residual)
+    void *scratch_norm_      = nullptr;  // [total_valid_frames, d_model] (norm output)
+    void *scratch_q_         = nullptr;  // [total_valid_frames, d_model]
+    void *scratch_k_         = nullptr;
+    void *scratch_v_         = nullptr;
+    void *scratch_attn_out_  = nullptr;  // [total_valid_frames, d_model]
+    void *scratch_ffn_inter_ = nullptr;  // [total_valid_frames, encoder_ffn_dim]
+    void *scratch_proj1_out_ = nullptr;  // [total_valid_frames, d_model]
+    void *scratch_output_    = nullptr;  // [total_valid_frames, output_dim] (final)
+
+    // Capacity planned for scratch (so realloc only when needed).
+    int  scratch_chunk_num_      = 0;
+    int  scratch_max_chunk_len_  = 0;
+    int  scratch_total_frames_   = 0;
+
+    bool ensure_scratch_(int chunk_num, int max_chunk_len, int total_frames,
+                          int frames_per_chunk);
+    bool free_scratch_();
 
     // Counters reported by smoke harness.
     int n_tensors_seen_   = 0;
     int n_weights_bound_  = 0;
 };
 
-} // namespace ominix_cuda
+}  // namespace ominix_cuda
