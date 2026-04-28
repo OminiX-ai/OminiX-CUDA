@@ -352,9 +352,25 @@ The 28-layer Talker body is GEMM-compute-bound at F16. To clear the 80-150 fps c
 
 The production-CLI side of the image-perf gap is closed by `cfb31930`: passing `--diffusion-fa` to `ominix-diffusion-cli` enables the wired-but-unused `fattn-mma-f16` path on SM12.1 GB10, taking 1024² 20-step from 1229 s → 165 s (2:45, 7.4×). The native `ImageDiffusionCudaEngine` still runs naive F32 attention (~960 ms/block) and remains gated on a future cuDNN FMHA pass for native-engine end-to-end.
 
-### Phase 3.7 — text encoder + VAE FlashAttention (deferred, image-perf)
+### Phase 3.7 — text encoder + VAE FlashAttention (INVESTIGATED, dead-end on this workload)
 
-The Phase 3.6 `--diffusion-fa` flag accelerates the DiT attention; the Qwen2.5-VL text encoder and VAE encode/decode still run on un-flash-attended kernels. On the 165 s production wall, the text encode + VAE encode/decode share is ~50 s combined; bringing those under FA-equivalent kernels is the next perf lever for the production CLI.
+Hypothesis from earlier scoping was that text encoder + VAE attention each took meaningful wall time and could be FA-accelerated for ~10–15% off total. Probe on zgx-5b44 (commit `98abe096`) closed this:
+
+- **VAE FA wiring already exists** (`wan.hpp:576`, `vae.hpp:143` honor `ctx->flash_attn_enabled`) and is enabled by `--fa`. Empirical wall delta: encode 4.13 → 4.17 s, decode 7.34 → 7.38 s — measurably zero (VAE attention is one self-attn block, dominated by conv ops).
+- **LLM (Qwen2.5-VL) FA wiring was hard-coded `false` at `llm.hpp:885`.** Wiring it through (commit `1b425bbb4`) and running `--fa` produced **all-NaN text embeddings** (759808/759808 NaN, ±3.4e38). Root cause: `ggml_ext_attention_ext` casts q/k/v to f16 unconditionally before `ggml_flash_attn_ext` (`ggml_extend.hpp:1328`), and Qwen2.5-VL hidden-state magnitudes overflow f16 — same family of failure as the OminiX-API MLX-side note documenting f16 unsafety on this exact text encoder. **Reverted** with an inline comment (`98abe096`) so the next person doesn't re-flip it.
+- **Text encode is only 0.32 s of 163 s total wall** — even if FA worked correctly on the LLM, the upper bound on Phase 3.7 win is ~0.1 s on a 163 s wall (~0.06 %), well below noise.
+
+Conclusion: Phase 3.7 as scoped is **closed with no perf win**. The production lever is squarely on DiT FMHA per-step time (Phase 3.6 already landed) and on the attention kernel itself (cuDNN FMHA / sm_120-tuned, gated on a separate dispatch).
+
+### Phase 3.8 — CUDA Graphs at DiT block level (INVESTIGATED, already enabled, no perf win)
+
+ggml-cuda has built-in CUDA Graphs support (`USE_CUDA_GRAPH`, default-on via `GGML_CUDA_GRAPHS=ON` in our top-level `CMakeLists.txt`). Probe added in commit `004eece8d` (env-gated `OMINIX_CUDA_GRAPH_PROBE=1`, zero cost when off) confirms on zgx-5b44:
+
+- 100 % of cgraphs pass the compatibility check (no split buffers, no MUL_MAT_ID — QIE-Edit DiT cleanly captures).
+- ~6 of 7 backend `graph_compute` calls per inference hit the captured-graph replay path on the very first replay.
+- A/B vs `GGML_CUDA_DISABLE_GRAPHS=1`: **30.39 s vs 30.38 s** for 4 DiT steps (s/step 7.598 vs 7.595) — within run-to-run noise.
+
+The DiT 1024² step is compute-bound on the FlashAttention kernel and the Q4_0 mat-muls; per-launch overhead that CUDA Graphs amortizes is too small to matter on this workload. Path (a) of the contract (built-in graphs) is operationally complete; path (b) (native engine with per-block CUDA-Graph capture, mirroring TalkerCudaEngine) faces the same kernel-time wall and would not help — confirmed by the disable-vs-enable A/B above.
 
 ### Vocoder → Talker init amortization (TTS warm-start, deferred)
 
@@ -372,7 +388,7 @@ Phase 2.7a–c ported the SpeechTokenizerDecoder vocoder verbatim from Ascend (R
 
 ### Phase 1 wall over contract target (CLOSED via Phase 3.6)
 
-Contract Gate 1 was "1024^2 / 20-step at <140 s wall." With Phase 3.6 `--diffusion-fa` enabled, the production CLI lands at **165 s** — within striking distance of the 140 s gate, with Phase 3.7 (text encoder + VAE FA) the next lever to clear it.
+Contract Gate 1 was "1024^2 / 20-step at <140 s wall." With Phase 3.6 `--diffusion-fa` enabled, the production CLI lands at **165 s** — within striking distance of the 140 s gate. Phase 3.7 (text encoder + VAE FA) was probed and ruled out (see §7 above): text encode is 0.32 s of 163 s, VAE FA is already wired and gives no measurable delta, and LLM FA hits an f16 overflow producing NaN. Phase 3.8 (CUDA Graphs at DiT block level) was probed and confirmed already-active in production with zero perf delta vs disabled (compute-bound, not launch-bound). The remaining lever is the DiT attention kernel itself — cuDNN FMHA or a sm_120-tuned FlashAttention — gated on a separate dispatch.
 
 ---
 
