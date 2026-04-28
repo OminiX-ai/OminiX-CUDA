@@ -882,7 +882,18 @@ namespace LLM {
             k = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));  // [N, num_kv_heads, n_token, head_dim]
             k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);      // [N*num_kv_heads, n_token, head_dim]
 
-            x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, attention_mask, true, ctx->flash_attn_enabled);  // [N, n_token, hidden_size]
+            // NOTE: Phase 3.7 probe (2026-04-27) confirmed that wiring
+            // ctx->flash_attn_enabled here produces all-NaN text embeddings on
+            // the Qwen2.5-VL Q8_0 text encoder running QIE-Edit-2509 on GB10.
+            // The ggml_ext_attention_ext FA path casts q/k/v to f16
+            // unconditionally before ggml_flash_attn_ext (see ggml_extend.hpp:1328);
+            // text embedding magnitudes from this model overflow f16 and the
+            // mask path further trips f16 underflow into ±inf, producing NaN
+            // through softmax. Wall time was identical to the standard path
+            // (162.3s vs 162.8s) since text-encode is only ~0.3s of total wall.
+            // Keep the LLM forward on the standard softmax(QK^T)V path. If a
+            // future ggml-cuda gains an f32-q/k/v FA kernel, revisit.
+            x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, attention_mask, true, false);  // [N, n_token, hidden_size]
 
             x = out_proj->forward(ctx, x);  // [N, n_token, hidden_size]
             return x;
