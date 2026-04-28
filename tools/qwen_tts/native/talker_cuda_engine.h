@@ -85,6 +85,19 @@ public:
     bool has_lm_head_uploaded() const { return lm_head_w_f16_dev_ != nullptr; }
     int  lm_head_vocab() const { return lm_head_vocab_; }
 
+    // ---- Phase 2.6 LM-head FP8 lane (Blackwell sm_121a) ---------------
+    // Optional FP8 E4M3 LM-head. Calibrates per-tensor amax over the F32
+    // host weight, computes a single F32 scale_w = amax / E4M3_MAX, packs
+    // weights as FP8 on device. Coexists with the F16 lane — set
+    // set_use_fp8_lm_head(true) to switch the inference path; set false
+    // to fall back to F16. Only kicks in for forward_decode_with_logits.
+    // Returns false if cublasLt is unavailable or the heuristic doesn't
+    // accept the layout (caller falls back to F16 silently).
+    bool upload_lm_head_weights_fp8(const float *lm_head_w_f32, int vocab);
+    bool has_lm_head_uploaded_fp8() const { return lm_head_w_fp8_dev_ != nullptr; }
+    void set_use_fp8_lm_head(bool enable) { use_fp8_lm_head_ = enable; }
+    bool use_fp8_lm_head() const { return use_fp8_lm_head_; }
+
     // Same body as forward_decode(), but instead of D2H'ing the hidden
     // state and forcing the caller to compute LM-head on host, this runs
     // the LM-head GEMM on device and D2Hs only the F32 logits[vocab].
@@ -259,6 +272,30 @@ private:
     void *lm_head_logits_f32_dev_ = nullptr; // F32 [vocab]
     int   lm_head_vocab_         = 0;
 
+    // ---- Phase 2.6 FP8 LM-head lane ----------------------------------------
+    // Populated by upload_lm_head_weights_fp8(); used when use_fp8_lm_head_=1
+    // inside forward_decode_with_logits(). All raw void* (FP8 byte storage)
+    // so the .h doesn't need to pull cuda_fp8.h. cublasLt handle is also
+    // an opaque pointer.
+    void *lm_head_w_fp8_dev_     = nullptr;   // E4M3 [vocab, n_embd] row-major
+    void *lm_head_x_fp8_dev_     = nullptr;   // E4M3 [n_embd] (cast staging)
+    void *lm_head_logits_f16_dev_ = nullptr;  // F16  [vocab] (cublasLt D)
+    void *lm_head_scale_a_dev_    = nullptr;  // F32 (weight scale)
+    void *lm_head_scale_b_dev_    = nullptr;  // F32 (input scale, fixed=1)
+    float lm_head_scale_a_host_   = 0.0f;     // weight scale (=amax_W / E4M3_MAX)
+    void *lm_head_lt_handle_      = nullptr;  // cublasLtHandle_t
+    void *lm_head_lt_desc_        = nullptr;  // cublasLtMatmulDesc_t
+    void *lm_head_lt_layout_a_    = nullptr;  // cublasLtMatrixLayout_t
+    void *lm_head_lt_layout_b_    = nullptr;  // cublasLtMatrixLayout_t
+    void *lm_head_lt_layout_d_    = nullptr;  // cublasLtMatrixLayout_t
+    void *lm_head_lt_pref_        = nullptr;  // cublasLtMatmulPreference_t
+    void *lm_head_lt_workspace_   = nullptr;
+    size_t lm_head_lt_ws_bytes_   = 0;
+    // Cached heuristic algo storage (cublasLtMatmulHeuristicResult_t — kept
+    // as raw bytes to avoid leaking cublasLt types into the public header).
+    void *lm_head_lt_algo_blob_   = nullptr;  // cublasLtMatmulHeuristicResult_t (heap)
+    bool  use_fp8_lm_head_        = false;
+
     // ---- Phase 2.6 quant flags ---------------------------------------------
     bool use_int8_weights_ = false;
     bool int8_applied_     = false;
@@ -283,6 +320,10 @@ private:
     // INT8 + F16 scale; allocates new device buffers.
     bool int8_calibrate_weight_(const float *host_w, int64_t rows, int64_t cols,
                                 void *&weight_i8_dev, void *&scale_dev);
+
+    // Phase 2.6 FP8 LM-head — frees cublasLt resources and FP8 buffers.
+    // Defined in talker_cuda_engine.cpp; safe to call multiple times.
+    void teardown_fp8_lm_head_();
 };
 
 }  // namespace ominix_cuda

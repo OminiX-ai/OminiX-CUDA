@@ -33,7 +33,9 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cmath>
 #include <cstdio>
@@ -213,6 +215,11 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     safe_free(lm_head_w_f16_dev_);
     safe_free(lm_head_hidden_f16_dev_);
     safe_free(lm_head_logits_f32_dev_);
+
+    // Phase 2.6 FP8 LM-head lane buffers + cublasLt resources. Kept in
+    // dedicated cleanup function below to keep cublasLt headers out of
+    // this dtor block (it's defined just above the FP8 entry points).
+    teardown_fp8_lm_head_();
 
     for (auto exec : decode_graph_execs_) {
         if (exec) cudaGraphExecDestroy(exec);
@@ -998,22 +1005,59 @@ void TalkerCudaEngine::forward_decode_with_logits(const float *input_embed,
         run_decode_ops_(pos);
     }
 
-    // Cast device-resident F32 hidden -> F16 for cuBLAS LM-head GEMM.
-    launch_cast_f32_to_f16((const float *)output_stage_f32_dev_,
-                             (__half *)lm_head_hidden_f16_dev_,
-                             n_embd_, stream_);
+    if (use_fp8_lm_head_ && lm_head_w_fp8_dev_ != nullptr) {
+        // -------- FP8 lane (Phase 2.6) ---------------------------------
+        // Quantize hidden state F32 -> FP8 E4M3 (inv_scale = 1.0; weight
+        // scale is composed by cublasLt via A-scale pointer).
+        launch_cast_f32_to_fp8_e4m3_scaled(
+            (const float *)output_stage_f32_dev_,
+            lm_head_x_fp8_dev_,
+            /*inv_scale=*/1.0f,
+            n_embd_, stream_);
 
-    // LM-head GEMM: logits_f32[vocab] = W_f16[vocab, n_embd] @ hidden_f16[n_embd]
-    cublasStatus_t st = gemm_lm_head_f16_to_f32(cublas_,
-                              (const __half *)lm_head_w_f16_dev_,
-                              (const __half *)lm_head_hidden_f16_dev_,
-                              (float *)lm_head_logits_f32_dev_,
-                              lm_head_vocab_, n_embd_);
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr,
-                "[talker_cuda] LM-head cuBLAS GemmEx failed (status=%d)\n",
-                (int)st);
-        std::abort();
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasLtMatmul(
+            (cublasLtHandle_t)lm_head_lt_handle_,
+            (cublasLtMatmulDesc_t)lm_head_lt_desc_,
+            &alpha,
+            lm_head_w_fp8_dev_,                              // A: W FP8 [in,out]^T
+            (cublasLtMatrixLayout_t)lm_head_lt_layout_a_,
+            lm_head_x_fp8_dev_,                              // B: x FP8 [in,1]
+            (cublasLtMatrixLayout_t)lm_head_lt_layout_b_,
+            &beta,
+            lm_head_logits_f16_dev_,                         // C (unused, beta=0)
+            (cublasLtMatrixLayout_t)lm_head_lt_layout_d_,
+            lm_head_logits_f16_dev_,                         // D: F16 [vocab,1]
+            (cublasLtMatrixLayout_t)lm_head_lt_layout_d_,
+            &((cublasLtMatmulHeuristicResult_t *)lm_head_lt_algo_blob_)->algo,
+            lm_head_lt_workspace_, lm_head_lt_ws_bytes_,
+            stream_);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[talker_cuda] FP8 LM-head cublasLtMatmul failed (status=%d)\n",
+                    (int)st);
+            std::abort();
+        }
+        // Widen F16 logits -> F32 (consumers expect F32).
+        launch_cast_f16_to_f32((const __half *)lm_head_logits_f16_dev_,
+                                 (float *)lm_head_logits_f32_dev_,
+                                 lm_head_vocab_, stream_);
+    } else {
+        // -------- F16 lane (Phase 2.9 reference) -----------------------
+        launch_cast_f32_to_f16((const float *)output_stage_f32_dev_,
+                                 (__half *)lm_head_hidden_f16_dev_,
+                                 n_embd_, stream_);
+        cublasStatus_t st = gemm_lm_head_f16_to_f32(cublas_,
+                                  (const __half *)lm_head_w_f16_dev_,
+                                  (const __half *)lm_head_hidden_f16_dev_,
+                                  (float *)lm_head_logits_f32_dev_,
+                                  lm_head_vocab_, n_embd_);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[talker_cuda] LM-head cuBLAS GemmEx failed (status=%d)\n",
+                    (int)st);
+            std::abort();
+        }
     }
 
     // D2H the F32 logits — this is the only sync per step (~vocab*4 bytes).
@@ -1023,6 +1067,257 @@ void TalkerCudaEngine::forward_decode_with_logits(const float *input_embed,
     cudaStreamSynchronize(stream_);
 
     if (kv_cache_len_ < pos + 1) kv_cache_len_ = pos + 1;
+}
+
+// ============================================================================
+// Phase 2.6 — FP8 E4M3 LM-head lane.
+//
+// Microbench (Apr 2026) on Blackwell GB10 sm_121a + CUDA 13.0.88:
+//   shape                      | f16 us | fp8 us | speedup
+//   pred_lm_head [30720,1024]  |  320   |  133   |  2.40x   <- only big win
+//   talker_lm_head [3072,2048] |   14   |   20   |  0.73x
+//   ffn shapes (matvec K=1)    |   ~30  |   ~35  |  ~0.85x
+//
+// Therefore we plumb FP8 ONLY into forward_decode_with_logits (predictor
+// LM-head fires 1920 times per request). The Talker LM-head runs on the
+// host side anyway in the production e2e harness, so it stays out of
+// scope. FFN matmuls remain F16.
+//
+// Numerics:
+//   weight: per-tensor amax-derived F32 scale_w = amax(W) / E4M3_MAX
+//           (E4M3_MAX = 448.0). Stored compressed: w_fp8 = E4M3(W / scale_w).
+//   activ : input range varies, we use a fixed scale_a = 1.0 (E4M3_MAX is
+//           large enough for hidden state values; if needed, future work
+//           tracks running amax per request). The activation cast also
+//           applies inv_scale_a = 1.0.
+//   GEMM  : cublasLtMatmul with A_scale=&scale_w, B_scale=&one. The library
+//           computes D[M,N] = scale_w * 1.0 * (W_fp8^T · x_fp8) and emits F16.
+//   We then widen F16 D -> F32 via launch_cast_f16_to_f32 and D2H to host.
+//
+// Fallback policy: if upload_lm_head_weights_fp8() fails to find a cublasLt
+// algo for the shape, the FP8 lane stays unpopulated and use_fp8_lm_head()
+// silently keeps returning false; the caller falls back to F16 GEMM.
+// ============================================================================
+
+namespace {
+
+// E4M3 representable max (per CUDA fp8 spec).
+constexpr float kE4M3_MAX = 448.0f;
+
+// Helper: free a cublasLt handle/desc/layout/preference set, in safe order.
+void destroy_lt_resources(cublasLtHandle_t  &handle,
+                           cublasLtMatmulDesc_t &desc,
+                           cublasLtMatrixLayout_t &aL,
+                           cublasLtMatrixLayout_t &bL,
+                           cublasLtMatrixLayout_t &dL,
+                           cublasLtMatmulPreference_t &pref) {
+    if (pref) { cublasLtMatmulPreferenceDestroy(pref); pref = nullptr; }
+    if (aL)   { cublasLtMatrixLayoutDestroy(aL);  aL = nullptr; }
+    if (bL)   { cublasLtMatrixLayoutDestroy(bL);  bL = nullptr; }
+    if (dL)   { cublasLtMatrixLayoutDestroy(dL);  dL = nullptr; }
+    if (desc) { cublasLtMatmulDescDestroy(desc);  desc = nullptr; }
+    if (handle) { cublasLtDestroy(handle); handle = nullptr; }
+}
+
+}  // namespace
+
+void TalkerCudaEngine::teardown_fp8_lm_head_() {
+    if (lm_head_w_fp8_dev_)      { cudaFree(lm_head_w_fp8_dev_);      lm_head_w_fp8_dev_ = nullptr; }
+    if (lm_head_x_fp8_dev_)      { cudaFree(lm_head_x_fp8_dev_);      lm_head_x_fp8_dev_ = nullptr; }
+    if (lm_head_logits_f16_dev_) { cudaFree(lm_head_logits_f16_dev_); lm_head_logits_f16_dev_ = nullptr; }
+    if (lm_head_scale_a_dev_)    { cudaFree(lm_head_scale_a_dev_);    lm_head_scale_a_dev_ = nullptr; }
+    if (lm_head_scale_b_dev_)    { cudaFree(lm_head_scale_b_dev_);    lm_head_scale_b_dev_ = nullptr; }
+    if (lm_head_lt_workspace_)   { cudaFree(lm_head_lt_workspace_);   lm_head_lt_workspace_ = nullptr; }
+
+    auto pref = (cublasLtMatmulPreference_t)lm_head_lt_pref_;
+    auto desc = (cublasLtMatmulDesc_t)lm_head_lt_desc_;
+    auto aL   = (cublasLtMatrixLayout_t)lm_head_lt_layout_a_;
+    auto bL   = (cublasLtMatrixLayout_t)lm_head_lt_layout_b_;
+    auto dL   = (cublasLtMatrixLayout_t)lm_head_lt_layout_d_;
+    auto lt   = (cublasLtHandle_t)lm_head_lt_handle_;
+    destroy_lt_resources(lt, desc, aL, bL, dL, pref);
+    lm_head_lt_handle_   = nullptr;
+    lm_head_lt_desc_     = nullptr;
+    lm_head_lt_layout_a_ = nullptr;
+    lm_head_lt_layout_b_ = nullptr;
+    lm_head_lt_layout_d_ = nullptr;
+    lm_head_lt_pref_     = nullptr;
+    if (lm_head_lt_algo_blob_) {
+        std::free(lm_head_lt_algo_blob_);
+        lm_head_lt_algo_blob_ = nullptr;
+    }
+    use_fp8_lm_head_ = false;
+}
+
+bool TalkerCudaEngine::upload_lm_head_weights_fp8(const float *lm_head_w_f32,
+                                                   int vocab) {
+    if (!ready_) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights_fp8 before init\n");
+        return false;
+    }
+    if (lm_head_w_f32 == nullptr || vocab <= 0) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights_fp8: bad args\n");
+        return false;
+    }
+    if (vocab != lm_head_vocab_ && lm_head_vocab_ != 0) {
+        // Caller mixed F16 and FP8 vocab sizes — bail.
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights_fp8: vocab mismatch (had %d new %d)\n",
+                lm_head_vocab_, vocab);
+        return false;
+    }
+
+    teardown_fp8_lm_head_();
+
+    const size_t n_w = (size_t)vocab * (size_t)n_embd_;
+
+    // 1) Compute per-tensor amax over the F32 weight (host).
+    float amax = 0.0f;
+    for (size_t i = 0; i < n_w; ++i) {
+        float a = std::fabs(lm_head_w_f32[i]);
+        if (a > amax) amax = a;
+    }
+    if (amax <= 0.0f) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights_fp8: zero weight tensor\n");
+        return false;
+    }
+    const float scale_w = amax / kE4M3_MAX;
+    const float inv_scale_w = 1.0f / scale_w;
+
+    // 2) Quantize weights to E4M3 on host, copy to device.
+    std::vector<__nv_fp8_e4m3> w_fp8(n_w);
+    for (size_t i = 0; i < n_w; ++i) {
+        w_fp8[i] = __nv_fp8_e4m3(lm_head_w_f32[i] * inv_scale_w);
+    }
+    void *w_fp8_dev = nullptr;
+    if (cudaMalloc(&w_fp8_dev, n_w) != cudaSuccess) return false;
+    if (cudaMemcpy(w_fp8_dev, w_fp8.data(), n_w, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(w_fp8_dev);
+        return false;
+    }
+
+    // 3) Allocate FP8 input staging + F16 logits buffer + scale buffers.
+    void *x_fp8_dev = nullptr;
+    if (cudaMalloc(&x_fp8_dev, (size_t)n_embd_) != cudaSuccess) {
+        cudaFree(w_fp8_dev); return false;
+    }
+    void *logits_f16_dev = nullptr;
+    if (cudaMalloc(&logits_f16_dev, (size_t)vocab * sizeof(__half)) != cudaSuccess) {
+        cudaFree(w_fp8_dev); cudaFree(x_fp8_dev); return false;
+    }
+    float *scale_a_dev = nullptr, *scale_b_dev = nullptr;
+    if (cudaMalloc(&scale_a_dev, sizeof(float)) != cudaSuccess) {
+        cudaFree(w_fp8_dev); cudaFree(x_fp8_dev); cudaFree(logits_f16_dev); return false;
+    }
+    if (cudaMalloc(&scale_b_dev, sizeof(float)) != cudaSuccess) {
+        cudaFree(w_fp8_dev); cudaFree(x_fp8_dev); cudaFree(logits_f16_dev);
+        cudaFree(scale_a_dev); return false;
+    }
+    const float scale_b_host = 1.0f;
+    cudaMemcpy(scale_a_dev, &scale_w,      sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(scale_b_dev, &scale_b_host, sizeof(float), cudaMemcpyHostToDevice);
+
+    // 4) cublasLt setup. Layouts: A is row-major [vocab, n_embd] which we
+    //    feed as col-major [n_embd, vocab] with op_A=T. B is [n_embd, 1].
+    //    D is [vocab, 1] in F16.
+    cublasLtHandle_t lt = nullptr;
+    if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS) {
+        cudaFree(w_fp8_dev); cudaFree(x_fp8_dev); cudaFree(logits_f16_dev);
+        cudaFree(scale_a_dev); cudaFree(scale_b_dev);
+        return false;
+    }
+
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t aL = nullptr, bL = nullptr, dL = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    auto cleanup_fail = [&]() {
+        destroy_lt_resources(lt, desc, aL, bL, dL, pref);
+        cudaFree(w_fp8_dev); cudaFree(x_fp8_dev); cudaFree(logits_f16_dev);
+        cudaFree(scale_a_dev); cudaFree(scale_b_dev);
+    };
+
+    if (cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+            != CUBLAS_STATUS_SUCCESS) { cleanup_fail(); return false; }
+    cublasOperation_t op_A = CUBLAS_OP_T;
+    cublasOperation_t op_B = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_A, sizeof(op_A));
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_B, sizeof(op_B));
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                    &scale_a_dev, sizeof(scale_a_dev));
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                    &scale_b_dev, sizeof(scale_b_dev));
+
+    // A col-major view: rows=in_dim (n_embd), cols=out (vocab), ld=in_dim.
+    if (cublasLtMatrixLayoutCreate(&aL, CUDA_R_8F_E4M3, n_embd_, vocab, n_embd_)
+            != CUBLAS_STATUS_SUCCESS) { cleanup_fail(); return false; }
+    if (cublasLtMatrixLayoutCreate(&bL, CUDA_R_8F_E4M3, n_embd_, 1, n_embd_)
+            != CUBLAS_STATUS_SUCCESS) { cleanup_fail(); return false; }
+    if (cublasLtMatrixLayoutCreate(&dL, CUDA_R_16F, vocab, 1, vocab)
+            != CUBLAS_STATUS_SUCCESS) { cleanup_fail(); return false; }
+
+    if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) {
+        cleanup_fail(); return false;
+    }
+    size_t ws_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
+    cublasLtMatmulPreferenceSetAttribute(pref,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &ws_bytes, sizeof(ws_bytes));
+
+    cublasLtMatmulHeuristicResult_t *algo_blob =
+        (cublasLtMatmulHeuristicResult_t *)std::malloc(sizeof(cublasLtMatmulHeuristicResult_t));
+    int n_results = 0;
+    cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+        lt, desc, aL, bL, dL, dL, pref, 1, algo_blob, &n_results);
+    if (hst != CUBLAS_STATUS_SUCCESS || n_results == 0) {
+        fprintf(stderr,
+                "[talker_cuda] FP8 LM-head: no cublasLt algo for shape "
+                "[%d,%d] (status=%d, n=%d) — falling back to F16\n",
+                vocab, n_embd_, (int)hst, n_results);
+        std::free(algo_blob);
+        cleanup_fail();
+        return false;
+    }
+
+    void *workspace = nullptr;
+    if (cudaMalloc(&workspace, ws_bytes) != cudaSuccess) {
+        std::free(algo_blob); cleanup_fail();
+        return false;
+    }
+
+    // Persist resources.
+    lm_head_w_fp8_dev_      = w_fp8_dev;
+    lm_head_x_fp8_dev_      = x_fp8_dev;
+    lm_head_logits_f16_dev_ = logits_f16_dev;
+    lm_head_scale_a_dev_    = scale_a_dev;
+    lm_head_scale_b_dev_    = scale_b_dev;
+    lm_head_scale_a_host_   = scale_w;
+    lm_head_lt_handle_      = lt;
+    lm_head_lt_desc_        = desc;
+    lm_head_lt_layout_a_    = aL;
+    lm_head_lt_layout_b_    = bL;
+    lm_head_lt_layout_d_    = dL;
+    lm_head_lt_pref_        = pref;
+    lm_head_lt_workspace_   = workspace;
+    lm_head_lt_ws_bytes_    = ws_bytes;
+    lm_head_lt_algo_blob_   = algo_blob;
+    lm_head_vocab_          = vocab;
+
+    // Allocate the F32 output buffer if the F16 lane hasn't already.
+    if (lm_head_logits_f32_dev_ == nullptr) {
+        alloc_dev_(&lm_head_logits_f32_dev_, (size_t)vocab * sizeof(float));
+    }
+
+    fprintf(stderr,
+            "[talker_cuda] Phase 2.6 FP8 LM-head uploaded: vocab=%d hidden=%d  "
+            "scale_w=%.6g (amax=%.4f, %.2f MB E4M3 + %.2f MB workspace)\n",
+            vocab, n_embd_, scale_w, amax,
+            (double)n_w / (1024.0 * 1024.0),
+            (double)ws_bytes / (1024.0 * 1024.0));
+    return true;
 }
 
 }  // namespace ominix_cuda

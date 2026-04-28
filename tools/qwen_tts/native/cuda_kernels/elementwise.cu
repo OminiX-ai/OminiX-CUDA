@@ -1,13 +1,26 @@
 // ============================================================================
-// Elementwise CUDA kernels: F32<->F16 casts and F16 add.
-// All shapes are flat [n]; one block-stride loop per kernel.
+// Elementwise CUDA kernels: F32<->F16 casts, F32->FP8 E4M3 cast (scaled),
+// and F16 add.  All shapes are flat [n]; one block-stride loop per kernel.
 // ============================================================================
 
 #include "cuda_kernels.h"
+#include <cuda_fp8.h>
 
 namespace ominix_cuda {
 
 namespace {
+
+__global__ void cast_f32_to_fp8_e4m3_scaled_kernel(const float *in,
+                                                    __nv_fp8_e4m3 *out,
+                                                    float inv_scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    // FP8 E4M3 max = 448.0; we pre-multiply by 1/scale to land inputs inside
+    // representable range. The matching weight scale is applied by cublasLt
+    // via the A/B scale pointers, which compose with this 1/scale to recover
+    // the original product magnitude.
+    out[idx] = __nv_fp8_e4m3(in[idx] * inv_scale);
+}
 
 __global__ void cast_f32_to_f16_kernel(const float *in, __half *out, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -58,6 +71,16 @@ void launch_add_f16(const __half *a, const __half *b, __half *y, int n,
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     add_f16_kernel<<<blocks, threads, 0, stream>>>(a, b, y, n);
+}
+
+void launch_cast_f32_to_fp8_e4m3_scaled(const float *in, void *out,
+                                         float inv_scale, int n,
+                                         cudaStream_t stream) {
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks  = (n + threads - 1) / threads;
+    cast_f32_to_fp8_e4m3_scaled_kernel<<<blocks, threads, 0, stream>>>(
+        in, (__nv_fp8_e4m3 *)out, inv_scale, n);
 }
 
 }  // namespace ominix_cuda

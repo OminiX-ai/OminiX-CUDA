@@ -144,7 +144,7 @@ if(QWEN_TTS_ASCENDC)
 endif()
 if(QWEN_TTS_CUDA)
     target_link_libraries     (${TARGET} PRIVATE
-        CUDA::cudart CUDA::cublas qwen_tts_cuda_kernels)
+        CUDA::cudart CUDA::cublas CUDA::cublasLt qwen_tts_cuda_kernels)
     target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_include_directories(${TARGET} PRIVATE native)
     if(OMINIX_CUDA_USE_CUDNN)
@@ -263,7 +263,7 @@ if(QWEN_TTS_ASCENDC)
 endif()
 if(QWEN_TTS_CUDA)
     target_link_libraries     (${API_TARGET} PRIVATE
-        CUDA::cudart CUDA::cublas qwen_tts_cuda_kernels)
+        CUDA::cudart CUDA::cublas CUDA::cublasLt qwen_tts_cuda_kernels)
     target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_include_directories(${API_TARGET} PRIVATE native)
     if(OMINIX_CUDA_USE_CUDNN)
@@ -526,7 +526,7 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (test_talker_cuda_init PUBLIC  ggml qwen_common)
     target_link_libraries     (test_talker_cuda_init PRIVATE Threads::Threads
-                                                              CUDA::cudart CUDA::cublas
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
                                                               qwen_tts_cuda_kernels)
     target_include_directories(test_talker_cuda_init PUBLIC  .)
     target_include_directories(test_talker_cuda_init PRIVATE
@@ -553,7 +553,7 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (test_talker_cuda_decode PUBLIC  ggml qwen_common)
     target_link_libraries     (test_talker_cuda_decode PRIVATE Threads::Threads
-                                                                 CUDA::cudart CUDA::cublas
+                                                                 CUDA::cudart CUDA::cublas CUDA::cublasLt
                                                                  qwen_tts_cuda_kernels)
     target_include_directories(test_talker_cuda_decode PUBLIC  .)
     target_include_directories(test_talker_cuda_decode PRIVATE
@@ -581,7 +581,7 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (test_talker_cuda_autoreg PUBLIC  ggml qwen_common)
     target_link_libraries     (test_talker_cuda_autoreg PRIVATE Threads::Threads
-                                                                  CUDA::cudart CUDA::cublas
+                                                                  CUDA::cudart CUDA::cublas CUDA::cublasLt
                                                                   qwen_tts_cuda_kernels)
     target_include_directories(test_talker_cuda_autoreg PUBLIC  .)
     target_include_directories(test_talker_cuda_autoreg PRIVATE
@@ -614,7 +614,7 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (test_codec_cuda PUBLIC  ggml qwen_common)
     target_link_libraries     (test_codec_cuda PRIVATE Threads::Threads
-                                                        CUDA::cudart CUDA::cublas
+                                                        CUDA::cudart CUDA::cublas CUDA::cublasLt
                                                         qwen_tts_cuda_kernels)
     target_include_directories(test_codec_cuda PUBLIC  .)
     target_include_directories(test_codec_cuda PRIVATE
@@ -647,7 +647,7 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (qwen_tts_speech_decoder_cuda PUBLIC ggml)
     target_link_libraries     (qwen_tts_speech_decoder_cuda PRIVATE
-                                                              CUDA::cudart CUDA::cublas)
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt)
     target_include_directories(qwen_tts_speech_decoder_cuda PUBLIC native)
     target_include_directories(qwen_tts_speech_decoder_cuda PRIVATE
                                                               ../.. ../../vendor)
@@ -662,7 +662,7 @@ if(QWEN_TTS_CUDA)
                                                               ggml qwen_tts_speech_decoder_cuda)
     target_link_libraries     (test_speech_tokenizer_decoder_init PRIVATE
                                                               Threads::Threads
-                                                              CUDA::cudart CUDA::cublas)
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt)
     target_include_directories(test_speech_tokenizer_decoder_init PUBLIC  .)
     target_include_directories(test_speech_tokenizer_decoder_init PRIVATE
                                                               ../.. ../../vendor native)
@@ -685,7 +685,7 @@ if(QWEN_TTS_CUDA)
                                                               ggml qwen_common qwen_tts_speech_decoder_cuda)
     target_link_libraries     (test_qwen_tts_e2e PRIVATE
                                                               Threads::Threads
-                                                              CUDA::cudart CUDA::cublas
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
                                                               qwen_tts_cuda_kernels)
     target_include_directories(test_qwen_tts_e2e PUBLIC  .)
     target_include_directories(test_qwen_tts_e2e PRIVATE
@@ -698,4 +698,36 @@ if(QWEN_TTS_CUDA)
         target_compile_definitions(test_qwen_tts_e2e PRIVATE OMINIX_CUDA_USE_CUDNN=1)
     endif()
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7d E2E smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.10 — TTS warm-start daemon (tts_server)
+    # ---------------------------------------------------------------------
+    # Persistent process that loads all weights once and serves synthesis
+    # requests over a TCP line-protocol on 127.0.0.1:OMINIX_TTS_SERVER_PORT
+    # (default 7777). Amortizes the ~11 s of init+weight-load that
+    # dominates cold-start in test_qwen_tts_e2e. Same engines, same
+    # numerics; only the entry-point and per-request lifecycle change.
+    # ---------------------------------------------------------------------
+    add_executable(tts_server
+        native/tts_server.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (tts_server PUBLIC
+                                                              ggml qwen_common qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (tts_server PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                              CUDA::cublasLt
+                                                              qwen_tts_cuda_kernels)
+    target_include_directories(tts_server PUBLIC  .)
+    target_include_directories(tts_server PRIVATE
+                                                              ../.. ../../vendor native
+                                                              ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(tts_server PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (tts_server PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (tts_server PRIVATE CUDA::cudnn)
+        target_compile_definitions(tts_server PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.10 warm-start daemon ENABLED")
 endif()

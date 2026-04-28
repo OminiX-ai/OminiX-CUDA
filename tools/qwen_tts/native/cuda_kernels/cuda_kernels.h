@@ -33,6 +33,17 @@ void launch_cast_f16_to_f32(const __half *in, float *out, int n,
 void launch_add_f16(const __half *a, const __half *b, __half *y, int n,
                     cudaStream_t stream);
 
+// F32 -> FP8 E4M3 cast with input pre-scaling. Output is __nv_fp8_e4m3 packed
+// as 1 byte per element. The kernel multiplies each input by `inv_scale`
+// before quantizing, so `out_byte = E4M3(input * inv_scale)`. Caller passes
+// `inv_scale = 1.0 / activation_scale` to land FP8 inputs near unity range.
+//   in     : F32 [n]
+//   out    : __nv_fp8_e4m3 [n]   (typed as void* in the launcher to keep the
+//                                  cuda_fp8.h dependency out of this header)
+void launch_cast_f32_to_fp8_e4m3_scaled(const float *in, void *out,
+                                         float inv_scale, int n,
+                                         cudaStream_t stream);
+
 // RmsNorm: y = (x / sqrt(mean(x^2) + eps)) * gamma.
 //   x      : F16 [rows, cols]
 //   gamma  : F32 [cols]   (Qwen3 norm gammas are F32 on disk)
