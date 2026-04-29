@@ -502,3 +502,123 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         } break;
     }
 }
+
+// ===========================================================================
+// QIE-Edit fused gated residual: out = x + y * gate.
+// All tensors are GGML_TYPE_F32 and contiguous in memory layout. `gate` may
+// broadcast over any of the trailing dims (typically over the token dim).
+// ===========================================================================
+
+static __global__ void k_mul_add_gated_f32(const float * __restrict__ x,
+                                           const float * __restrict__ y,
+                                           const float * __restrict__ gate,
+                                           float       * __restrict__ dst,
+                                           const int     ne0,    // hidden
+                                           const int64_t total,  // ne0*ne1*ne2*ne3
+                                           const uint3   gate_ne0_packed,
+                                           const uint3   gate_ne1_packed,
+                                           const uint3   gate_ne2_packed,
+                                           const uint3   gate_ne3_packed,
+                                           const uint3   x_ne0_packed,   // for unraveling i -> (i0,i1,i2,i3)
+                                           const uint3   x_ne01_packed,  // ne0*ne1
+                                           const uint3   x_ne012_packed, // ne0*ne1*ne2
+                                           const int64_t gate_s1,
+                                           const int64_t gate_s2,
+                                           const int64_t gate_s3) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+
+    for (int64_t i = tid; i < total; i += stride) {
+        // unravel i -> (i0, i1, i2, i3) assuming x/y/dst share the contiguous shape ne0..ne3
+        const uint32_t i3 = fastdiv((uint32_t) i, x_ne012_packed);
+        const uint32_t r2 = (uint32_t) i - i3 * x_ne012_packed.z;
+        const uint32_t i2 = fastdiv(r2, x_ne01_packed);
+        const uint32_t r1 = r2 - i2 * x_ne01_packed.z;
+        const uint32_t i1 = fastdiv(r1, x_ne0_packed);
+        const uint32_t i0 = r1 - i1 * x_ne0_packed.z;
+
+        const uint32_t g0 = fastmodulo(i0, gate_ne0_packed);
+        const uint32_t g1 = fastmodulo(i1, gate_ne1_packed);
+        const uint32_t g2 = fastmodulo(i2, gate_ne2_packed);
+        const uint32_t g3 = fastmodulo(i3, gate_ne3_packed);
+
+        const float gv = gate[(int64_t) g3 * gate_s3 + (int64_t) g2 * gate_s2 + (int64_t) g1 * gate_s1 + g0];
+        // Use __fmul_rn / __fadd_rn to match ggml's round-then-add semantics
+        // (no FMA contraction). This gives bit-identical results vs the separate
+        // MUL + ADD dispatch on the same operands.
+        const float prod = __fmul_rn(y[i], gv);
+        dst[i] = __fadd_rn(x[i], prod);
+    }
+}
+
+void ggml_cuda_op_mul_add_gated(ggml_backend_cuda_context & ctx,
+                                ggml_tensor *               mul_node,
+                                ggml_tensor *               add_node) {
+    // mul_node = MUL(y, gate); gate is the broadcasting operand.
+    // We assume mul_node->src[0] = y (full shape) and mul_node->src[1] = gate (broadcasts).
+    // Caller (the fusion site in ggml-cuda.cu) is responsible for verifying that.
+    const ggml_tensor * y_t    = mul_node->src[0];
+    const ggml_tensor * gate_t = mul_node->src[1];
+
+    // add_node has add_node->src[0] = x (skip), add_node->src[1] = mul_node.
+    const ggml_tensor * x_t = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+
+    // Optional debug logging for shape sanity-checks during bring-up.
+    if (std::getenv("OMNX_CUDA_QIE_FUSED_GATE_DEBUG")) {
+        fprintf(stderr,
+                "[fused_gate] y[%lld,%lld,%lld,%lld] gate[%lld,%lld,%lld,%lld] x[%lld,%lld,%lld,%lld]\n",
+                (long long) y_t->ne[0],   (long long) y_t->ne[1],   (long long) y_t->ne[2],   (long long) y_t->ne[3],
+                (long long) gate_t->ne[0],(long long) gate_t->ne[1],(long long) gate_t->ne[2],(long long) gate_t->ne[3],
+                (long long) x_t->ne[0],   (long long) x_t->ne[1],   (long long) x_t->ne[2],   (long long) x_t->ne[3]);
+    }
+
+    GGML_ASSERT(y_t->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate_t->type == GGML_TYPE_F32);
+    GGML_ASSERT(x_t->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_node->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(y_t));
+    GGML_ASSERT(ggml_is_contiguous(x_t));
+    GGML_ASSERT(ggml_is_contiguous(add_node));
+    GGML_ASSERT(ggml_are_same_shape(x_t, y_t));
+    GGML_ASSERT(ggml_are_same_shape(add_node, x_t));
+
+    const int64_t ne0 = x_t->ne[0];
+    const int64_t ne1 = x_t->ne[1];
+    const int64_t ne2 = x_t->ne[2];
+    const int64_t ne3 = x_t->ne[3];
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+
+    const float * x_d    = (const float *) x_t->data;
+    const float * y_d    = (const float *) y_t->data;
+    const float * gate_d = (const float *) gate_t->data;
+    float       * dst_d  = (float       *) add_node->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    const uint3 gate_ne0 = init_fastdiv_values((uint32_t) gate_t->ne[0]);
+    const uint3 gate_ne1 = init_fastdiv_values((uint32_t) gate_t->ne[1]);
+    const uint3 gate_ne2 = init_fastdiv_values((uint32_t) gate_t->ne[2]);
+    const uint3 gate_ne3 = init_fastdiv_values((uint32_t) gate_t->ne[3]);
+
+    const uint3 x_ne0   = init_fastdiv_values((uint32_t) ne0);
+    const uint3 x_ne01  = init_fastdiv_values((uint32_t) (ne0 * ne1));
+    const uint3 x_ne012 = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
+
+    const size_t ts_g = ggml_type_size(gate_t->type);
+    GGML_ASSERT(gate_t->nb[0] == ts_g);
+    const int64_t gate_s1 = gate_t->nb[1] / ts_g;
+    const int64_t gate_s2 = gate_t->nb[2] / ts_g;
+    const int64_t gate_s3 = gate_t->nb[3] / ts_g;
+
+    const int block_size = 256;
+    const int max_blocks = 4096;
+    int blocks = (int) std::min<int64_t>(max_blocks, (total + block_size - 1) / block_size);
+    blocks = std::max(blocks, 1);
+
+    k_mul_add_gated_f32<<<blocks, block_size, 0, stream>>>(
+        x_d, y_d, gate_d, dst_d, (int) ne0, total,
+        gate_ne0, gate_ne1, gate_ne2, gate_ne3,
+        x_ne0, x_ne01, x_ne012,
+        gate_s1, gate_s2, gate_s3);
+}
