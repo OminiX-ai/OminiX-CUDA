@@ -4105,6 +4105,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // OminiX Phase 3.8 probe: env-gated counters to characterize CUDA-Graph
+    // activation rate on the production sd.cpp dispatch path. Guarded so it
+    // costs nothing in the default build path (one getenv on first call).
+    static const bool ominix_probe = (getenv("OMINIX_CUDA_GRAPH_PROBE") != nullptr);
+    static std::atomic<size_t> probe_total{0};
+    static std::atomic<size_t> probe_warm{0};
+    static std::atomic<size_t> probe_incompat{0};
+    static std::atomic<size_t> probe_property_change{0};
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -4113,6 +4122,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (!graph_compatible && ominix_probe) {
+            probe_incompat.fetch_add(1, std::memory_order_relaxed);
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -4123,6 +4135,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else if (ominix_probe) {
+                    probe_property_change.fetch_add(1, std::memory_order_relaxed);
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4131,11 +4145,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    if (ominix_probe) {
+                        probe_property_change.fetch_add(1, std::memory_order_relaxed);
+                    }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        }
+    }
+    if (ominix_probe) {
+        size_t t = probe_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (use_cuda_graph) {
+            probe_warm.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((t % 200) == 0 || t < 8) {
+            GGML_LOG_INFO("[ominix-cuda-graph-probe] total=%zu warm=%zu incompat=%zu prop_change=%zu enabled=%d compatible_now=%d\n",
+                          t,
+                          probe_warm.load(std::memory_order_relaxed),
+                          probe_incompat.load(std::memory_order_relaxed),
+                          probe_property_change.load(std::memory_order_relaxed),
+                          (int)(graph_key != nullptr && cuda_ctx->cuda_graph(graph_key)->is_enabled()),
+                          (int)use_cuda_graph);
         }
     }
 #endif // USE_CUDA_GRAPH
