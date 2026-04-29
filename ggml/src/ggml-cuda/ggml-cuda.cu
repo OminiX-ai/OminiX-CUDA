@@ -3031,8 +3031,61 @@ static bool ggml_cuda_graph_node_properties_match(ggml_tensor * node, ggml_cuda_
     return true;
 }
 
+// OminiX CUDA-Graph DiT capture (P0): the historical key returns nodes[0],
+// the first ggml_tensor* in the cgraph. Each call rebuilds compute_ctx, so
+// nodes[0] is a fresh pointer per call and the cuda_graphs map gets a new
+// slot every time — warmup never latches across denoise steps. This blocks
+// CUDA-Graph capture for the DiT (60-block forward, ~14.8k launches/step).
+//
+// When OMNX_CUDA_DIT_GRAPH is set, we hash the graph topology instead: the
+// hash is stable across denoise steps because the DiT build_graph emits the
+// same op sequence and the same gallocr reuses the same backing buffer
+// (so node->data offsets are deterministic too). Different graphs (e.g.
+// conditioner vs DiT vs VAE) hash to different keys and stay in their own
+// map slots.
+//
+// We pack the hash into the low 48 bits of a pointer-shaped value and tag
+// the high 16 bits so the result can never alias a real heap pointer (bit
+// pattern 0xCEED00... is unlikely to collide with mmap-allocated ggml
+// tensors).
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    static const bool dit_graph_enabled = (getenv("OMNX_CUDA_DIT_GRAPH") != nullptr);
+    if (!dit_graph_enabled || cgraph->n_nodes <= 0) {
+        return cgraph->nodes[0];
+    }
+
+    // FNV-1a 64-bit over a stable subset of the topology.
+    uint64_t h = 0xcbf29ce484222325ULL;
+    auto mix = [&h](uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v & 0xff);
+            h *= 0x100000001b3ULL;
+            v >>= 8;
+        }
+    };
+
+    mix(static_cast<uint64_t>(cgraph->n_nodes));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) continue;
+        mix(static_cast<uint64_t>(node->op));
+        mix(static_cast<uint64_t>(node->type));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix(static_cast<uint64_t>(node->ne[d]));
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            // src kind: 0 = null, 1 = present. Don't mix the pointer itself
+            // since it's per-call; topology presence is what stabilises the
+            // map slot.
+            mix(node->src[s] != nullptr ? 1ULL : 0ULL);
+        }
+    }
+
+    // Tag bits in [56:48] so the result is clearly a synthetic key, not a
+    // real pointer. Low 48 bits carry the entropy; on aarch64 with VA48
+    // userland this lives outside the canonical user range.
+    const uintptr_t key = static_cast<uintptr_t>(0xCEEDULL << 48) | (static_cast<uintptr_t>(h) & 0x0000FFFFFFFFFFFFULL);
+    return reinterpret_cast<const void *>(key);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
