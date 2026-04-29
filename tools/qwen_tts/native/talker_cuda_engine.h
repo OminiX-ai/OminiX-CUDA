@@ -105,6 +105,61 @@ public:
     void forward_decode_with_logits(const float *input_embed, int pos,
                                     float *logits_out_f32);
 
+    // ---- P2 (April 2026) on-device sampling autoregressive loop -------
+    // Eliminates the per-step D2H of logits + host sampling + H2D of next
+    // embedding. Pre-uploads the token-embedding table once, then runs a
+    // tight loop on the engine's CUDA stream:
+    //
+    //   1. (step 0) H2D first input embedding into input_stage_f32_dev_.
+    //      (subsequent steps the embedding-lookup kernel writes directly.)
+    //   2. forward_decode body + LM-head GEMM (existing captured graph).
+    //   3. Optional repetition-penalty kernel (rolls a recent-window over
+    //      `next_token_dev_`).
+    //   4. Top-K sampler kernel writes next_token_dev_[step].
+    //   5. Embedding lookup kernel writes input_stage_f32_dev_ for next step.
+    //   6. Every `eos_check_period` steps, host sync + D2H of the partial
+    //      tokens to check EOS. On EOS: trim and return.
+    //
+    // Returns the count of tokens written to `out_tokens_host` (which must
+    // have capacity >= max_steps).
+    struct OnDevSamplingConfig {
+        int      top_k              = 50;
+        float    temperature        = 0.9f;
+        int      do_sample          = 1;          // 0=greedy, 1=stochastic
+        uint64_t seed               = 42;
+        int      sample_lo          = 0;
+        int      sample_hi          = 0;          // exclusive
+        float    repetition_penalty = 1.0f;
+        int      recent_window      = 0;
+        int      recent_offset      = 0;          // added to recent ids before clamp
+        int      eos_token          = -1;         // absolute; -1 disables
+        int      eos_check_period   = 16;         // host sync cadence
+    };
+
+    // Pre-upload an F32 token-embedding table to device. Must match
+    // [embed_vocab, n_embd_]. Returns false on failure. Memory is owned by
+    // the engine (freed in dtor). Caller can re-bind by calling again with
+    // a different table pointer.
+    bool upload_embedding_table_f32(const float *table_f32, int embed_vocab);
+
+    // Upload LM-head weights AND keep an F32 copy on device. The F32 copy is
+    // used by decode_loop_topk_ondev() so the on-device GEMM matches the
+    // host's matvec_f32 reference bit-for-bit (modulo cuBLAS GEMM ordering
+    // noise). Use this for the Talker, which prior code sampled in F32 on
+    // host and so requires F32 parity. Predictor stays on the F16 lane.
+    bool upload_lm_head_weights_with_f32_copy(const float *lm_head_w_f32,
+                                                int vocab);
+
+    // Allocate the on-device sampler scratch buffer (next_token_dev_ size N).
+    // No-op if already sized >= N. Called automatically by decode_loop_topk_ondev.
+    void ensure_sampler_scratch_(int n_pending);
+
+    int decode_loop_topk_ondev(const float *first_input_emb_f32,
+                                int start_pos,
+                                int max_steps,
+                                const OnDevSamplingConfig &cfg,
+                                int *out_tokens_host);
+
     // RoPE position-speed factor (EOS-steering parity with Ascend / MLX).
     void set_rope_speed_factor(float factor);
 
@@ -270,6 +325,14 @@ private:
     void *lm_head_w_f16_dev_     = nullptr;  // F16 [vocab, n_embd] row-major
     void *lm_head_hidden_f16_dev_ = nullptr; // F16 [n_embd] (cast staging)
     void *lm_head_logits_f32_dev_ = nullptr; // F32 [vocab]
+    // P2: optional F32 LM-head weight buffer. When populated (via
+    // upload_lm_head_weights_with_f32_copy()), the on-device sampling loop
+    // uses an F32×F32 GEMM for parity with the host F32 matvec_f32 path
+    // (avoids the F16 LM-head precision divergence that flips greedy argmax
+    // for some tokens with close logits). Only set for engines whose
+    // sampling MUST match host F32 reference; predictor leaves this null
+    // and continues on the F16 lane.
+    void *lm_head_w_f32_dev_     = nullptr;  // F32 [vocab, n_embd]
     int   lm_head_vocab_         = 0;
 
     // ---- Phase 2.6 FP8 LM-head lane ----------------------------------------
@@ -334,6 +397,22 @@ private:
     // cudaGraphExecUpdate calls.
     int *pos_dev_       = nullptr;   // device int [1]
     int *pos_host_pin_  = nullptr;   // pinned host int [1]; capture-safe H2D src
+
+    // ---- P2 (April 2026) on-device sampling state --------------------------
+    // Embedding-table pointer (F32 [embed_vocab, n_embd_]) used by
+    // launch_embedding_lookup_f32. Owned by the engine; freed in dtor.
+    void *embed_table_f32_dev_ = nullptr;
+    int   embed_vocab_         = 0;
+
+    // Output token buffer used by the on-device sampler. Size grows on demand
+    // via ensure_sampler_scratch_; capacity tracked separately.
+    int  *next_token_dev_      = nullptr;
+    int   next_token_capacity_ = 0;
+
+    // Chain-mode captured graph: forward_decode body + LM-head GEMM, but
+    // WITHOUT the input H2D (input_stage_f32_dev_ is already populated by the
+    // prior step's embedding-lookup kernel). Captured lazily on first use.
+    cudaGraphExec_t graph_once_decode_chain_ = nullptr;
 
     // ---- Internal helpers (defined in .cpp / sibling .cu files) ------------
     void alloc_dev_(void **ptr, size_t bytes);

@@ -215,6 +215,7 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     safe_free(lm_head_w_f16_dev_);
     safe_free(lm_head_hidden_f16_dev_);
     safe_free(lm_head_logits_f32_dev_);
+    safe_free(lm_head_w_f32_dev_);
 
     // Phase 2.6 FP8 LM-head lane buffers + cublasLt resources. Kept in
     // dedicated cleanup function below to keep cublasLt headers out of
@@ -228,8 +229,15 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     // P0 capture-once decode graphs.
     if (graph_once_decode_)        cudaGraphExecDestroy(graph_once_decode_);
     if (graph_once_decode_logits_) cudaGraphExecDestroy(graph_once_decode_logits_);
+    if (graph_once_decode_chain_)  cudaGraphExecDestroy(graph_once_decode_chain_);
     graph_once_decode_        = nullptr;
     graph_once_decode_logits_ = nullptr;
+    graph_once_decode_chain_  = nullptr;
+
+    // P2 on-device sampling state.
+    safe_free(embed_table_f32_dev_);
+    if (next_token_dev_) { cudaFree(next_token_dev_); next_token_dev_ = nullptr; }
+    next_token_capacity_ = 0;
 
     // P1 device-resident pos buffer.
     if (pos_dev_) {
@@ -1629,6 +1637,390 @@ bool TalkerCudaEngine::upload_lm_head_weights_fp8(const float *lm_head_w_f32,
             (double)n_w / (1024.0 * 1024.0),
             (double)ws_bytes / (1024.0 * 1024.0));
     return true;
+}
+
+// ============================================================================
+// P2 (April 2026) — on-device sampling autoregressive decode loop.
+//
+// Eliminates the per-step D2H of logits + host sampling + H2D of next
+// embedding. The captured graph (graph_once_decode_chain_) does:
+//   F32 input_stage_f32_dev_  (already populated)
+//     -> F32->F16 cast into cur_dev_
+//     -> 28-layer body (run_decode_ops_dev_)
+//     -> LM-head GEMM into lm_head_logits_f32_dev_
+//
+// Outside the captured graph (still on stream_, between graph launches):
+//   -> optional rep-penalty kernel
+//   -> top-K sampler kernel writes next_token_dev_[step]
+//   -> embedding-lookup kernel writes input_stage_f32_dev_ for next step
+//
+// Host sync only at EOS-check boundaries (every cfg.eos_check_period steps)
+// or at end of generation. Token D2H is one bulk copy at sync time.
+// ============================================================================
+
+bool TalkerCudaEngine::upload_lm_head_weights_with_f32_copy(
+        const float *lm_head_w_f32, int vocab) {
+    // Reuse the F16 path to populate lm_head_w_f16_dev_ and the logits
+    // buffer; then allocate + upload the F32 copy.
+    if (!upload_lm_head_weights(lm_head_w_f32, vocab)) return false;
+    if (lm_head_w_f32_dev_) {
+        cudaFree(lm_head_w_f32_dev_);
+        lm_head_w_f32_dev_ = nullptr;
+    }
+    size_t bytes = (size_t)vocab * (size_t)n_embd_ * sizeof(float);
+    alloc_dev_(&lm_head_w_f32_dev_, bytes);
+    cudaError_t err = cudaMemcpy(lm_head_w_f32_dev_, lm_head_w_f32, bytes,
+                                  cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "[talker_cuda] upload_lm_head_weights_with_f32_copy: F32 H2D "
+                "failed: %s\n", cudaGetErrorString(err));
+        cudaFree(lm_head_w_f32_dev_);
+        lm_head_w_f32_dev_ = nullptr;
+        return false;
+    }
+    fprintf(stderr,
+            "[talker_cuda] P2 LM-head F32 copy uploaded: vocab=%d hidden=%d "
+            "(F32, %.2f MB)\n",
+            vocab, n_embd_, (double)bytes / (1024.0 * 1024.0));
+    return true;
+}
+
+bool TalkerCudaEngine::upload_embedding_table_f32(const float *table_f32,
+                                                    int embed_vocab) {
+    if (!ready_) {
+        fprintf(stderr, "[talker_cuda] upload_embedding_table_f32 before init\n");
+        return false;
+    }
+    if (table_f32 == nullptr || embed_vocab <= 0) {
+        fprintf(stderr,
+                "[talker_cuda] upload_embedding_table_f32: bad args\n");
+        return false;
+    }
+    cudaSetDevice(device_);
+    if (embed_table_f32_dev_) {
+        cudaFree(embed_table_f32_dev_);
+        embed_table_f32_dev_ = nullptr;
+    }
+    size_t bytes = (size_t)embed_vocab * (size_t)n_embd_ * sizeof(float);
+    alloc_dev_(&embed_table_f32_dev_, bytes);
+    cudaError_t err = cudaMemcpy(embed_table_f32_dev_, table_f32, bytes,
+                                  cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "[talker_cuda] upload_embedding_table_f32: cudaMemcpy failed: %s\n",
+                cudaGetErrorString(err));
+        cudaFree(embed_table_f32_dev_);
+        embed_table_f32_dev_ = nullptr;
+        return false;
+    }
+    embed_vocab_ = embed_vocab;
+    fprintf(stderr,
+            "[talker_cuda] P2 embedding table uploaded: vocab=%d hidden=%d "
+            "(F32, %.2f MB)\n",
+            embed_vocab, n_embd_,
+            (double)bytes / (1024.0 * 1024.0));
+    return true;
+}
+
+void TalkerCudaEngine::ensure_sampler_scratch_(int n_pending) {
+    if (n_pending <= next_token_capacity_) return;
+    if (next_token_dev_) { cudaFree(next_token_dev_); next_token_dev_ = nullptr; }
+    cudaMalloc(&next_token_dev_, (size_t)n_pending * sizeof(int));
+    next_token_capacity_ = n_pending;
+}
+
+namespace {
+// Helper: run the chain-mode body on stream_. The chain body assumes
+// input_stage_f32_dev_ is already populated, so it skips the H2D node and
+// starts at the F32->F16 cast. Mirrors run_decode_ops_dev_ but is wrapped
+// to be capture-friendly: reads pos from pos_dev_, runs the body, then runs
+// the LM-head GEMM. The caller decides whether to capture or run eagerly.
+}  // namespace
+
+int TalkerCudaEngine::decode_loop_topk_ondev(
+        const float *first_input_emb_f32,
+        int start_pos,
+        int max_steps,
+        const OnDevSamplingConfig &cfg,
+        int *out_tokens_host) {
+    if (!ready_) {
+        fprintf(stderr, "[talker_cuda] decode_loop_topk_ondev before init\n");
+        return 0;
+    }
+    if (lm_head_w_f16_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] decode_loop_topk_ondev: LM-head not uploaded\n");
+        return 0;
+    }
+    if (embed_table_f32_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] decode_loop_topk_ondev: embedding table not "
+                "uploaded (call upload_embedding_table_f32 first)\n");
+        return 0;
+    }
+    if (max_steps <= 0) return 0;
+
+    cudaSetDevice(device_);
+    ensure_sampler_scratch_(max_steps);
+
+    // 1) Stage the FIRST input embedding to device (host -> input_stage F32 dev).
+    cudaMemcpyAsync(input_stage_f32_dev_, first_input_emb_f32,
+                     (size_t)n_embd_ * sizeof(float),
+                     cudaMemcpyHostToDevice, stream_);
+
+    // Initialize pos_dev_ to (start_pos - 1) on stream. The chain graph's
+    // first node will increment pos_dev_, so the first replay sees
+    // *pos_dev_ == start_pos. This sidesteps the captured-H2D-from-pinned
+    // race that would otherwise let later loop iterations clobber
+    // *pos_host_pin_ before earlier H2D nodes execute on the GPU.
+    if (pos_dev_ != nullptr && pos_host_pin_ != nullptr) {
+        *pos_host_pin_ = start_pos - 1;
+        cudaMemcpyAsync(pos_dev_, pos_host_pin_, sizeof(int),
+                         cudaMemcpyHostToDevice, stream_);
+    }
+
+    // 2) Iterate. For each step:
+    //      a) Run the chain body (cast + decoder body + LM-head GEMM).
+    //         When capture-once is enabled, replay graph_once_decode_chain_;
+    //         else run eagerly via run_decode_ops_dev_ with explicit cublas.
+    //      b) Apply rep-penalty (optional).
+    //      c) Sample.
+    //      d) Embedding lookup -> writes input_stage_f32_dev_ for next step.
+    //
+    // Periodic sync: every cfg.eos_check_period steps, sync stream and D2H
+    // partial tokens to check for EOS.
+    int produced = 0;
+    int sync_chunk_start = 0;
+    int eos_period = cfg.eos_check_period;
+    if (eos_period <= 0) eos_period = max_steps;
+
+    bool stop = false;
+    for (int step = 0; step < max_steps && !stop; ++step) {
+        int pos = start_pos + step;
+        if (pos >= MAX_SEQ) {
+            fprintf(stderr,
+                    "[talker_cuda] decode_loop_topk_ondev: pos %d exceeds MAX_SEQ\n",
+                    pos);
+            break;
+        }
+
+        // (a) Body: F32 input -> F16 cast -> decode body -> LM-head GEMM.
+        // We use the existing chain mechanism. For the very first step we
+        // capture the chain graph (start with cast, body, LM-head).
+        //
+        // We implement this by ALWAYS using the device-pos path (run_decode_ops_dev_)
+        // and capturing once. If decode_graph_once_ is disabled or pos_dev_/
+        // pos_host_pin_ unavailable, run eagerly without capture.
+        static const bool g_no_chain_graph =
+            (std::getenv("OMNX_TTS_ONDEV_NO_CHAIN_GRAPH") &&
+             std::getenv("OMNX_TTS_ONDEV_NO_CHAIN_GRAPH")[0] == '1');
+        if (!g_no_chain_graph && decode_graph_once_ && pos_dev_ != nullptr && pos_host_pin_ != nullptr) {
+            // NOTE: we deliberately do NOT update *pos_host_pin_ here. The
+            // chain graph's first node is launch_increment_int(pos_dev_),
+            // which advances the device-resident pos by 1 per replay. The
+            // pos_dev_ is pre-initialized to (start_pos - 1) at the top of
+            // decode_loop_topk_ondev, so the first replay sees start_pos.
+            // F32 -> F16 cast (outside captured graph). Reads input_stage at
+            // runtime; writes cur_dev_ which the body then consumes.
+            launch_cast_f32_to_f16(
+                (const float *)input_stage_f32_dev_,
+                (__half *)cur_dev_, n_embd_, stream_);
+            if (graph_once_decode_chain_ == nullptr) {
+                // First call — capture.
+                cudaGraph_t graph = nullptr;
+                cudaError_t cerr = cudaStreamBeginCapture(
+                    stream_, cudaStreamCaptureModeThreadLocal);
+                if (cerr != cudaSuccess) {
+                    // fall back to eager
+                    fprintf(stderr,
+                            "[talker_cuda] decode_loop ondev: BeginCapture "
+                            "failed: %s — falling back to eager\n",
+                            cudaGetErrorString(cerr));
+                } else {
+                    // First captured node: increment *pos_dev_. We
+                    // pre-initialized pos_dev_ to (start_pos - 1) before
+                    // entering the loop, so the first replay sees
+                    // *pos_dev_ == start_pos, the second sees start_pos+1,
+                    // etc. Avoids the H2D-from-pinned race condition that
+                    // would arise from updating *pos_host_pin_ each step
+                    // (the GPU might still be reading from the prior
+                    // iteration's H2D when the host overwrites it).
+                    launch_increment_int(pos_dev_, stream_);
+                    run_decode_ops_dev_();
+                    cerr = cudaStreamEndCapture(stream_, &graph);
+                    if (cerr == cudaSuccess && graph != nullptr) {
+                        cudaError_t serr = cudaGraphInstantiate(
+                            &graph_once_decode_chain_, graph, nullptr,
+                            nullptr, 0);
+                        cudaGraphDestroy(graph);
+                        if (serr != cudaSuccess) {
+                            graph_once_decode_chain_ = nullptr;
+                        }
+                    }
+                    if (graph_once_decode_chain_ != nullptr) {
+                        cudaGraphLaunch(graph_once_decode_chain_, stream_);
+                    } else {
+                        // Capture failed; run the body eagerly. Increment
+                        // pos_dev_ same as the captured first node would.
+                        launch_increment_int(pos_dev_, stream_);
+                        launch_cast_f32_to_f16(
+                            (const float *)input_stage_f32_dev_,
+                            (__half *)cur_dev_, n_embd_, stream_);
+                        run_decode_ops_dev_();
+                    }
+                }
+            } else {
+                // Hot path — replay the captured chain graph.
+                cudaGraphLaunch(graph_once_decode_chain_, stream_);
+            }
+            // LM-head GEMM (outside captured graph). Mirrors the P1
+            // forward_decode_with_logits pattern.
+            if (lm_head_w_f32_dev_ != nullptr) {
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                    lm_head_vocab_, 1, n_embd_, &alpha,
+                    lm_head_w_f32_dev_, CUDA_R_32F, n_embd_,
+                    output_stage_f32_dev_, CUDA_R_32F, n_embd_,
+                    &beta,
+                    lm_head_logits_f32_dev_, CUDA_R_32F, lm_head_vocab_,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            } else {
+                launch_cast_f32_to_f16(
+                    (const float *)output_stage_f32_dev_,
+                    (__half *)lm_head_hidden_f16_dev_, n_embd_, stream_);
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                    lm_head_vocab_, 1, n_embd_, &alpha,
+                    lm_head_w_f16_dev_, CUDA_R_16F, n_embd_,
+                    lm_head_hidden_f16_dev_, CUDA_R_16F, n_embd_,
+                    &beta,
+                    lm_head_logits_f32_dev_, CUDA_R_32F, lm_head_vocab_,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
+        } else {
+            // Non-capture eager path. Falls back to host-pos run_decode_ops_
+            // because there's no race-free way to update pos_dev_ without
+            // a per-step sync (the captured-H2D-from-pinned pattern races).
+            launch_cast_f32_to_f16(
+                (const float *)input_stage_f32_dev_,
+                (__half *)cur_dev_, n_embd_, stream_);
+            run_decode_ops_(pos);
+            if (lm_head_w_f32_dev_ != nullptr) {
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                    lm_head_vocab_, 1, n_embd_, &alpha,
+                    lm_head_w_f32_dev_, CUDA_R_32F, n_embd_,
+                    output_stage_f32_dev_, CUDA_R_32F, n_embd_,
+                    &beta,
+                    lm_head_logits_f32_dev_, CUDA_R_32F, lm_head_vocab_,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            } else {
+                launch_cast_f32_to_f16(
+                    (const float *)output_stage_f32_dev_,
+                    (__half *)lm_head_hidden_f16_dev_, n_embd_, stream_);
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                    lm_head_vocab_, 1, n_embd_, &alpha,
+                    lm_head_w_f16_dev_, CUDA_R_16F, n_embd_,
+                    lm_head_hidden_f16_dev_, CUDA_R_16F, n_embd_,
+                    &beta,
+                    lm_head_logits_f32_dev_, CUDA_R_32F, lm_head_vocab_,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
+        }
+
+        if (kv_cache_len_ < pos + 1) kv_cache_len_ = pos + 1;
+
+        // (b) Repetition penalty over a recent window of prior tokens. The
+        // recent set is next_token_dev_[max(0, step - recent_window) ..
+        // step). For step==0 there are no recent tokens.
+        if (cfg.repetition_penalty != 1.0f && cfg.recent_window > 0 && step > 0) {
+            int from = step - cfg.recent_window;
+            if (from < 0) from = 0;
+            int n_recent = step - from;
+            launch_apply_repetition_penalty_f32(
+                (float *)lm_head_logits_f32_dev_,
+                cfg.sample_lo, cfg.sample_hi,
+                next_token_dev_ + from,
+                n_recent,
+                cfg.recent_offset,
+                cfg.repetition_penalty,
+                stream_);
+        }
+
+        // (c) Top-K sampler writes next_token_dev_[step].
+        launch_sample_top_k_f32(
+            (const float *)lm_head_logits_f32_dev_,
+            cfg.sample_lo, cfg.sample_hi,
+            cfg.top_k, cfg.temperature, cfg.do_sample,
+            cfg.seed, step,
+            next_token_dev_,
+            stream_);
+
+        // (d) For all but the last possible iteration, look up the next
+        // embedding. (Skipping at the very last step is a tiny saving.)
+        if (step + 1 < max_steps) {
+            launch_embedding_lookup_f32(
+                next_token_dev_, step,
+                (const float *)embed_table_f32_dev_,
+                embed_vocab_, n_embd_,
+                (float *)input_stage_f32_dev_,
+                stream_);
+        }
+
+        // (e) Periodic EOS check.
+        if (cfg.eos_token >= 0 && (step + 1 - sync_chunk_start) >= eos_period) {
+            // Sync, D2H tokens [sync_chunk_start..step+1).
+            cudaStreamSynchronize(stream_);
+            int chunk_n = step + 1 - sync_chunk_start;
+            cudaMemcpy(out_tokens_host + sync_chunk_start,
+                        next_token_dev_ + sync_chunk_start,
+                        (size_t)chunk_n * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+            for (int i = 0; i < chunk_n; ++i) {
+                int tok = out_tokens_host[sync_chunk_start + i];
+                if (tok == cfg.eos_token) {
+                    produced = sync_chunk_start + i;  // exclude EOS
+                    stop = true;
+                    break;
+                }
+            }
+            if (!stop) produced = step + 1;
+            sync_chunk_start = step + 1;
+        }
+    }
+
+    // Final sync + D2H of any remaining tail.
+    cudaStreamSynchronize(stream_);
+    if (!stop && sync_chunk_start < max_steps) {
+        // We may have produced fewer than max_steps if we broke early.
+        int tail_end = (produced > sync_chunk_start) ? produced : sync_chunk_start;
+        // If we never had a periodic check (eos_period >= max_steps), produced
+        // would still be 0; in that case we copy max_steps. Detect: if no
+        // periodic sync hit, produced==0 and sync_chunk_start==0.
+        int actual_steps = (sync_chunk_start == 0 && produced == 0)
+                            ? max_steps
+                            : tail_end;
+        if (actual_steps > sync_chunk_start) {
+            int n = actual_steps - sync_chunk_start;
+            cudaMemcpy(out_tokens_host + sync_chunk_start,
+                        next_token_dev_ + sync_chunk_start,
+                        (size_t)n * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+        }
+        if (sync_chunk_start == 0 && produced == 0) produced = max_steps;
+        // Also scan for EOS in the tail (if we never hit a periodic boundary).
+        if (cfg.eos_token >= 0) {
+            for (int i = 0; i < produced; ++i) {
+                if (out_tokens_host[i] == cfg.eos_token) {
+                    produced = i;
+                    break;
+                }
+            }
+        }
+    }
+    return produced;
 }
 
 }  // namespace ominix_cuda
