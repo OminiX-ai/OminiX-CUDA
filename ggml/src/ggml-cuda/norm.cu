@@ -670,3 +670,215 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// ===========================================================================
+// QIE-Edit fused LayerNorm + modulate kernel.
+// Computes per row: out = (1 + scale[bcast]) * LayerNorm(x) + shift[bcast]
+// in a single dispatch / single memory pass, replacing the unfused
+// NORM -> MUL -> ADD -> ADD chain emitted by Flux::modulate.
+// ===========================================================================
+
+template <int block_size>
+static __global__ void norm_modulate_f32(const float * __restrict__ x,
+                                         const float * __restrict__ mul,
+                                         const float * __restrict__ add,
+                                         float       * __restrict__ dst,
+                                         const int     ncols,
+                                         const int64_t stride_row,
+                                         const int64_t stride_channel,
+                                         const int64_t stride_sample,
+                                         const int64_t mul_stride_row,
+                                         const int64_t mul_stride_channel,
+                                         const int64_t mul_stride_sample,
+                                         const uint3   mul_ncols_packed,
+                                         const uint3   mul_nrows_packed,
+                                         const uint3   mul_nchannels_packed,
+                                         const uint3   mul_nsamples_packed,
+                                         const int64_t add_stride_row,
+                                         const int64_t add_stride_channel,
+                                         const int64_t add_stride_sample,
+                                         const uint3   add_ncols_packed,
+                                         const uint3   add_nrows_packed,
+                                         const uint3   add_nchannels_packed,
+                                         const uint3   add_nsamples_packed,
+                                         const float   eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    {
+        const uint32_t mul_row     = fastmodulo(row,     mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample,  mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+    {
+        const uint32_t add_row     = fastmodulo(row,     add_nrows_packed);
+        const uint32_t add_channel = fastmodulo(channel, add_nchannels_packed);
+        const uint32_t add_sample  = fastmodulo(sample,  add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    // Pass 1: compute mean and variance.
+    float2 mean_var = make_float2(0.0f, 0.0f);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    extern __shared__ float2 s_sum2_mod[];
+    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2_mod);
+
+    const float mean    = mean_var.x / ncols;
+    const float var     = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    // Pass 2: apply norm + (1 + scale)*x_normed + shift in registers.
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xn   = (x[col] - mean) * inv_std;
+        const int   mc   = fastmodulo(col, mul_ncols_packed);
+        const int   ac   = fastmodulo(col, add_ncols_packed);
+        dst[col]         = xn * (1.0f + mul[mc]) + add[ac];
+    }
+}
+
+static void norm_modulate_f32_cuda(const float *  x,
+                                   const float *  mul,
+                                   const float *  add,
+                                   float       *  dst,
+                                   const int      ncols,
+                                   const int      nrows,
+                                   const int      nchannels,
+                                   const int      nsamples,
+                                   const int64_t  stride_row,
+                                   const int64_t  stride_channel,
+                                   const int64_t  stride_sample,
+                                   const int64_t  mul_stride_row,
+                                   const int64_t  mul_stride_channel,
+                                   const int64_t  mul_stride_sample,
+                                   const uint32_t mul_ncols,
+                                   const uint32_t mul_nrows,
+                                   const uint32_t mul_nchannels,
+                                   const uint32_t mul_nsamples,
+                                   const int64_t  add_stride_row,
+                                   const int64_t  add_stride_channel,
+                                   const int64_t  add_stride_sample,
+                                   const uint32_t add_ncols,
+                                   const uint32_t add_nrows,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
+                                   cudaStream_t   stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+
+    const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+    const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+    const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+
+    const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
+    const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+    const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+    const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        norm_modulate_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(
+            x, mul, add, dst, ncols,
+            stride_row, stride_channel, stride_sample,
+            mul_stride_row, mul_stride_channel, mul_stride_sample,
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+            add_stride_row, add_stride_channel, add_stride_sample,
+            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed,
+            eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        norm_modulate_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0, stream>>>(
+            x, mul, add, dst, ncols,
+            stride_row, stride_channel, stride_sample,
+            mul_stride_row, mul_stride_channel, mul_stride_sample,
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+            add_stride_row, add_stride_channel, add_stride_sample,
+            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed,
+            eps);
+    }
+}
+
+void ggml_cuda_op_norm_modulate(ggml_backend_cuda_context & ctx,
+                                ggml_tensor *               norm_node,
+                                ggml_tensor *               mul_node,
+                                ggml_tensor *               add_inner,
+                                ggml_tensor *               add_outer) {
+    // Identify operands.
+    const ggml_tensor * x_src = norm_node->src[0];
+
+    // mul_node has one src that is norm_node (the LN output) and one that is `scale`.
+    const ggml_tensor * scale_src = (mul_node->src[0] == norm_node) ? mul_node->src[1] : mul_node->src[0];
+    GGML_ASSERT(scale_src != nullptr);
+    GGML_ASSERT(mul_node->src[0] == norm_node || mul_node->src[1] == norm_node);
+
+    // add_inner has srcs = (norm_node, mul_node) (order may swap).
+    GGML_ASSERT((add_inner->src[0] == norm_node && add_inner->src[1] == mul_node) ||
+                (add_inner->src[0] == mul_node  && add_inner->src[1] == norm_node));
+
+    // add_outer has one src = add_inner and the other = `shift`.
+    const ggml_tensor * shift_src = (add_outer->src[0] == add_inner) ? add_outer->src[1] : add_outer->src[0];
+    GGML_ASSERT(shift_src != nullptr);
+    GGML_ASSERT(add_outer->src[0] == add_inner || add_outer->src[1] == add_inner);
+
+    GGML_ASSERT(x_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(shift_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_outer->type == GGML_TYPE_F32);
+
+    float eps = 0.0f;
+    memcpy(&eps, norm_node->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const float * x_d     = (const float *) x_src->data;
+    const float * scale_d = (const float *) scale_src->data;
+    const float * shift_d = (const float *) shift_src->data;
+    float       * dst_d   = (float       *) add_outer->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne00 = x_src->ne[0];
+    const int64_t ne01 = x_src->ne[1];
+    const int64_t ne02 = x_src->ne[2];
+    const int64_t ne03 = x_src->ne[3];
+
+    const size_t ts_x = ggml_type_size(x_src->type);
+    GGML_ASSERT(x_src->nb[0] == ts_x);
+    const int64_t s01 = x_src->nb[1] / ts_x;
+    const int64_t s02 = x_src->nb[2] / ts_x;
+    const int64_t s03 = x_src->nb[3] / ts_x;
+
+    const size_t ts_m = ggml_type_size(scale_src->type);
+    GGML_ASSERT(scale_src->nb[0] == ts_m);
+    const int64_t mul_s01 = scale_src->nb[1] / ts_m;
+    const int64_t mul_s02 = scale_src->nb[2] / ts_m;
+    const int64_t mul_s03 = scale_src->nb[3] / ts_m;
+
+    const size_t ts_a = ggml_type_size(shift_src->type);
+    GGML_ASSERT(shift_src->nb[0] == ts_a);
+    const int64_t add_s01 = shift_src->nb[1] / ts_a;
+    const int64_t add_s02 = shift_src->nb[2] / ts_a;
+    const int64_t add_s03 = shift_src->nb[3] / ts_a;
+
+    norm_modulate_f32_cuda(x_d, scale_d, shift_d, dst_d,
+                           ne00, ne01, ne02, ne03,
+                           s01, s02, s03,
+                           mul_s01, mul_s02, mul_s03,
+                           scale_src->ne[0], scale_src->ne[1], scale_src->ne[2], scale_src->ne[3],
+                           add_s01, add_s02, add_s03,
+                           shift_src->ne[0], shift_src->ne[1], shift_src->ne[2], shift_src->ne[3],
+                           eps, stream);
+}
