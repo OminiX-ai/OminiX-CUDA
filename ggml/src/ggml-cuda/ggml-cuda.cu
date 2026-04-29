@@ -3457,6 +3457,103 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // QIE-Edit fused LayerNorm + modulate: NORM -> MUL -> ADD -> ADD pattern.
+    // Emitted by Flux::modulate(LayerNorm(x), shift, scale): out = x_normed*(1+scale) + shift.
+    // Subgraph topology check: norm output is consumed by both mul and add_inner;
+    // add_inner output is consumed by add_outer (the dst).
+    {
+        std::initializer_list<enum ggml_op> norm_modulate_ops = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD };
+        if (is_equal(norm_modulate_ops, ops) &&
+            ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+
+            const ggml_tensor * norm_n = cgraph->nodes[node_idx];
+            const ggml_tensor * mul_n  = cgraph->nodes[node_idx + 1];
+            const ggml_tensor * addi_n = cgraph->nodes[node_idx + 2];
+            const ggml_tensor * addo_n = cgraph->nodes[node_idx + 3];
+
+            // Type checks: F32 throughout.
+            if (norm_n->src[0]->type != GGML_TYPE_F32 || norm_n->type != GGML_TYPE_F32) return false;
+            if (mul_n->src[0]->type  != GGML_TYPE_F32 || mul_n->src[1]->type  != GGML_TYPE_F32 || mul_n->type  != GGML_TYPE_F32) return false;
+            if (addi_n->src[0]->type != GGML_TYPE_F32 || addi_n->src[1]->type != GGML_TYPE_F32 || addi_n->type != GGML_TYPE_F32) return false;
+            if (addo_n->src[0]->type != GGML_TYPE_F32 || addo_n->src[1]->type != GGML_TYPE_F32 || addo_n->type != GGML_TYPE_F32) return false;
+
+            // Topology checks:
+            //  - mul_n consumes norm_n on one side
+            //  - addi_n consumes norm_n on one side and mul_n on the other (the self-residual)
+            //  - addo_n consumes addi_n on one side
+            const bool mul_uses_norm  = (mul_n->src[0] == norm_n) || (mul_n->src[1] == norm_n);
+            const bool addi_uses_norm = (addi_n->src[0] == norm_n) || (addi_n->src[1] == norm_n);
+            const bool addi_uses_mul  = (addi_n->src[0] == mul_n)  || (addi_n->src[1] == mul_n);
+            const bool addo_uses_addi = (addo_n->src[0] == addi_n) || (addo_n->src[1] == addi_n);
+            if (!mul_uses_norm || !addi_uses_norm || !addi_uses_mul || !addo_uses_addi) {
+                return false;
+            }
+
+            // Contiguity checks (norm kernel needs contiguous rows on x; mul/add operands broadcast over leading dim).
+            if (!ggml_is_contiguous_rows(norm_n->src[0])) return false;
+            const ggml_tensor * scale_t = (mul_n->src[0] == norm_n) ? mul_n->src[1] : mul_n->src[0];
+            const ggml_tensor * shift_t = (addo_n->src[0] == addi_n) ? addo_n->src[1] : addo_n->src[0];
+            if (!ggml_is_contiguous_rows(scale_t) || !ggml_is_contiguous_rows(shift_t)) return false;
+
+            // Same-shape constraint between norm output and addi/addo dst (the modulate path).
+            if (!ggml_are_same_shape(norm_n, addi_n)) return false;
+            if (!ggml_are_same_shape(addi_n, addo_n)) return false;
+
+            return true;
+        }
+    }
+
+    // QIE-Edit fused gated residual: MUL -> ADD pattern where:
+    //   mul_n = MUL(y, gate)  with `gate` broadcasting (smaller-shape operand on src[1]),
+    //   add_n = ADD(x, mul_n) with `x` same shape as `y`.
+    //
+    // Strict pattern match (intentionally narrow to avoid firing inside the
+    // text encoder where similar `add(x, mul(...))` chains appear with
+    // different shape semantics). Specifically:
+    //   * mul_n->src[0] must equal mul_n in shape (the "y" full operand),
+    //   * mul_n->src[1] must broadcast (the gate),
+    //   * gate must have ne[0] == y->ne[0] (same hidden dim) and ne[1] == 1
+    //     so it broadcasts along the token dim.
+    {
+        std::initializer_list<enum ggml_op> mul_add_ops = { GGML_OP_MUL, GGML_OP_ADD };
+        if (is_equal(mul_add_ops, ops) &&
+            ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 })) {
+
+            const ggml_tensor * mul_n = cgraph->nodes[node_idx];
+            const ggml_tensor * add_n = cgraph->nodes[node_idx + 1];
+
+            // Type checks.
+            if (mul_n->src[0]->type != GGML_TYPE_F32 || mul_n->src[1]->type != GGML_TYPE_F32 || mul_n->type != GGML_TYPE_F32) return false;
+            if (add_n->src[0]->type != GGML_TYPE_F32 || add_n->src[1]->type != GGML_TYPE_F32 || add_n->type != GGML_TYPE_F32) return false;
+
+            // Topology: add must consume mul on one side; the other side is `x` (skip).
+            const bool add_uses_mul = (add_n->src[0] == mul_n) || (add_n->src[1] == mul_n);
+            if (!add_uses_mul) return false;
+
+            const ggml_tensor * y_t    = mul_n->src[0];
+            const ggml_tensor * gate_t = mul_n->src[1];
+
+            // Strict: y must be same-shape as mul output (no broadcast on src[0]).
+            if (!ggml_are_same_shape(y_t, mul_n)) return false;
+
+            // Strict: gate must broadcast along the token dim (ne[1]==1) but
+            // match hidden dim (ne[0]). This is the QIE AdaLN-gate shape.
+            if (gate_t->ne[0] != y_t->ne[0]) return false;
+            if (gate_t->ne[1] != 1)          return false;
+
+            // x must match y's shape (so x + y*gate is well-formed and dst shape == x shape).
+            const ggml_tensor * x_t = (add_n->src[0] == mul_n) ? add_n->src[1] : add_n->src[0];
+            if (!ggml_are_same_shape(x_t, y_t)) return false;
+            if (!ggml_are_same_shape(add_n, x_t)) return false;
+
+            // Contiguity for the scalar grid-stride kernel.
+            if (!ggml_is_contiguous(x_t) || !ggml_is_contiguous(y_t) || !ggml_is_contiguous(add_n)) return false;
+            if (!ggml_is_contiguous_rows(gate_t)) return false;
+
+            return true;
+        }
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -4048,6 +4145,56 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
+                    }
+
+                    // QIE-Edit fused LayerNorm + modulate (NORM -> MUL -> ADD -> ADD).
+                    // Env-gated by OMNX_CUDA_QIE_FUSED_NORM (default: enabled).
+                    {
+                        static const bool qie_fused_norm_enabled = []() {
+                            const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
+                            // Default-on: env unset or non-"0" enables fusion. Set to "0" to disable.
+                            return !(v && v[0] == '0' && v[1] == '\0');
+                        }();
+                        if (qie_fused_norm_enabled &&
+                            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD }, {})) {
+                            ggml_cuda_op_norm_modulate(*cuda_ctx,
+                                                       cgraph->nodes[i],
+                                                       cgraph->nodes[i+1],
+                                                       cgraph->nodes[i+2],
+                                                       cgraph->nodes[i+3]);
+                            i += 3;
+                            continue;
+                        }
+                    }
+
+                    // QIE-Edit fused gated residual (MUL -> ADD).
+                    // Env-gated by OMNX_CUDA_QIE_FUSED_GATE (default: enabled).
+                    // OMNX_CUDA_QIE_FUSED_GATE=2 takes the fusion match but dispatches
+                    // the original MUL+ADD ops separately as a control-arm experiment.
+                    {
+                        static const int qie_fused_gate_mode = []() {
+                            const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_GATE");
+                            if (!v) return 1; // default on (fused kernel)
+                            if (v[0] == '0' && v[1] == '\0') return 0;
+                            if (v[0] == '2' && v[1] == '\0') return 2; // detect-only control
+                            return 1;
+                        }();
+                        if (qie_fused_gate_mode != 0 &&
+                            node->op == GGML_OP_MUL &&
+                            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD }, {})) {
+                            if (qie_fused_gate_mode == 2) {
+                                // Control: dispatch the original ops normally to verify
+                                // fusion-detection isn't disrupting graph topology.
+                                ggml_cuda_op_mul(*cuda_ctx, cgraph->nodes[i]);
+                                ggml_cuda_op_add(*cuda_ctx, cgraph->nodes[i+1]);
+                            } else {
+                                ggml_cuda_op_mul_add_gated(*cuda_ctx,
+                                                           cgraph->nodes[i],
+                                                           cgraph->nodes[i+1]);
+                            }
+                            i += 1;
+                            continue;
+                        }
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
