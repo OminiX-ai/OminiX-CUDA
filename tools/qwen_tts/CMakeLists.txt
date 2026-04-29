@@ -56,8 +56,33 @@ if(QWEN_TTS_CUDA)
                         "engine dispatches cuBLAS directly")
     endif()
     find_package(CUDAToolkit REQUIRED)
+    enable_language(CUDA)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        # GB10 is sm_121 (Blackwell). Allow override from the cmake CLI.
+        set(CMAKE_CUDA_ARCHITECTURES 121)
+    endif()
     message(STATUS "qwen_tts: native CUDA Talker engine ENABLED "
-                   "(CUDA ${CUDAToolkit_VERSION})")
+                   "(CUDA ${CUDAToolkit_VERSION}, sm=${CMAKE_CUDA_ARCHITECTURES})")
+
+    # Static library bundling the custom CUDA kernels (RmsNorm, RoPE,
+    # SwiGLU, GQA attention, F32<->F16 casts, F16 add). Linked into the
+    # qwen_tts executable, the qwen_tts_api shared lib, and the Phase 2.x
+    # smoke harnesses.
+    add_library(qwen_tts_cuda_kernels STATIC
+        native/cuda_kernels/elementwise.cu
+        native/cuda_kernels/rmsnorm.cu
+        native/cuda_kernels/rope_neox.cu
+        native/cuda_kernels/swiglu.cu
+        native/cuda_kernels/attn_gqa.cu
+        native/cuda_kernels/sampler.cu
+        native/cuda_kernels/embedding_lookup.cu
+    )
+    target_include_directories(qwen_tts_cuda_kernels PUBLIC native)
+    set_target_properties(qwen_tts_cuda_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+    target_compile_features(qwen_tts_cuda_kernels PUBLIC cxx_std_17)
 endif()
 
 # llama.cpp fallback Talker path: optional, default OFF. When OFF, the
@@ -121,7 +146,7 @@ if(QWEN_TTS_ASCENDC)
 endif()
 if(QWEN_TTS_CUDA)
     target_link_libraries     (${TARGET} PRIVATE
-        CUDA::cudart CUDA::cublas)
+        CUDA::cudart CUDA::cublas CUDA::cublasLt qwen_tts_cuda_kernels)
     target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_include_directories(${TARGET} PRIVATE native)
     if(OMINIX_CUDA_USE_CUDNN)
@@ -240,7 +265,7 @@ if(QWEN_TTS_ASCENDC)
 endif()
 if(QWEN_TTS_CUDA)
     target_link_libraries     (${API_TARGET} PRIVATE
-        CUDA::cudart CUDA::cublas)
+        CUDA::cudart CUDA::cublas CUDA::cublasLt qwen_tts_cuda_kernels)
     target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_include_directories(${API_TARGET} PRIVATE native)
     if(OMINIX_CUDA_USE_CUDNN)
@@ -503,9 +528,12 @@ if(QWEN_TTS_CUDA)
     )
     target_link_libraries     (test_talker_cuda_init PUBLIC  ggml qwen_common)
     target_link_libraries     (test_talker_cuda_init PRIVATE Threads::Threads
-                                                              CUDA::cudart CUDA::cublas)
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                              qwen_tts_cuda_kernels)
     target_include_directories(test_talker_cuda_init PUBLIC  .)
-    target_include_directories(test_talker_cuda_init PRIVATE ../.. ../../vendor native)
+    target_include_directories(test_talker_cuda_init PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)   # talker.h includes <llama.h>
     target_compile_definitions(test_talker_cuda_init PRIVATE QWEN_TTS_HAS_CUDA=1)
     target_compile_features   (test_talker_cuda_init PRIVATE cxx_std_17)
     if(OMINIX_CUDA_USE_CUDNN)
@@ -513,4 +541,195 @@ if(QWEN_TTS_CUDA)
         target_compile_definitions(test_talker_cuda_init PRIVATE OMINIX_CUDA_USE_CUDNN=1)
     endif()
     message(STATUS "qwen_tts: OminiX-CUDA Phase 2.1 smoke harness ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.2 smoke harness — test_talker_cuda_decode
+    #
+    # Drives the full forward_decode body for 10 sequential positions.
+    # Asserts no NaN/inf and reports avg wall-clock per step. Same GGUF
+    # path as Phase 2.1; reuses the kernel static lib.
+    # ---------------------------------------------------------------------
+    add_executable(test_talker_cuda_decode
+        native/test_talker_cuda_decode.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_talker_cuda_decode PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_talker_cuda_decode PRIVATE Threads::Threads
+                                                                 CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                                 qwen_tts_cuda_kernels)
+    target_include_directories(test_talker_cuda_decode PUBLIC  .)
+    target_include_directories(test_talker_cuda_decode PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_talker_cuda_decode PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_talker_cuda_decode PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_talker_cuda_decode PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_talker_cuda_decode PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.2 decode smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.3 smoke harness — test_talker_cuda_autoreg
+    #
+    # Drives a true autoregressive loop: token_embd lookup → forward_decode
+    # → CPU lm_head matvec → argmax → next-token. Reports tokens/sec and
+    # token-sequence sanity (not-all-same, not-degenerate runs). The lm_head
+    # matmul stays on host for Phase 2.3; Phase 2.4 will move it onto GPU.
+    # ---------------------------------------------------------------------
+    add_executable(test_talker_cuda_autoreg
+        native/test_talker_cuda_autoreg.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_talker_cuda_autoreg PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_talker_cuda_autoreg PRIVATE Threads::Threads
+                                                                  CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                                  qwen_tts_cuda_kernels)
+    target_include_directories(test_talker_cuda_autoreg PUBLIC  .)
+    target_include_directories(test_talker_cuda_autoreg PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_talker_cuda_autoreg PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_talker_cuda_autoreg PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_talker_cuda_autoreg PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_talker_cuda_autoreg PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.3 autoreg smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.4 smoke harness — test_codec_cuda
+    #
+    # The qwen3_tts_predictor.gguf shipped on zgx-3675 is a flat llama.cpp
+    # Qwen3 transformer export with the SAME tensor schema as the Talker
+    # GGUF (blk.<L>.attn_q.weight etc.); only the hyperparameters differ
+    # (5 layers / hidden 1024 / FFN 3072 / vocab 30720 = 15 groups × 2048).
+    # Phase 2.4 reuses TalkerCudaEngine directly with a TalkerConfig
+    # populated from CodePredictorConfig values, then drives a 256-step
+    # autoreg loop to prove the transformer engine works on codec dims.
+    # No new engine source needed; binary just links the existing
+    # talker_cuda_engine.cpp + qwen_tts_cuda_kernels static lib.
+    # ---------------------------------------------------------------------
+    add_executable(test_codec_cuda
+        native/test_codec_cuda.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_codec_cuda PUBLIC  ggml qwen_common)
+    target_link_libraries     (test_codec_cuda PRIVATE Threads::Threads
+                                                        CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                        qwen_tts_cuda_kernels)
+    target_include_directories(test_codec_cuda PUBLIC  .)
+    target_include_directories(test_codec_cuda PRIVATE
+        ../.. ../../vendor native
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_codec_cuda PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_codec_cuda PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_codec_cuda PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_codec_cuda PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.4 codec smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.7a — SpeechTokenizerDecoder scaffold + RVQ decode.
+    #
+    # Builds the SpeechTokenizerDecoderCudaEngine static lib (GGUF parse +
+    # RVQ decode only; pre_conv / pre_transformer / upsample / vocoder are
+    # scaffolded but abort) and a tiny smoke harness that drives init +
+    # rvq_decode against the qwen_tts_tokenizer_dec.gguf shipped on
+    # zgx-3675. Phase 2.7b will add pre_conv + upsample; 2.7c lands the
+    # SnakeBeta vocoder + final conv.
+    # ---------------------------------------------------------------------
+    add_library(qwen_tts_speech_decoder_cuda STATIC
+        native/speech_tokenizer_decoder_cuda_engine.cpp
+        native/cuda_kernels/decoder_ops.cu
+    )
+    set_target_properties(qwen_tts_speech_decoder_cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+    target_link_libraries     (qwen_tts_speech_decoder_cuda PUBLIC ggml)
+    target_link_libraries     (qwen_tts_speech_decoder_cuda PRIVATE
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt)
+    target_include_directories(qwen_tts_speech_decoder_cuda PUBLIC native)
+    target_include_directories(qwen_tts_speech_decoder_cuda PRIVATE
+                                                              ../.. ../../vendor)
+    target_compile_features   (qwen_tts_speech_decoder_cuda PUBLIC cxx_std_17)
+    set_target_properties     (qwen_tts_speech_decoder_cuda PROPERTIES
+                                                              POSITION_INDEPENDENT_CODE ON)
+
+    add_executable(test_speech_tokenizer_decoder_init
+        native/test_speech_tokenizer_decoder_init.cpp
+    )
+    target_link_libraries     (test_speech_tokenizer_decoder_init PUBLIC
+                                                              ggml qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (test_speech_tokenizer_decoder_init PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt)
+    target_include_directories(test_speech_tokenizer_decoder_init PUBLIC  .)
+    target_include_directories(test_speech_tokenizer_decoder_init PRIVATE
+                                                              ../.. ../../vendor native)
+    target_compile_definitions(test_speech_tokenizer_decoder_init PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_speech_tokenizer_decoder_init PRIVATE cxx_std_17)
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7a speech-decoder smoke ENABLED")
+    # ---------------------------------------------------------------------
+    # Phase 2.7d E2E smoke harness — test_qwen_tts_e2e
+    #
+    # Drives the full text -> codec tokens -> audio waveform pipeline:
+    #   text -> BPE -> seed codec token -> TalkerCudaEngine autoreg ->
+    #   CodePredictor (15 acoustic groups, Pattern B sequential) ->
+    #   SpeechTokenizerDecoder.decode_audio -> WAV save.
+    # ---------------------------------------------------------------------
+    add_executable(test_qwen_tts_e2e
+        native/test_qwen_tts_e2e.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (test_qwen_tts_e2e PUBLIC
+                                                              ggml qwen_common qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (test_qwen_tts_e2e PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                              qwen_tts_cuda_kernels)
+    target_include_directories(test_qwen_tts_e2e PUBLIC  .)
+    target_include_directories(test_qwen_tts_e2e PRIVATE
+                                                              ../.. ../../vendor native
+                                                              ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(test_qwen_tts_e2e PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (test_qwen_tts_e2e PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (test_qwen_tts_e2e PRIVATE CUDA::cudnn)
+        target_compile_definitions(test_qwen_tts_e2e PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.7d E2E smoke ENABLED")
+
+    # ---------------------------------------------------------------------
+    # Phase 2.10 — TTS warm-start daemon (tts_server)
+    # ---------------------------------------------------------------------
+    # Persistent process that loads all weights once and serves synthesis
+    # requests over a TCP line-protocol on 127.0.0.1:OMINIX_TTS_SERVER_PORT
+    # (default 7777). Amortizes the ~11 s of init+weight-load that
+    # dominates cold-start in test_qwen_tts_e2e. Same engines, same
+    # numerics; only the entry-point and per-request lifecycle change.
+    # ---------------------------------------------------------------------
+    add_executable(tts_server
+        native/tts_server.cpp
+        native/talker_cuda_engine.cpp
+    )
+    target_link_libraries     (tts_server PUBLIC
+                                                              ggml qwen_common qwen_tts_speech_decoder_cuda)
+    target_link_libraries     (tts_server PRIVATE
+                                                              Threads::Threads
+                                                              CUDA::cudart CUDA::cublas CUDA::cublasLt
+                                                              CUDA::cublasLt
+                                                              qwen_tts_cuda_kernels)
+    target_include_directories(tts_server PUBLIC  .)
+    target_include_directories(tts_server PRIVATE
+                                                              ../.. ../../vendor native
+                                                              ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(tts_server PRIVATE QWEN_TTS_HAS_CUDA=1)
+    target_compile_features   (tts_server PRIVATE cxx_std_17)
+    if(OMINIX_CUDA_USE_CUDNN)
+        target_link_libraries     (tts_server PRIVATE CUDA::cudnn)
+        target_compile_definitions(tts_server PRIVATE OMINIX_CUDA_USE_CUDNN=1)
+    endif()
+    message(STATUS "qwen_tts: OminiX-CUDA Phase 2.10 warm-start daemon ENABLED")
 endif()

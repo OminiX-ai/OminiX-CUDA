@@ -270,4 +270,71 @@ void launch_channel_scale_f32(const float *x, const float *gamma, float *y,
 void launch_add_f32(const float *a, const float *b, float *y, int n,
                      cudaStream_t stream);
 
+// ============================================================================
+// P2 (April 2026) — on-device sampling kernels.
+//
+// Eliminate the per-step D2H of logits + host sampling + H2D of next embedding
+// by sampling directly on device and looking up the next embedding row from a
+// device-resident table. Used inside the captured decode graph.
+// ============================================================================
+
+// In-place repetition penalty: for each id in `recent_tokens_dev`, divide
+// (or multiply if logit<=0) `logits[id + recent_offset]` by `penalty`,
+// clamped to the [lo, hi) range. Mirrors the host apply_repetition_penalty
+// in tts_server.cpp.
+//   logits             : F32 [vocab]
+//   recent_tokens_dev  : int [n_recent]   (device)
+//   recent_offset      : int              (added to each recent_tokens_dev[i]
+//                                          before clamp; e.g. lo for predictor)
+void launch_apply_repetition_penalty_f32(float *logits, int lo, int hi,
+                                          const int *recent_tokens_dev,
+                                          int n_recent, int recent_offset,
+                                          float penalty,
+                                          cudaStream_t stream);
+
+// Top-K sampler with temperature. Single-block design; reads `logits[lo..hi)`,
+// finds top-K by repeated max with exclusion (K small, default 50), softmaxes
+// over the top-K with the temperature divisor, then samples either greedy
+// (do_sample==0 || temperature<=0) or stochastic via xorshift64* PRNG seeded
+// by (seed XOR step_idx).
+//   logits         : F32 [vocab]
+//   lo, hi         : sub-range
+//   top_k          : 1..256; <=0 -> full
+//   temperature    : >0 stochastic divisor; <=0 forces greedy
+//   do_sample      : 0=greedy, 1=stochastic
+//   seed           : per-request RNG seed
+//   step_idx       : output slot AND RNG mix
+//   out_token_dev  : int [pending_slots]  (writes [step_idx])
+void launch_sample_top_k_f32(const float *logits,
+                              int lo, int hi,
+                              int top_k,
+                              float temperature,
+                              int do_sample,
+                              uint64_t seed,
+                              int step_idx,
+                              int *out_token_dev,
+                              cudaStream_t stream);
+
+// Atomic-style increment of a single int in device memory: *p += 1. Used by
+// the on-device decode loop to step `pos_dev_` between captured replays
+// without the captured-H2D-from-pinned-host race condition (the H2D node's
+// source pointer is fixed at capture time, but on multi-step replay the
+// caller would have to ensure pos_host_pin_ stays valid until the H2D
+// actually executes — not safe without per-step sync).
+void launch_increment_int(int *p_dev, cudaStream_t stream);
+
+// Embedding lookup: out[0..hidden) = table[tok_dev[slot] * hidden + i].
+// Used to populate the next decode step's input embedding from a sampled token.
+//   tok_dev    : int [N]   (device)
+//   slot       : int       (which slot to read)
+//   table_dev  : F32 [vocab, hidden]   (row-major)
+//   out_dev    : F32 [hidden]
+void launch_embedding_lookup_f32(const int *tok_dev,
+                                  int slot,
+                                  const float *table_dev,
+                                  int vocab,
+                                  int hidden,
+                                  float *out_dev,
+                                  cudaStream_t stream);
+
 }  // namespace ominix_cuda
