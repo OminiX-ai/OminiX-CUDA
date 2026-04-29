@@ -324,13 +324,27 @@ private:
     cudaGraphExec_t graph_once_decode_         = nullptr;  // forward_decode
     cudaGraphExec_t graph_once_decode_logits_  = nullptr;  // forward_decode_with_logits
 
+    // ---- P1 (April 2026) device-resident pos --------------------------------
+    // When decode_graph_once_ is enabled, the captured graph reads `pos` from
+    // a device-side int* at kernel runtime (RoPE, attention, V-write all use
+    // the *_dev launchers). The host updates pos_host_ before each replay,
+    // and the captured H2D memcpy node copies it into pos_dev_ as the first
+    // node of the graph. This makes the graph topology truly static across
+    // positions: single instantiate, single cudaGraphLaunch per step, zero
+    // cudaGraphExecUpdate calls.
+    int *pos_dev_       = nullptr;   // device int [1]
+    int *pos_host_pin_  = nullptr;   // pinned host int [1]; capture-safe H2D src
+
     // ---- Internal helpers (defined in .cpp / sibling .cu files) ------------
     void alloc_dev_(void **ptr, size_t bytes);
     void build_rope_tables_();
     void build_causal_mask_();
 
-    // Phase 2.2 — per-token forward kernel sequence (eager).
+    // Phase 2.2 — per-token forward kernel sequence (eager). When use_dev_pos
+    // is true, routes RoPE / attention / V-write through the *_dev launchers
+    // that read pos from pos_dev_ instead of using host-side `pos`.
     void run_decode_ops_(int pos);
+    void run_decode_ops_dev_();   // P1: device-pos variant for capture-once
 
     // Phase 2.6 — calibrate one [out, in] F32 weight to per-channel symmetric
     // INT8 + F16 scale; allocates new device buffers.

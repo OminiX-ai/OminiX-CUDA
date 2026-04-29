@@ -231,6 +231,16 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     graph_once_decode_        = nullptr;
     graph_once_decode_logits_ = nullptr;
 
+    // P1 device-resident pos buffer.
+    if (pos_dev_) {
+        cudaFree(pos_dev_);
+        pos_dev_ = nullptr;
+    }
+    if (pos_host_pin_) {
+        cudaFreeHost(pos_host_pin_);
+        pos_host_pin_ = nullptr;
+    }
+
     if (decode_done_event_) cudaEventDestroy(decode_done_event_);
     if (stream_b_)       cudaStreamDestroy(stream_b_);
     if (primary_stream_) cudaStreamDestroy(primary_stream_);
@@ -514,6 +524,33 @@ bool TalkerCudaEngine::init_from_gguf(const std::string &gguf_path,
         }
     }
 
+    // P1: device-resident pos buffer + pinned host source. The capture-once
+    // graph contains a cudaMemcpyAsync(pos_dev_, pos_host_pin_, sizeof(int))
+    // as its first node; CUDA stream capture requires the H2D source to be
+    // pinned host memory. Both allocs are cheap (sizeof(int)) and live for
+    // the engine's lifetime.
+    {
+        cudaError_t cerr = cudaMalloc((void **)&pos_dev_, sizeof(int));
+        if (cerr != cudaSuccess) {
+            fprintf(stderr,
+                    "[talker_cuda] cudaMalloc(pos_dev_) failed: %s\n",
+                    cudaGetErrorString(cerr));
+            pos_dev_ = nullptr;
+        } else {
+            int zero = 0;
+            cudaMemcpy(pos_dev_, &zero, sizeof(int), cudaMemcpyHostToDevice);
+        }
+        cerr = cudaMallocHost((void **)&pos_host_pin_, sizeof(int));
+        if (cerr != cudaSuccess) {
+            fprintf(stderr,
+                    "[talker_cuda] cudaMallocHost(pos_host_pin_) failed: %s\n",
+                    cudaGetErrorString(cerr));
+            pos_host_pin_ = nullptr;
+        } else {
+            *pos_host_pin_ = 0;
+        }
+    }
+
     // Free GGUF context — Phase 2.2 re-opens it inside a dedicated weight-
     // upload helper that does the per-layer cudaMemcpyAsync.
     gguf_free(gguf_ctx);
@@ -629,6 +666,131 @@ inline cublasStatus_t gemm_rowmajor_matvec_f16(cublasHandle_t cublas,
 }
 
 }  // namespace
+
+// ============================================================================
+// P1: device-resident-pos decode body. Mirrors run_decode_ops_ but routes
+// RoPE / attention / V-write through *_dev launchers that read pos from
+// pos_dev_ at kernel runtime. Used only inside the capture-once decode graph
+// (decode_graph_once_ path); this is what makes the captured graph topology
+// truly static across positions.
+// ============================================================================
+void TalkerCudaEngine::run_decode_ops_dev_() {
+    const float inv_sqrt_d  = 1.0f / std::sqrt((float)head_dim_);
+    const int kv_dim        = kv_dim_;
+
+    for (int il = 0; il < n_layers_; ++il) {
+        const auto &lw = layer_w_[il];
+
+        cudaMemcpyAsync(residual_dev_, cur_dev_,
+                         (size_t)n_embd_ * sizeof(__half),
+                         cudaMemcpyDeviceToDevice, stream_);
+
+        launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                                 (const float *)lw.input_ln_w,
+                                 (__half *)normed_dev_,
+                                 1, n_embd_, eps_, stream_);
+
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.q_proj_w, (const __half *)normed_dev_,
+            (__half *)q_dev_, q_dim_,  n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.k_proj_w, (const __half *)normed_dev_,
+            (__half *)k_dev_, kv_dim_, n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.v_proj_w, (const __half *)normed_dev_,
+            (__half *)v_dev_, kv_dim_, n_embd_);
+
+        launch_rmsnorm_f16_g32((const __half *)q_dev_,
+                                 (const float *)lw.q_norm_w,
+                                 (__half *)q_dev_,
+                                 n_heads_, head_dim_, eps_, stream_);
+        launch_rmsnorm_f16_g32((const __half *)k_dev_,
+                                 (const float *)lw.k_norm_w,
+                                 (__half *)k_dev_,
+                                 n_kv_, head_dim_, eps_, stream_);
+
+        // 4a. RoPE on Q (writes to attn_out_dev_, no stride offset).
+        launch_rope_neox_f16_dev((const __half *)q_dev_,
+                                  (const __half *)rope_cos_dev_,
+                                  (const __half *)rope_sin_dev_,
+                                  (__half *)attn_out_dev_,
+                                  pos_dev_,
+                                  n_heads_, head_dim_,
+                                  /*y_stride=*/0,
+                                  stream_);
+
+        // 4b. RoPE on K, written directly into row `pos` of the K-cache.
+        // y_stride = kv_dim so dst = k_cache_base + pos*kv_dim + ...
+        launch_rope_neox_f16_dev((const __half *)k_dev_,
+                                  (const __half *)rope_cos_dev_,
+                                  (const __half *)rope_sin_dev_,
+                                  (__half *)k_cache_dev_[il],
+                                  pos_dev_,
+                                  n_kv_, head_dim_,
+                                  /*y_stride=*/kv_dim,
+                                  stream_);
+
+        // 5. V -> KV cache slot at row `pos` (device-pos kernel).
+        launch_v_write_kv_dev((const __half *)v_dev_,
+                              (__half *)v_cache_dev_[il],
+                              pos_dev_, kv_dim, stream_);
+
+        // 6. GQA attention with device-pos seq_len = (*pos_dev_) + 1.
+        launch_attn_decode_gqa_f16_dev(
+            (const __half *)attn_out_dev_,
+            (const __half *)k_cache_dev_[il],
+            (const __half *)v_cache_dev_[il],
+            (__half *)q_dev_,
+            pos_dev_, MAX_SEQ,
+            n_heads_, n_kv_, head_dim_, inv_sqrt_d,
+            stream_);
+
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.o_proj_w, (const __half *)q_dev_,
+            (__half *)o_out_dev_, n_embd_, q_dim_);
+
+        launch_add_f16((const __half *)residual_dev_,
+                        (const __half *)o_out_dev_,
+                        (__half *)cur_dev_, n_embd_, stream_);
+
+        cudaMemcpyAsync(residual_dev_, cur_dev_,
+                         (size_t)n_embd_ * sizeof(__half),
+                         cudaMemcpyDeviceToDevice, stream_);
+
+        launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                                 (const float *)lw.post_ln_w,
+                                 (__half *)normed_dev_,
+                                 1, n_embd_, eps_, stream_);
+
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.gate_proj_w, (const __half *)normed_dev_,
+            (__half *)gate_dev_, inter_, n_embd_);
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.up_proj_w, (const __half *)normed_dev_,
+            (__half *)up_dev_, inter_, n_embd_);
+
+        launch_swiglu_f16((const __half *)gate_dev_,
+                           (const __half *)up_dev_,
+                           (__half *)gate_dev_, inter_, stream_);
+
+        gemm_rowmajor_matvec_f16(cublas_,
+            (const __half *)lw.down_proj_w, (const __half *)gate_dev_,
+            (__half *)ffn_out_dev_, n_embd_, inter_);
+
+        launch_add_f16((const __half *)residual_dev_,
+                        (const __half *)ffn_out_dev_,
+                        (__half *)cur_dev_, n_embd_, stream_);
+    }
+
+    launch_rmsnorm_f16_g32((const __half *)cur_dev_,
+                             (const float *)final_norm_w_dev_,
+                             (__half *)normed_dev_,
+                             1, n_embd_, eps_, stream_);
+
+    launch_cast_f16_to_f32((const __half *)normed_dev_,
+                             (float *)output_stage_f32_dev_,
+                             n_embd_, stream_);
+}
 
 void TalkerCudaEngine::run_decode_ops_(int pos) {
     // Per-position cos/sin row pointers into the precomputed RoPE table.
@@ -792,76 +954,79 @@ void TalkerCudaEngine::forward_decode(const float *input_embed,
     //    normed_dev_/etc. are stable buffers refilled per call by the
     //    upstream cast above, so replay sees fresh inputs each time.
     if (decode_graph_once_) {
-        // P0 capture-once / replay-many. Topology is identical across all
-        // positions; only pointer offsets and a scalar seq_len change. We
-        // re-capture into a transient graph each call (cheap), then either
-        // instantiate (first call) or cudaGraphExecUpdate (subsequent —
-        // ~µs vs ~ms for instantiate).
-        cudaGraph_t graph = nullptr;
-        cudaError_t cerr = cudaStreamBeginCapture(
-            stream_, cudaStreamCaptureModeThreadLocal);
-        if (cerr != cudaSuccess) {
-            fprintf(stderr,
-                    "[talker_cuda] cudaStreamBeginCapture failed at pos=%d: "
-                    "%s — falling back to eager\n",
-                    pos, cudaGetErrorString(cerr));
+        // P1 capture-once / replay-many with device-resident pos.
+        //
+        // The captured graph reads `pos` from pos_dev_ at kernel runtime
+        // (RoPE / attention / V-write all use *_dev launchers). The first
+        // node of the graph is a 4-byte H2D memcpy from pos_host_pin_ into
+        // pos_dev_. For subsequent steps the host updates *pos_host_pin_
+        // and just calls cudaGraphLaunch — no recapture, no ExecUpdate.
+        //
+        // Fallback to eager if pos_dev_ / pos_host_pin_ couldn't be allocated
+        // or capture is unavailable (covered below).
+        if (pos_dev_ == nullptr || pos_host_pin_ == nullptr) {
             run_decode_ops_(pos);
         } else {
-            run_decode_ops_(pos);
-            cerr = cudaStreamEndCapture(stream_, &graph);
-            if (cerr != cudaSuccess || graph == nullptr) {
-                fprintf(stderr,
-                        "[talker_cuda] cudaStreamEndCapture failed at "
-                        "pos=%d: %s — falling back to eager\n",
-                        pos, cudaGetErrorString(cerr));
-            } else {
-                cudaError_t serr = cudaSuccess;
-                if (graph_once_decode_ == nullptr) {
-                    // First call — instantiate.
-                    serr = cudaGraphInstantiate(&graph_once_decode_, graph,
-                                                 nullptr, nullptr, 0);
-                    if (serr != cudaSuccess || graph_once_decode_ == nullptr) {
-                        fprintf(stderr,
-                                "[talker_cuda] cudaGraphInstantiate failed at "
-                                "pos=%d: %s — falling back to eager\n",
-                                pos, cudaGetErrorString(serr));
-                        graph_once_decode_ = nullptr;
-                    }
+            // Update host-pinned pos source. The captured memcpy reads from
+            // this address every replay.
+            *pos_host_pin_ = pos;
+
+            if (graph_once_decode_ == nullptr) {
+                // First call — capture + instantiate.
+                cudaGraph_t graph = nullptr;
+                cudaError_t cerr = cudaStreamBeginCapture(
+                    stream_, cudaStreamCaptureModeThreadLocal);
+                if (cerr != cudaSuccess) {
+                    fprintf(stderr,
+                            "[talker_cuda] cudaStreamBeginCapture failed at pos=%d: "
+                            "%s — falling back to eager\n",
+                            pos, cudaGetErrorString(cerr));
+                    run_decode_ops_(pos);
                 } else {
-                    // Subsequent calls — patch in-place.
-                    cudaGraphExecUpdateResultInfo info = {};
-                    serr = cudaGraphExecUpdate(graph_once_decode_, graph, &info);
-                    if (serr != cudaSuccess) {
-                        // Topology changed — re-instantiate (rare; only on
-                        // shape boundary, which we don't expect for decode).
+                    // Capture: H2D pos -> pos_dev_, then the device-pos body.
+                    cudaMemcpyAsync(pos_dev_, pos_host_pin_, sizeof(int),
+                                     cudaMemcpyHostToDevice, stream_);
+                    run_decode_ops_dev_();
+                    cerr = cudaStreamEndCapture(stream_, &graph);
+                    if (cerr != cudaSuccess || graph == nullptr) {
                         fprintf(stderr,
-                                "[talker_cuda] cudaGraphExecUpdate fell back to "
-                                "instantiate at pos=%d: %s (info.result=%d)\n",
-                                pos, cudaGetErrorString(serr), (int)info.result);
-                        cudaGraphExecDestroy(graph_once_decode_);
-                        graph_once_decode_ = nullptr;
-                        serr = cudaGraphInstantiate(&graph_once_decode_, graph,
-                                                     nullptr, nullptr, 0);
-                        if (serr != cudaSuccess) {
+                                "[talker_cuda] cudaStreamEndCapture failed at "
+                                "pos=%d: %s — falling back to eager\n",
+                                pos, cudaGetErrorString(cerr));
+                        run_decode_ops_(pos);
+                    } else {
+                        cudaError_t serr = cudaGraphInstantiate(
+                            &graph_once_decode_, graph, nullptr, nullptr, 0);
+                        cudaGraphDestroy(graph);
+                        if (serr != cudaSuccess || graph_once_decode_ == nullptr) {
                             fprintf(stderr,
-                                    "[talker_cuda] re-instantiate failed: %s\n",
-                                    cudaGetErrorString(serr));
+                                    "[talker_cuda] cudaGraphInstantiate failed at "
+                                    "pos=%d: %s — falling back to eager\n",
+                                    pos, cudaGetErrorString(serr));
                             graph_once_decode_ = nullptr;
+                            run_decode_ops_(pos);
+                        } else {
+                            cudaError_t lerr = cudaGraphLaunch(
+                                graph_once_decode_, stream_);
+                            if (lerr != cudaSuccess) {
+                                fprintf(stderr,
+                                        "[talker_cuda] cudaGraphLaunch (post-cap) "
+                                        "failed at pos=%d: %s\n",
+                                        pos, cudaGetErrorString(lerr));
+                                run_decode_ops_(pos);
+                            }
                         }
                     }
                 }
-                cudaGraphDestroy(graph);
-                if (graph_once_decode_) {
-                    cudaError_t lerr = cudaGraphLaunch(graph_once_decode_,
-                                                        stream_);
-                    if (lerr != cudaSuccess) {
-                        fprintf(stderr,
-                                "[talker_cuda] cudaGraphLaunch failed at pos=%d: "
-                                "%s — falling back to eager\n",
-                                pos, cudaGetErrorString(lerr));
-                        run_decode_ops_(pos);
-                    }
-                } else {
+            } else {
+                // Hot path — single replay. No recapture, no ExecUpdate.
+                cudaError_t lerr = cudaGraphLaunch(graph_once_decode_,
+                                                    stream_);
+                if (lerr != cudaSuccess) {
+                    fprintf(stderr,
+                            "[talker_cuda] cudaGraphLaunch failed at pos=%d: "
+                            "%s — falling back to eager\n",
+                            pos, cudaGetErrorString(lerr));
                     run_decode_ops_(pos);
                 }
             }
@@ -1078,52 +1243,48 @@ void TalkerCudaEngine::forward_decode_with_logits(const float *input_embed,
     // region in forward_decode()), but cudaGraphExecUpdate requires a
     // single live exec per topology, so we keep them strictly separate.
     if (decode_graph_once_) {
-        cudaGraph_t graph = nullptr;
-        cudaError_t cerr = cudaStreamBeginCapture(
-            stream_, cudaStreamCaptureModeThreadLocal);
-        if (cerr != cudaSuccess) {
+        // P1 capture-once / replay-many with device-resident pos. Same
+        // pattern as forward_decode above, but a separate exec since this
+        // path's captured topology is identical (the LM-head GEMM happens
+        // outside the captured region).
+        if (pos_dev_ == nullptr || pos_host_pin_ == nullptr) {
             run_decode_ops_(pos);
         } else {
-            run_decode_ops_(pos);
-            cerr = cudaStreamEndCapture(stream_, &graph);
-            if (cerr == cudaSuccess && graph != nullptr) {
-                cudaError_t serr = cudaSuccess;
-                if (graph_once_decode_logits_ == nullptr) {
-                    serr = cudaGraphInstantiate(&graph_once_decode_logits_,
-                                                 graph, nullptr, nullptr, 0);
-                    if (serr != cudaSuccess) {
-                        graph_once_decode_logits_ = nullptr;
-                    }
+            *pos_host_pin_ = pos;
+
+            if (graph_once_decode_logits_ == nullptr) {
+                cudaGraph_t graph = nullptr;
+                cudaError_t cerr = cudaStreamBeginCapture(
+                    stream_, cudaStreamCaptureModeThreadLocal);
+                if (cerr != cudaSuccess) {
+                    run_decode_ops_(pos);
                 } else {
-                    cudaGraphExecUpdateResultInfo info = {};
-                    serr = cudaGraphExecUpdate(graph_once_decode_logits_,
-                                                graph, &info);
-                    if (serr != cudaSuccess) {
-                        fprintf(stderr,
-                                "[talker_cuda] (logits) cudaGraphExecUpdate fell "
-                                "back to instantiate at pos=%d: %s "
-                                "(info.result=%d)\n",
-                                pos, cudaGetErrorString(serr), (int)info.result);
-                        cudaGraphExecDestroy(graph_once_decode_logits_);
-                        graph_once_decode_logits_ = nullptr;
-                        serr = cudaGraphInstantiate(&graph_once_decode_logits_,
-                                                     graph, nullptr,
-                                                     nullptr, 0);
-                        if (serr != cudaSuccess) {
+                    cudaMemcpyAsync(pos_dev_, pos_host_pin_, sizeof(int),
+                                     cudaMemcpyHostToDevice, stream_);
+                    run_decode_ops_dev_();
+                    cerr = cudaStreamEndCapture(stream_, &graph);
+                    if (cerr != cudaSuccess || graph == nullptr) {
+                        run_decode_ops_(pos);
+                    } else {
+                        cudaError_t serr = cudaGraphInstantiate(
+                            &graph_once_decode_logits_, graph, nullptr,
+                            nullptr, 0);
+                        cudaGraphDestroy(graph);
+                        if (serr != cudaSuccess ||
+                            graph_once_decode_logits_ == nullptr) {
                             graph_once_decode_logits_ = nullptr;
+                            run_decode_ops_(pos);
+                        } else {
+                            cudaError_t lerr = cudaGraphLaunch(
+                                graph_once_decode_logits_, stream_);
+                            if (lerr != cudaSuccess) run_decode_ops_(pos);
                         }
                     }
                 }
-                cudaGraphDestroy(graph);
-                if (graph_once_decode_logits_) {
-                    cudaError_t lerr =
-                        cudaGraphLaunch(graph_once_decode_logits_, stream_);
-                    if (lerr != cudaSuccess) run_decode_ops_(pos);
-                } else {
-                    run_decode_ops_(pos);
-                }
             } else {
-                run_decode_ops_(pos);
+                cudaError_t lerr = cudaGraphLaunch(graph_once_decode_logits_,
+                                                    stream_);
+                if (lerr != cudaSuccess) run_decode_ops_(pos);
             }
         }
     } else if (use_cuda_graphs_) {
