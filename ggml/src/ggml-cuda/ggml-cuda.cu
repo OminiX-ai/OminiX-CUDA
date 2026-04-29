@@ -3821,11 +3821,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             {
                 static const bool qie_fused_norm_enabled = []() {
                     const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
-                    // Default-OFF for this commit; the allocator-aliasing
-                    // and producer-ordering fixes are now in place but the
-                    // env-gate remains until perf is measured. Set
-                    // OMNX_CUDA_QIE_FUSED_NORM=1 to enable.
-                    return v && v[0] == '1' && v[1] == '\0';
+                    // Default-ON. The allocator-aliasing issue is now resolved
+                    // by (a) pinning `scale` with GGML_TENSOR_FLAG_OUTPUT in
+                    // Flux::modulate so its buffer is not freed before the
+                    // fused dispatch, and (b) dispatching the fused kernel at
+                    // the addo position rather than the norm position so all
+                    // producers of `scale` and `shift` have completed by the
+                    // time the kernel reads them. Set OMNX_CUDA_QIE_FUSED_NORM=0
+                    // to disable, OMNX_CUDA_QIE_FUSED_NORM=2 for the
+                    // detect-only control arm.
+                    if (!v) return true;
+                    if (v[0] == '0' && v[1] == '\0') return false;
+                    return true;
                 }();
                 if (qie_fused_norm_enabled) {
                     qie_norm_mod_skip.assign(cgraph->n_nodes, false);
@@ -4297,7 +4304,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             // isolation from the fused kernel.
                             static const int qie_fused_norm_mode = []() {
                                 const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
-                                if (!v)                                   return 0; // default off
+                                if (!v)                                   return 1; // default on
                                 if (v[0] == '0' && v[1] == '\0')          return 0;
                                 if (v[0] == '2' && v[1] == '\0')          return 2;
                                 return 1;

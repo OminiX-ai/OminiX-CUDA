@@ -253,8 +253,15 @@ namespace Flux {
         // working set. Only triggered when the env is set so non-CUDA /
         // unfused paths see no behaviour change.
         static const bool pin_scale_for_fused_norm = []() {
+            // Default-ON together with ggml-cuda's fused norm dispatcher.
+            // OMNX_CUDA_QIE_FUSED_NORM=0 turns it off (and stops also pinning
+            // scale, restoring the original allocator behaviour). This
+            // matches ggml-cuda.cu's default-on policy after the dispatch-at-
+            // addo + scale-pin fix.
             const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
-            return v && v[0] != '\0' && v[0] != '0';
+            if (!v) return true;
+            if (v[0] == '0' && v[1] == '\0') return false;
+            return true;
         }();
         if (pin_scale_for_fused_norm && scale != nullptr) {
             ggml_set_output(scale);
