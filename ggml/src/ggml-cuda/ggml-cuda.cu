@@ -3779,33 +3779,57 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            // QIE-Edit norm-modulate fusion needs to consume MUL/ADD/ADD nodes
-            // that may appear non-contiguously after the matching NORM (with
-            // independent VIEW/CONT/RESHAPE ops interleaved). We pre-scan the
-            // graph to find all such chains by data dependency and skip the
-            // matched MUL/ADD/ADD when dispatching.
+            // QIE-Edit norm-modulate fusion. The chain (NORM -> MUL -> ADD ->
+            // ADD) gets emitted by Flux::modulate, but its members are NOT
+            // sequential in graph index because the topo-sort interleaves the
+            // VIEW/CONT/RESHAPE ops that produce `scale` and `shift`. We
+            // pre-scan from each NORM forward up to MAX_LOOKAHEAD nodes via a
+            // data-dependency walker to recover the chain.
             //
-            // KNOWN ISSUE (2026-04-29): the in-tree ggml backend allocator
-            // alias-reuses tensor slots aggressively, so `scale` (consumed
-            // only by the inner MUL) and `shift` (consumed only by the outer
-            // ADD) end up sharing the same memory slot in a number of layers.
-            // The unfused NORM->MUL->ADD->ADD path is correct because MUL
-            // finishes before the slot is rewritten as `shift`. The fused
-            // kernel reads BOTH simultaneously and gets identical values for
-            // `scale` and `shift`, producing wrong output. As a result the
-            // norm-modulate fusion is OFF BY DEFAULT until the allocator path
-            // is fixed (proposed: extend the fused op's use_counts during
-            // graph build to keep scale alive through addo). Set
-            // OMNX_CUDA_QIE_FUSED_NORM=1 to force-enable for experimentation.
+            // Two allocator hazards have to be handled together for the
+            // fusion to actually fire correctly:
+            //
+            //  1. `scale` (last unfused use: inner MUL) and `shift` (first
+            //     unfused use: outer ADD) have disjoint live ranges, so the
+            //     ggml backend allocator aliases them onto the same memory
+            //     slot in 100% of QIE layers. The fused kernel reads BOTH
+            //     simultaneously, so we need their slots distinct. Resolved
+            //     by Flux::modulate marking `scale` with
+            //     GGML_TENSOR_FLAG_OUTPUT, which prevents the allocator from
+            //     freeing its slot before the fused kernel runs.
+            //
+            //  2. The `scale` and `shift` producer ops are topo-sorted
+            //     AFTER the matching NORM, so dispatching the fused kernel
+            //     at the NORM index reads uninitialised scale/shift. Resolved
+            //     by deferring dispatch to the addo (outer ADD) index — by
+            //     that point all upstream producers have run. The norm/mul/
+            //     addi indices are recorded in qie_norm_mod_skip so the loop
+            //     walks past them; the addo index is recorded in
+            //     qie_norm_mod_chain_at and the kernel is dispatched there.
+            //
+            // OMNX_CUDA_QIE_FUSED_NORM=0 disables; =1 enables (default);
+            // =2 detect-only control arm (walker runs, fused kernel does
+            // not — original ops dispatch unchanged).
             std::vector<bool> qie_norm_mod_skip;
+            struct QieNormFusedChain {
+                ggml_tensor * norm_n;
+                ggml_tensor * mul_n;
+                ggml_tensor * addi_n;
+                ggml_tensor * addo_n;
+            };
+            std::vector<QieNormFusedChain> qie_norm_mod_chain_at;  // indexed by addo_idx; only addo entries are populated
             {
                 static const bool qie_fused_norm_enabled = []() {
                     const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
-                    // Default-OFF until the allocator-aliasing issue is fixed.
+                    // Default-OFF for this commit; the allocator-aliasing
+                    // and producer-ordering fixes are now in place but the
+                    // env-gate remains until perf is measured. Set
+                    // OMNX_CUDA_QIE_FUSED_NORM=1 to enable.
                     return v && v[0] == '1' && v[1] == '\0';
                 }();
                 if (qie_fused_norm_enabled) {
                     qie_norm_mod_skip.assign(cgraph->n_nodes, false);
+                    qie_norm_mod_chain_at.assign(cgraph->n_nodes, QieNormFusedChain{nullptr, nullptr, nullptr, nullptr});
                 }
             }
 
@@ -3813,6 +3837,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_tensor * node = cgraph->nodes[i];
                 if (!qie_norm_mod_skip.empty() && qie_norm_mod_skip[i]) {
                     continue; // already consumed by a fused norm-modulate dispatch
+                }
+                if (!qie_norm_mod_chain_at.empty() &&
+                    qie_norm_mod_chain_at[i].norm_n != nullptr) {
+                    // Tail (addo) of a deferred fused norm-modulate chain.
+                    // Dispatch the fused kernel here, after all producers
+                    // of scale/shift have run.
+                    const QieNormFusedChain & ch = qie_norm_mod_chain_at[i];
+                    ggml_cuda_op_norm_modulate(*cuda_ctx, ch.norm_n, ch.mul_n, ch.addi_n, ch.addo_n);
+                    continue;
                 }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
@@ -4272,10 +4305,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (qie_fused_norm_mode == 2) {
                                 // detect-only control arm — don't fuse, fall through.
                             } else if (qie_fused_norm_mode == 1 && !aliased) {
-                                ggml_cuda_op_norm_modulate(*cuda_ctx, node, mul_n, addi_n, addo_n);
+                                // Defer fused dispatch to addo_idx so all upstream
+                                // producers of `scale` and `shift` have run by the
+                                // time we read them. Dispatching at NORM's position
+                                // would read uninitialised scale/shift because the
+                                // ggml_ext_chunk + cont + reshape ops that produce
+                                // them are topo-sorted AFTER the NORM in this graph.
+                                // Skip the original NORM/MUL/ADDi dispatches; the
+                                // ADDo position will be detected via
+                                // qie_norm_mod_chain_at[addo_idx] and dispatched as
+                                // the fused kernel there.
+                                qie_norm_mod_skip[i]        = true;
                                 qie_norm_mod_skip[mul_idx]  = true;
                                 qie_norm_mod_skip[addi_idx] = true;
-                                qie_norm_mod_skip[addo_idx] = true;
+                                qie_norm_mod_chain_at[addo_idx] = QieNormFusedChain{node, mul_n, addi_n, addo_n};
                                 continue;
                             }
                             // else: fall through to unfused dispatch.
