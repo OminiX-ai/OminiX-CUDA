@@ -742,11 +742,19 @@ static __global__ void norm_modulate_f32(const float * __restrict__ x,
     const float inv_std = rsqrtf(var + eps);
 
     // Pass 2: apply norm + (1 + scale)*x_normed + shift in registers.
+    // The first step `(x - mean) * inv_std` matches what the unfused
+    // norm_f32 kernel computes (same rounding). The subsequent MUL+ADD+ADD
+    // are emitted with __fmul_rn / __fadd_rn to disable FMA contraction so
+    // the result is bit-identical to the unfused NORM -> MUL -> ADD -> ADD
+    // chain (which uses separate-rounding semantics in ggml-cuda binbcast).
     for (int col = tid; col < ncols; col += block_size) {
         const float xn   = (x[col] - mean) * inv_std;
         const int   mc   = fastmodulo(col, mul_ncols_packed);
         const int   ac   = fastmodulo(col, add_ncols_packed);
-        dst[col]         = xn * (1.0f + mul[mc]) + add[ac];
+        // Mimic: tmp1 = MUL(xn, scale); tmp2 = ADD(xn, tmp1); dst = ADD(tmp2, shift).
+        const float prod = __fmul_rn(xn, mul[mc]);
+        const float t2   = __fadd_rn(xn, prod);
+        dst[col]         = __fadd_rn(t2, add[ac]);
     }
 }
 
