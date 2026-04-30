@@ -357,6 +357,17 @@ bool init_server_ctx(ServerCtx &S) {
             fprintf(stderr, "[tts_server] predictor LM-head upload FAIL\n");
             return false;
         }
+        // P3: also upload the predictor's token embedding table to device
+        // so the on-device predictor frame loop can do the per-group
+        // embedding lookup without a host roundtrip. This is unconditional;
+        // the env-gated decode_predictor_frame_topk_ondev() path requires it,
+        // and the upload cost is one-time at warm-up.
+        if (!S.predictor.upload_embedding_table_f32(S.p_embd_w.data(),
+                                                     S.p_vocab)) {
+            fprintf(stderr,
+                    "[tts_server] predictor embedding upload FAIL (P3)\n");
+            return false;
+        }
         // Phase 2.6 — optional FP8 lane on the predictor LM-head. Microbench
         // shows ~2.4x at this shape; only kicks in when enabled at startup.
         if (env_i("OMINIX_TTS_USE_FP8_LMHEAD", 0)) {
@@ -537,27 +548,77 @@ SynthResult synthesize_one(ServerCtx &S, const std::string &text,
     for (int t = 0; t < T; ++t) codes[0][t] = semantic_tokens[t] % 2048;
 
     std::vector<float> p_input_emb(S.p_n_embd), p_logits(S.p_vocab);
-    for (int t = 0; t < T; ++t) {
-        S.predictor.reset_kv_cache();
-        int p_cur = (semantic_tokens[t] % S.p_vocab);
-        for (int g = 0; g < n_predictor_steps; ++g) {
+    const bool use_predictor_ondev =
+        (env_i("OMNX_TTS_PREDICTOR_ONDEV", 0) != 0);
+    if (use_predictor_ondev) {
+        // P3 — on-device predictor frame loop. Eliminates the per-group D2H
+        // of logits + host repetition penalty + host sampler + H2D of next
+        // embedding inside the 15-group inner loop. Cross-frame
+        // repetition-penalty history is maintained on device by the engine.
+        ominix_cuda::TalkerCudaEngine::OnDevPredictorConfig pcfg;
+        pcfg.n_groups            = n_predictor_steps;
+        pcfg.group_size          = 2048;
+        pcfg.top_k               = samp.top_k;
+        pcfg.temperature         = samp.temperature;
+        pcfg.do_sample           = samp.do_sample ? 1 : 0;
+        pcfg.seed                = samp.seed;
+        pcfg.repetition_penalty  = samp.repetition_penalty;
+        pcfg.recent_window       = samp.recent_window;
+        pcfg.max_frames          = T;
+
+        std::vector<int> frame_tokens(n_predictor_steps);
+        for (int t = 0; t < T; ++t) {
+            int first_abs = (semantic_tokens[t] % S.p_vocab);
+            // First input embedding is p_embd[first_abs]. The on-device
+            // method takes the host F32 vector and stages it via one H2D
+            // at the start of the frame; subsequent groups read embeddings
+            // via the device-resident embed_table_f32_dev_.
             std::memcpy(p_input_emb.data(),
-                        S.p_embd_w.data() + (size_t)p_cur * S.p_n_embd,
+                        S.p_embd_w.data() + (size_t)first_abs * S.p_n_embd,
                         S.p_n_embd * sizeof(float));
-            S.predictor.forward_decode_with_logits(p_input_emb.data(), g, p_logits.data());
-            int lo = g * 2048;
-            int hi = lo + 2048;
-            std::vector<int> recent_g;
-            int from = std::max(0, t - samp.recent_window);
-            for (int tt = from; tt < t; ++tt) recent_g.push_back(codes[g + 1][tt]);
-            apply_repetition_penalty(p_logits.data(), S.p_vocab, recent_g, lo, hi,
-                                      samp.repetition_penalty);
-            int nxt = sample_token(p_logits.data(), lo, hi, samp, rng);
-            codes[g + 1][t] = nxt - lo;
-            p_cur = nxt;
+            int produced = S.predictor.decode_predictor_frame_topk_ondev(
+                p_input_emb.data(), /*frame_t=*/t, pcfg,
+                frame_tokens.data());
+            if (produced != n_predictor_steps) {
+                fprintf(stderr,
+                        "[tts_server] predictor ondev produced %d/%d at t=%d "
+                        "(falling back to host path is not yet implemented)\n",
+                        produced, n_predictor_steps, t);
+                R.err = "predictor ondev failed";
+                return R;
+            }
+            for (int g = 0; g < n_predictor_steps; ++g) {
+                int nxt_abs = frame_tokens[g];
+                int lo = g * 2048;
+                codes[g + 1][t] = nxt_abs - lo;
+            }
+            if (n_predictor_steps < 15) {
+                for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+            }
         }
-        if (n_predictor_steps < 15) {
-            for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+    } else {
+        for (int t = 0; t < T; ++t) {
+            S.predictor.reset_kv_cache();
+            int p_cur = (semantic_tokens[t] % S.p_vocab);
+            for (int g = 0; g < n_predictor_steps; ++g) {
+                std::memcpy(p_input_emb.data(),
+                            S.p_embd_w.data() + (size_t)p_cur * S.p_n_embd,
+                            S.p_n_embd * sizeof(float));
+                S.predictor.forward_decode_with_logits(p_input_emb.data(), g, p_logits.data());
+                int lo = g * 2048;
+                int hi = lo + 2048;
+                std::vector<int> recent_g;
+                int from = std::max(0, t - samp.recent_window);
+                for (int tt = from; tt < t; ++tt) recent_g.push_back(codes[g + 1][tt]);
+                apply_repetition_penalty(p_logits.data(), S.p_vocab, recent_g, lo, hi,
+                                          samp.repetition_penalty);
+                int nxt = sample_token(p_logits.data(), lo, hi, samp, rng);
+                codes[g + 1][t] = nxt - lo;
+                p_cur = nxt;
+            }
+            if (n_predictor_steps < 15) {
+                for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+            }
         }
     }
 
