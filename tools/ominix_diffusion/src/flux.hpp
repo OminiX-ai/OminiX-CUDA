@@ -1,6 +1,7 @@
 #ifndef __FLUX_HPP__
 #define __FLUX_HPP__
 
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -238,6 +239,34 @@ namespace Flux {
         // x: [N, L, C]
         // scale: [N, C]
         // shift: [N, C]
+        //
+        // ggml-cuda fused LayerNorm+modulate (env OMNX_CUDA_QIE_FUSED_NORM=1)
+        // unblock: by default ggml's backend allocator aliases scale and
+        // shift onto the same memory slot because their unfused live ranges
+        // do not overlap (scale's last use is the inner MUL; shift's first
+        // use is the outer ADD that follows). The unfused chain is correct
+        // but the fused kernel reads BOTH simultaneously and observes
+        // scale->data == shift->data. Pin scale's storage with
+        // GGML_TENSOR_FLAG_OUTPUT so its slot is not reused before the
+        // fused op runs. Cost: ~12 KB per modulate call x ~120 calls per
+        // DiT graph = ~1.5 MB extra residency, negligible vs 25 GB DiT
+        // working set. Only triggered when the env is set so non-CUDA /
+        // unfused paths see no behaviour change.
+        static const bool pin_scale_for_fused_norm = []() {
+            // Default-ON together with ggml-cuda's fused norm dispatcher.
+            // OMNX_CUDA_QIE_FUSED_NORM=0 turns it off (and stops also pinning
+            // scale, restoring the original allocator behaviour). This
+            // matches ggml-cuda.cu's default-on policy after the dispatch-at-
+            // addo + scale-pin fix.
+            const char * v = std::getenv("OMNX_CUDA_QIE_FUSED_NORM");
+            if (!v) return true;
+            if (v[0] == '0' && v[1] == '\0') return false;
+            return true;
+        }();
+        if (pin_scale_for_fused_norm && scale != nullptr) {
+            ggml_set_output(scale);
+        }
+
         if (!skip_reshape) {
             scale = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]);  // [N, 1, C]
             shift = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]);  // [N, 1, C]
