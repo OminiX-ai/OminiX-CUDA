@@ -54,10 +54,32 @@ namespace {
 __global__ void increment_int_kernel(int *p) {
     if (threadIdx.x == 0 && blockIdx.x == 0) (*p) = (*p) + 1;
 }
+
+__global__ void set_int_value_kernel(int *p, int v) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) (*p) = v;
+}
+
+__global__ void record_rep_history_kernel(const int *src, int src_index,
+                                           int lo, int *slot) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        (*slot) = src[src_index] - lo;
+    }
+}
 }
 
 void launch_increment_int(int *p_dev, cudaStream_t stream) {
     increment_int_kernel<<<1, 1, 0, stream>>>(p_dev);
+}
+
+void launch_set_int_value(int *p_dev, int value, cudaStream_t stream) {
+    set_int_value_kernel<<<1, 1, 0, stream>>>(p_dev, value);
+}
+
+void launch_record_rep_history(const int *src_token_dev, int src_index,
+                                int lo, int *slot_dev,
+                                cudaStream_t stream) {
+    record_rep_history_kernel<<<1, 1, 0, stream>>>(
+        src_token_dev, src_index, lo, slot_dev);
 }
 
 }  // namespace ominix_cuda

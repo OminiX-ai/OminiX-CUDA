@@ -323,6 +323,27 @@ void launch_sample_top_k_f32(const float *logits,
 // actually executes — not safe without per-step sync).
 void launch_increment_int(int *p_dev, cudaStream_t stream);
 
+// Set a single device int to `value`. Used by the predictor decode loop to
+// reset pos_dev_ to -1 at the start of each frame without an H2D-from-host
+// (the chain graph's first node will then increment pos_dev_ to 0 on the
+// first replay). Race-safe: the kernel runs on `stream` and reads no host
+// memory.
+void launch_set_int_value(int *p_dev, int value, cudaStream_t stream);
+
+// Record one slot of the per-group rep-history buffer. Writes
+// `slot_dev[0] = src_token_dev[src_index] - lo`. Tiny single-thread kernel
+// designed to chain after the sampler kernel inside the predictor's
+// decode loop, so the next frame's rep-penalty kernel sees up-to-date
+// history without any H2D round-trip.
+//   src_token_dev : int [N]   (sampler output buffer, absolute ids)
+//   src_index     : int       (which sampler slot to read)
+//   lo            : int       (group's low bound, subtracted to get
+//                              zero-based codec id in [0, group_size))
+//   slot_dev      : int *     (rep_history_dev_ + g * max_frames + frame_t)
+void launch_record_rep_history(const int *src_token_dev, int src_index,
+                                int lo, int *slot_dev,
+                                cudaStream_t stream);
+
 // Embedding lookup: out[0..hidden) = table[tok_dev[slot] * hidden + i].
 // Used to populate the next decode step's input embedding from a sampled token.
 //   tok_dev    : int [N]   (device)

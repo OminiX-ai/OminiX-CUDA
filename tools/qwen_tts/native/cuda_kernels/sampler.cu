@@ -33,19 +33,33 @@ namespace {
 // --------------------------------------------------------------------------
 // Repetition penalty: for each recent token id, divide logit by penalty if
 // >0 else multiply by penalty. Matches the Ascend / host reference.
+//
+// IMPORTANT: must be applied SEQUENTIALLY because the recent list can contain
+// duplicates (same token id appearing multiple times in the rep window).
+// The host reference loops sequentially: each duplicate divides the same
+// logit AGAIN. A naive parallel implementation has a read-modify-write data
+// race when two threads target the same idx; in practice both reads see the
+// pre-update value and both writes overwrite each other, so the logit is
+// divided ONCE instead of N times. That tiny difference is enough to flip
+// argmax and cascade the entire predictor output.
+//
+// Solution: single-thread sequential kernel. n_recent is bounded by
+// recent_window (default 64), so this is a few hundred FP ops per call —
+// negligible vs the GEMM that produced the logits.
 // --------------------------------------------------------------------------
 __global__ void rep_penalty_kernel(float *logits, int lo, int hi,
                                     const int *recent_tokens, int n_recent,
                                     int recent_offset, // adds to recent[i]
                                     float penalty) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_recent) return;
-    int t = recent_tokens[idx] + recent_offset;
-    if (t < lo || t >= hi) return;
-    float v = logits[t];
-    if (v > 0.0f) v /= penalty;
-    else          v *= penalty;
-    logits[t] = v;
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int idx = 0; idx < n_recent; ++idx) {
+        int t = recent_tokens[idx] + recent_offset;
+        if (t < lo || t >= hi) continue;
+        float v = logits[t];
+        if (v > 0.0f) v /= penalty;
+        else          v *= penalty;
+        logits[t] = v;
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -231,9 +245,8 @@ void launch_apply_repetition_penalty_f32(float *logits, int lo, int hi,
                                           float penalty,
                                           cudaStream_t stream) {
     if (n_recent <= 0 || penalty == 1.0f) return;
-    int threads = 64;
-    int blocks  = (n_recent + threads - 1) / threads;
-    rep_penalty_kernel<<<blocks, threads, 0, stream>>>(
+    // Sequential 1-thread kernel — see comment on rep_penalty_kernel for why.
+    rep_penalty_kernel<<<1, 1, 0, stream>>>(
         logits, lo, hi, recent_tokens_dev, n_recent, recent_offset, penalty);
 }
 
