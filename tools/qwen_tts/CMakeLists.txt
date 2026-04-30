@@ -74,6 +74,8 @@ if(QWEN_TTS_CUDA)
         native/cuda_kernels/rope_neox.cu
         native/cuda_kernels/swiglu.cu
         native/cuda_kernels/attn_gqa.cu
+        native/cuda_kernels/sampler.cu
+        native/cuda_kernels/embedding_lookup.cu
     )
     target_include_directories(qwen_tts_cuda_kernels PUBLIC native)
     set_target_properties(qwen_tts_cuda_kernels PROPERTIES

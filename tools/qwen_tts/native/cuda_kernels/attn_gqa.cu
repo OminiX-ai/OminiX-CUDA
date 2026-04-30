@@ -173,6 +173,111 @@ __global__ void attn_decode_gqa_kernel(const __half *q,
     y[(size_t)h * HEAD_DIM + tid] = __float2half(acc);
 }
 
+// ============================================================================
+// P1 (April 2026) — device-resident-pos GQA attention kernel.
+//
+// seq_len is read inside the kernel as (*pos_dev) + 1. Shared-memory `scores`
+// buffer is allocated at MAX_SEQ * sizeof(float) on launch (constant across
+// positions, so the captured CUDA Graph node is static); only the first
+// seq_len entries are touched at runtime.
+//
+// On GB10 / sm_121a, max dynamic shmem per block defaults to 48 KB. With
+// MAX_SEQ=4096 the worst-case allocation is 16 KB — well under the limit.
+// ============================================================================
+__global__ void attn_decode_gqa_dev_kernel(const __half *q,
+                                            const __half *k_cache,
+                                            const __half *v_cache,
+                                            __half *y,
+                                            const int *pos_dev,
+                                            int n_heads, int n_kv,
+                                            float inv_sqrt_d) {
+    extern __shared__ float scores[];           // [<= max_seq]; only seq_len used
+
+    __shared__ float q_sh[HEAD_DIM];
+    __shared__ float warp_buf[BLOCK / 32];
+
+    const int h    = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int group = n_heads / n_kv;
+    const int h_kv  = h / group;
+
+    const int seq_len = (*pos_dev) + 1;
+
+    q_sh[tid] = __half2float(q[(size_t)h * HEAD_DIM + tid]);
+    __syncthreads();
+
+    const int warps_per_block = BLOCK / 32;     // 4
+    for (int t_base = 0; t_base < seq_len; t_base += warps_per_block) {
+        int t = t_base + warp;
+        float dot = 0.0f;
+        if (t < seq_len) {
+            const __half *k_row = k_cache +
+                ((size_t)t * n_kv + h_kv) * HEAD_DIM;
+            float kv = __half2float(k_row[lane]);
+            float qv = q_sh[lane];
+            float sum = qv * kv;
+            #pragma unroll
+            for (int extra = 1; extra < HEAD_DIM / 32; ++extra) {
+                int idx = lane + extra * 32;
+                kv = __half2float(k_row[idx]);
+                qv = q_sh[idx];
+                sum += qv * kv;
+            }
+            dot = warp_reduce_sum(sum);
+        }
+        if (lane == 0 && t < seq_len) {
+            scores[t] = dot * inv_sqrt_d;
+        }
+    }
+    __syncthreads();
+
+    float local_max = -INFINITY;
+    for (int t = tid; t < seq_len; t += BLOCK) {
+        local_max = fmaxf(local_max, scores[t]);
+    }
+    local_max = warp_reduce_max(local_max);
+    if (lane == 0) warp_buf[warp] = local_max;
+    __syncthreads();
+    __shared__ float global_max_sh;
+    if (tid == 0) {
+        float v = warp_buf[0];
+        for (int w = 1; w < warps_per_block; ++w) v = fmaxf(v, warp_buf[w]);
+        global_max_sh = v;
+    }
+    __syncthreads();
+    float global_max = global_max_sh;
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += BLOCK) {
+        float e = __expf(scores[t] - global_max);
+        scores[t] = e;
+        local_sum += e;
+    }
+    local_sum = warp_reduce_sum(local_sum);
+    if (lane == 0) warp_buf[warp] = local_sum;
+    __syncthreads();
+    __shared__ float global_sum_sh;
+    if (tid == 0) {
+        float v = 0.0f;
+        for (int w = 0; w < warps_per_block; ++w) v += warp_buf[w];
+        global_sum_sh = v;
+    }
+    __syncthreads();
+    float inv_denom = 1.0f / global_sum_sh;
+
+    float acc = 0.0f;
+    for (int t = 0; t < seq_len; ++t) {
+        const __half *v_row = v_cache +
+            ((size_t)t * n_kv + h_kv) * HEAD_DIM;
+        float p = scores[t] * inv_denom;
+        acc += p * __half2float(v_row[tid]);
+    }
+    y[(size_t)h * HEAD_DIM + tid] = __float2half(acc);
+}
+
 }  // namespace
 
 void launch_attn_decode_gqa_f16(const __half *q,
@@ -188,6 +293,25 @@ void launch_attn_decode_gqa_f16(const __half *q,
     dim3 block(BLOCK);
     attn_decode_gqa_kernel<<<grid, block, shmem_bytes, stream>>>(
         q, k_cache, v_cache, y, seq_len, n_heads, n_kv, inv_sqrt_d);
+}
+
+void launch_attn_decode_gqa_f16_dev(const __half *q,
+                                    const __half *k_cache,
+                                    const __half *v_cache,
+                                    __half *y,
+                                    const int *pos_dev,
+                                    int max_seq,
+                                    int n_heads, int n_kv,
+                                    int head_dim, float inv_sqrt_d,
+                                    cudaStream_t stream) {
+    if (n_heads <= 0 || head_dim != HEAD_DIM || max_seq <= 0) return;
+    // Allocate shmem at MAX_SEQ (constant across positions) so the captured
+    // CUDA Graph node is static.
+    size_t shmem_bytes = (size_t)max_seq * sizeof(float);
+    dim3 grid(n_heads);
+    dim3 block(BLOCK);
+    attn_decode_gqa_dev_kernel<<<grid, block, shmem_bytes, stream>>>(
+        q, k_cache, v_cache, y, pos_dev, n_heads, n_kv, inv_sqrt_d);
 }
 
 }  // namespace ominix_cuda

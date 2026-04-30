@@ -287,6 +287,16 @@ bool init_server_ctx(ServerCtx &S) {
                               (size_t)S.t_vocab * S.t_n_embd, S.t_lm_head_w)) {
             return false;
         }
+        // P2: also upload the Talker LM head to device so on-device sampling
+        // can run the LM-head GEMM on GPU. Use the F32-copy variant so the
+        // GEMM runs in F32 (parity with the host matvec_f32 reference path);
+        // an F16 copy is also kept for the existing forward_decode_with_logits
+        // path. Cost: t_vocab * t_n_embd * (2 + 4) bytes ~36 MB at 3072x2048.
+        if (!S.talker.upload_lm_head_weights_with_f32_copy(
+                S.t_lm_head_w.data(), S.t_vocab)) {
+            fprintf(stderr, "[tts_server] talker LM-head upload FAIL (P2)\n");
+            return false;
+        }
         gguf_free(t_gguf); ggml_free(t_ctx);
     }
 
@@ -299,6 +309,13 @@ bool init_server_ctx(ServerCtx &S) {
         if (!a_gguf || !a_ctx) { fprintf(stderr, "[tts_server] assets gguf FAIL\n"); return false; }
         if (!load_assets_embedding(a_ctx, "text_embd",  TEXT_VOCAB, S.t_n_embd, S.text_embd_vh))   return false;
         if (!load_assets_embedding(a_ctx, "codec_embd.0", S.t_vocab, S.t_n_embd, S.codec_embd0_vh)) return false;
+        // P2: upload the codec0 embedding table to the Talker engine for
+        // on-device embedding lookup during the autoregressive loop.
+        if (!S.talker.upload_embedding_table_f32(S.codec_embd0_vh.data(),
+                                                  S.t_vocab)) {
+            fprintf(stderr, "[tts_server] talker codec0 embed upload FAIL (P2)\n");
+            return false;
+        }
         gguf_free(a_gguf); ggml_free(a_ctx);
     }
 
@@ -338,6 +355,17 @@ bool init_server_ctx(ServerCtx &S) {
         }
         if (!S.predictor.upload_lm_head_weights(p_lm_head_w.data(), S.p_vocab)) {
             fprintf(stderr, "[tts_server] predictor LM-head upload FAIL\n");
+            return false;
+        }
+        // P3: also upload the predictor's token embedding table to device
+        // so the on-device predictor frame loop can do the per-group
+        // embedding lookup without a host roundtrip. This is unconditional;
+        // the env-gated decode_predictor_frame_topk_ondev() path requires it,
+        // and the upload cost is one-time at warm-up.
+        if (!S.predictor.upload_embedding_table_f32(S.p_embd_w.data(),
+                                                     S.p_vocab)) {
+            fprintf(stderr,
+                    "[tts_server] predictor embedding upload FAIL (P3)\n");
             return false;
         }
         // Phase 2.6 — optional FP8 lane on the predictor LM-head. Microbench
@@ -445,52 +473,170 @@ SynthResult synthesize_one(ServerCtx &S, const std::string &text,
     int pos_cursor = prefill_len;
     int cur_tok = first_tok;
     bool hit_eos = false;
-    for (int step = 1; step < n_talker_steps; ++step) {
-        lookup_codec0(cur_tok, input_emb.data());
-        S.talker.forward_decode(input_emb.data(), pos_cursor++, hidden.data());
-        matvec_f32(S.t_lm_head_w.data(), hidden.data(), logits.data(), S.t_vocab, S.t_n_embd);
-        std::vector<int> recent_abs;
-        int from = std::max(0, (int)semantic_tokens.size() - samp.recent_window);
-        for (int i = from; i < (int)semantic_tokens.size(); ++i)
-            recent_abs.push_back(semantic_tokens[i]);
-        apply_repetition_penalty(logits.data(), S.t_vocab, recent_abs, 0, S.t_vocab,
-                                  samp.repetition_penalty);
-        int nxt = sample_token(logits.data(), 3, S.t_vocab, samp, rng);
-        semantic_tokens.push_back(nxt);
-        cur_tok = nxt;
-        if (nxt == CODEC_EOS) { hit_eos = true; break; }
+
+    // Default ON: with the parallel-topk sampler kernel (#194) the on-device
+    // path beats the host-side one for both greedy and stochastic. Set
+    // OMNX_TTS_ONDEV_SAMPLE=0 to fall back to host sampling.
+    const bool use_ondev_sample = (env_i("OMNX_TTS_ONDEV_SAMPLE", 1) != 0);
+
+    if (use_ondev_sample) {
+        // P2: on-device sampling for the Talker loop. Skips the per-step
+        // D2H of hidden + host matvec + host sampler + host embedding-lookup
+        // round-trip. Captures one chain graph, replays for the remaining
+        // n_talker_steps - 1 steps with intervening sampler/embedding kernels.
+        ominix_cuda::TalkerCudaEngine::OnDevSamplingConfig cfg;
+        cfg.top_k              = samp.top_k;
+        cfg.temperature        = samp.temperature;
+        cfg.do_sample          = samp.do_sample ? 1 : 0;
+        cfg.seed               = samp.seed;
+        cfg.sample_lo          = 3;            // matches host: sample_token(logits, 3, t_vocab, ...)
+        cfg.sample_hi          = S.t_vocab;
+        cfg.repetition_penalty = samp.repetition_penalty;
+        cfg.recent_window      = samp.recent_window;
+        cfg.recent_offset      = 0;            // talker uses absolute ids
+        cfg.eos_token          = CODEC_EOS;
+        cfg.eos_check_period   = env_i("OMNX_TTS_ONDEV_EOS_PERIOD", 16);
+
+        // The first input embedding for the loop is codec_embd0[first_tok].
+        std::vector<float> first_emb(S.t_n_embd);
+        lookup_codec0(first_tok, first_emb.data());
+
+        // The on-device loop is for steps 1..n_talker_steps; the loop's step 0
+        // corresponds to the (step=1) call in the host loop.
+        std::vector<int> ondev_tokens(n_talker_steps);
+        int n_steps = n_talker_steps - 1;  // we already have first_tok
+        int produced = S.talker.decode_loop_topk_ondev(
+            first_emb.data(),
+            /*start_pos=*/pos_cursor,
+            /*max_steps=*/n_steps,
+            cfg,
+            ondev_tokens.data());
+
+        // Append produced tokens. produced may be shorter than n_steps if EOS
+        // was sampled inside the periodic check. The engine excludes EOS
+        // from the count.
+        for (int i = 0; i < produced; ++i) {
+            int t = ondev_tokens[i];
+            if (t == CODEC_EOS) { hit_eos = true; break; }
+            semantic_tokens.push_back(t);
+        }
+        // If we produced exactly n_steps and there was no EOS hit, fine —
+        // semantic_tokens already has 1 + produced entries.
+        // Update kv cache cursor (informational; engine tracks internally).
+        pos_cursor += produced;
+    } else {
+        for (int step = 1; step < n_talker_steps; ++step) {
+            lookup_codec0(cur_tok, input_emb.data());
+            S.talker.forward_decode(input_emb.data(), pos_cursor++, hidden.data());
+            matvec_f32(S.t_lm_head_w.data(), hidden.data(), logits.data(), S.t_vocab, S.t_n_embd);
+            std::vector<int> recent_abs;
+            int from = std::max(0, (int)semantic_tokens.size() - samp.recent_window);
+            for (int i = from; i < (int)semantic_tokens.size(); ++i)
+                recent_abs.push_back(semantic_tokens[i]);
+            apply_repetition_penalty(logits.data(), S.t_vocab, recent_abs, 0, S.t_vocab,
+                                      samp.repetition_penalty);
+            int nxt = sample_token(logits.data(), 3, S.t_vocab, samp, rng);
+            semantic_tokens.push_back(nxt);
+            cur_tok = nxt;
+            if (nxt == CODEC_EOS) { hit_eos = true; break; }
+        }
     }
     if (hit_eos && !semantic_tokens.empty() && semantic_tokens.back() == CODEC_EOS)
         semantic_tokens.pop_back();
     int T = (int)semantic_tokens.size();
     if (T <= 0) { R.err = "no codec tokens"; return R; }
 
+    if (env_i("OMNX_TTS_LOG_TOKENS", 0)) {
+        fprintf(stderr, "[tts_server] semantic_tokens(%d): first8=", T);
+        for (int i = 0; i < 8 && i < T; ++i) fprintf(stderr, " %d", semantic_tokens[i]);
+        fprintf(stderr, "\n");
+    }
+
     // Predictor — 15 acoustic groups per frame.
     std::vector<std::vector<int>> codes(16, std::vector<int>(T, 0));
     for (int t = 0; t < T; ++t) codes[0][t] = semantic_tokens[t] % 2048;
 
     std::vector<float> p_input_emb(S.p_n_embd), p_logits(S.p_vocab);
-    for (int t = 0; t < T; ++t) {
-        S.predictor.reset_kv_cache();
-        int p_cur = (semantic_tokens[t] % S.p_vocab);
-        for (int g = 0; g < n_predictor_steps; ++g) {
+    // Default ON: parallel-topk sampler kernel (#194) makes the on-device
+    // predictor loop a net wallclock win (~6.4s -> ~5.7s warm, stochastic).
+    // Set OMNX_TTS_PREDICTOR_ONDEV=0 to fall back to host-side per-group sampling.
+    const bool use_predictor_ondev =
+        (env_i("OMNX_TTS_PREDICTOR_ONDEV", 1) != 0);
+    if (use_predictor_ondev) {
+        // P3 — on-device predictor frame loop. Eliminates the per-group D2H
+        // of logits + host repetition penalty + host sampler + H2D of next
+        // embedding inside the 15-group inner loop. Cross-frame
+        // repetition-penalty history is maintained on device by the engine.
+        ominix_cuda::TalkerCudaEngine::OnDevPredictorConfig pcfg;
+        pcfg.n_groups            = n_predictor_steps;
+        pcfg.group_size          = 2048;
+        pcfg.top_k               = samp.top_k;
+        pcfg.temperature         = samp.temperature;
+        pcfg.do_sample           = samp.do_sample ? 1 : 0;
+        pcfg.seed                = samp.seed;
+        pcfg.repetition_penalty  = samp.repetition_penalty;
+        pcfg.recent_window       = samp.recent_window;
+        pcfg.max_frames          = T;
+
+        std::vector<int> frame_tokens(n_predictor_steps);
+        for (int t = 0; t < T; ++t) {
+            int first_abs = (semantic_tokens[t] % S.p_vocab);
+            // First input embedding is p_embd[first_abs]. The on-device
+            // method takes the host F32 vector and stages it via one H2D
+            // at the start of the frame; subsequent groups read embeddings
+            // via the device-resident embed_table_f32_dev_.
             std::memcpy(p_input_emb.data(),
-                        S.p_embd_w.data() + (size_t)p_cur * S.p_n_embd,
+                        S.p_embd_w.data() + (size_t)first_abs * S.p_n_embd,
                         S.p_n_embd * sizeof(float));
-            S.predictor.forward_decode_with_logits(p_input_emb.data(), g, p_logits.data());
-            int lo = g * 2048;
-            int hi = lo + 2048;
-            std::vector<int> recent_g;
-            int from = std::max(0, t - samp.recent_window);
-            for (int tt = from; tt < t; ++tt) recent_g.push_back(codes[g + 1][tt]);
-            apply_repetition_penalty(p_logits.data(), S.p_vocab, recent_g, lo, hi,
-                                      samp.repetition_penalty);
-            int nxt = sample_token(p_logits.data(), lo, hi, samp, rng);
-            codes[g + 1][t] = nxt - lo;
-            p_cur = nxt;
+            int produced = S.predictor.decode_predictor_frame_topk_ondev(
+                p_input_emb.data(), /*frame_t=*/t, pcfg,
+                frame_tokens.data());
+            if (produced != n_predictor_steps) {
+                fprintf(stderr,
+                        "[tts_server] predictor ondev produced %d/%d at t=%d "
+                        "(falling back to host path is not yet implemented)\n",
+                        produced, n_predictor_steps, t);
+                R.err = "predictor ondev failed";
+                return R;
+            }
+            for (int g = 0; g < n_predictor_steps; ++g) {
+                int nxt_abs = frame_tokens[g];
+                int lo = g * 2048;
+                codes[g + 1][t] = nxt_abs - lo;
+            }
+            if (t == 0 && env_i("OMNX_TTS_LOG_TOKENS", 0)) {
+                fprintf(stderr, "[tts_server] predictor t=0 frame_tokens:");
+                for (int g = 0; g < n_predictor_steps && g < 8; ++g)
+                    fprintf(stderr, " %d", frame_tokens[g]);
+                fprintf(stderr, "\n");
+            }
+            if (n_predictor_steps < 15) {
+                for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+            }
         }
-        if (n_predictor_steps < 15) {
-            for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+    } else {
+        for (int t = 0; t < T; ++t) {
+            S.predictor.reset_kv_cache();
+            int p_cur = (semantic_tokens[t] % S.p_vocab);
+            for (int g = 0; g < n_predictor_steps; ++g) {
+                std::memcpy(p_input_emb.data(),
+                            S.p_embd_w.data() + (size_t)p_cur * S.p_n_embd,
+                            S.p_n_embd * sizeof(float));
+                S.predictor.forward_decode_with_logits(p_input_emb.data(), g, p_logits.data());
+                int lo = g * 2048;
+                int hi = lo + 2048;
+                std::vector<int> recent_g;
+                int from = std::max(0, t - samp.recent_window);
+                for (int tt = from; tt < t; ++tt) recent_g.push_back(codes[g + 1][tt]);
+                apply_repetition_penalty(p_logits.data(), S.p_vocab, recent_g, lo, hi,
+                                          samp.repetition_penalty);
+                int nxt = sample_token(p_logits.data(), lo, hi, samp, rng);
+                codes[g + 1][t] = nxt - lo;
+                p_cur = nxt;
+            }
+            if (n_predictor_steps < 15) {
+                for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
+            }
         }
     }
 

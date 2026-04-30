@@ -34,7 +34,7 @@ case "$mode" in
             FP8_FLAG="OMINIX_TTS_USE_FP8_LMHEAD=1"
             echo "[run_tts] FP8 LM-head will be enabled (predictor)"
         fi
-        ssh -o BatchMode=yes "$HOST" "pkill -9 -f tts_server; sleep 2; $FP8_FLAG nohup $SERVER_BIN > $SERVER_LOG 2>&1 < /dev/null & disown; echo started_pid=\$!"
+        ssh -o BatchMode=yes "$HOST" "pkill -9 -f tts_server; sleep 2; $FP8_FLAG TALKER_USE_CUDA_GRAPHS=1 nohup $SERVER_BIN > $SERVER_LOG 2>&1 < /dev/null & disown; echo started_pid=\$!"
         echo "[run_tts] waiting for LISTENING (cold init ~10s)..."
         for i in $(seq 1 30); do
             if ssh -o BatchMode=yes "$HOST" "grep -q 'LISTENING on' $SERVER_LOG 2>/dev/null"; then

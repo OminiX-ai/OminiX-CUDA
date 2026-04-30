@@ -105,6 +105,116 @@ public:
     void forward_decode_with_logits(const float *input_embed, int pos,
                                     float *logits_out_f32);
 
+    // ---- P2 (April 2026) on-device sampling autoregressive loop -------
+    // Eliminates the per-step D2H of logits + host sampling + H2D of next
+    // embedding. Pre-uploads the token-embedding table once, then runs a
+    // tight loop on the engine's CUDA stream:
+    //
+    //   1. (step 0) H2D first input embedding into input_stage_f32_dev_.
+    //      (subsequent steps the embedding-lookup kernel writes directly.)
+    //   2. forward_decode body + LM-head GEMM (existing captured graph).
+    //   3. Optional repetition-penalty kernel (rolls a recent-window over
+    //      `next_token_dev_`).
+    //   4. Top-K sampler kernel writes next_token_dev_[step].
+    //   5. Embedding lookup kernel writes input_stage_f32_dev_ for next step.
+    //   6. Every `eos_check_period` steps, host sync + D2H of the partial
+    //      tokens to check EOS. On EOS: trim and return.
+    //
+    // Returns the count of tokens written to `out_tokens_host` (which must
+    // have capacity >= max_steps).
+    struct OnDevSamplingConfig {
+        int      top_k              = 50;
+        float    temperature        = 0.9f;
+        int      do_sample          = 1;          // 0=greedy, 1=stochastic
+        uint64_t seed               = 42;
+        int      sample_lo          = 0;
+        int      sample_hi          = 0;          // exclusive
+        float    repetition_penalty = 1.0f;
+        int      recent_window      = 0;
+        int      recent_offset      = 0;          // added to recent ids before clamp
+        int      eos_token          = -1;         // absolute; -1 disables
+        int      eos_check_period   = 16;         // host sync cadence
+    };
+
+    // Pre-upload an F32 token-embedding table to device. Must match
+    // [embed_vocab, n_embd_]. Returns false on failure. Memory is owned by
+    // the engine (freed in dtor). Caller can re-bind by calling again with
+    // a different table pointer.
+    bool upload_embedding_table_f32(const float *table_f32, int embed_vocab);
+
+    // Upload LM-head weights AND keep an F32 copy on device. The F32 copy is
+    // used by decode_loop_topk_ondev() so the on-device GEMM matches the
+    // host's matvec_f32 reference bit-for-bit (modulo cuBLAS GEMM ordering
+    // noise). Use this for the Talker, which prior code sampled in F32 on
+    // host and so requires F32 parity. Predictor stays on the F16 lane.
+    bool upload_lm_head_weights_with_f32_copy(const float *lm_head_w_f32,
+                                                int vocab);
+
+    // Allocate the on-device sampler scratch buffer (next_token_dev_ size N).
+    // No-op if already sized >= N. Called automatically by decode_loop_topk_ondev.
+    void ensure_sampler_scratch_(int n_pending);
+
+    int decode_loop_topk_ondev(const float *first_input_emb_f32,
+                                int start_pos,
+                                int max_steps,
+                                const OnDevSamplingConfig &cfg,
+                                int *out_tokens_host);
+
+    // ---- P3 (April 2026) on-device predictor frame decode ------------------
+    // Predictor variant of decode_loop_topk_ondev. The predictor pattern
+    // differs in three ways:
+    //   1) KV-cache resets at the start of every frame (15 group steps per
+    //      frame; pos_dev_ resets to -1 so the first chain-graph increment
+    //      yields *pos_dev_ == 0).
+    //   2) Each group step samples in a per-group sub-vocab range
+    //      [g*group_size, (g+1)*group_size). Caller passes group_size and
+    //      n_groups; the loop derives per-step lo/hi internally.
+    //   3) Repetition-penalty history is per-group, accumulated across PRIOR
+    //      frames (not the current frame). The engine maintains a device-
+    //      resident `[n_groups, max_frames]` rep-history buffer; the sampler
+    //      writes the zero-based id (sampled_abs - lo) into
+    //      rep_history_dev_[g, frame_t] at the end of each group step. The
+    //      caller passes frame_t (current frame index, monotonic across the
+    //      lifetime of the request) and recent_window — the kernel reads
+    //      rep_history_dev_[g, max(0, frame_t - recent_window) .. frame_t).
+    //
+    // Embedding lookup: the next group's input embedding is the embedding at
+    // ABSOLUTE token id `next_token_dev_[g]` (which is in [g*group_size,
+    // (g+1)*group_size)). The engine's embedding table must therefore be the
+    // predictor's full token_embd table (vocab = n_groups * group_size).
+    //
+    // Race-safe per P2 pattern:
+    //   - pos_dev_ is initialized to -1 by a 1-thread set kernel on stream_
+    //     (no H2D-from-pinned).
+    //   - Inside the captured chain graph (when enabled), the FIRST node is
+    //     launch_increment_int(pos_dev_).
+    //   - The host never writes to *pos_host_pin_ inside this method.
+    //
+    // Returns 0 on failure (env not initialised, missing uploads), or
+    // n_groups on success. On success, out_tokens_host[g] for g in [0,
+    // n_groups) holds the sampled absolute token id (caller subtracts
+    // g*group_size to get the zero-based codec id).
+    struct OnDevPredictorConfig {
+        int      n_groups            = 15;        // 1..MAX_PREDICTOR_GROUPS
+        int      group_size          = 2048;      // per-group sub-vocab width
+        int      top_k               = 50;
+        float    temperature         = 0.9f;
+        int      do_sample           = 1;
+        uint64_t seed                = 42;
+        float    repetition_penalty  = 1.0f;
+        int      recent_window       = 0;
+        int      max_frames          = 0;         // upper bound for rep-history
+                                                  // buffer alloc; if <= frame_t
+                                                  // engine grows on demand.
+    };
+
+    static constexpr int MAX_PREDICTOR_GROUPS = 16;
+
+    int decode_predictor_frame_topk_ondev(const float *first_input_emb_f32,
+                                           int frame_t,
+                                           const OnDevPredictorConfig &cfg,
+                                           int *out_tokens_host);
+
     // RoPE position-speed factor (EOS-steering parity with Ascend / MLX).
     void set_rope_speed_factor(float factor);
 
@@ -270,6 +380,14 @@ private:
     void *lm_head_w_f16_dev_     = nullptr;  // F16 [vocab, n_embd] row-major
     void *lm_head_hidden_f16_dev_ = nullptr; // F16 [n_embd] (cast staging)
     void *lm_head_logits_f32_dev_ = nullptr; // F32 [vocab]
+    // P2: optional F32 LM-head weight buffer. When populated (via
+    // upload_lm_head_weights_with_f32_copy()), the on-device sampling loop
+    // uses an F32×F32 GEMM for parity with the host F32 matvec_f32 path
+    // (avoids the F16 LM-head precision divergence that flips greedy argmax
+    // for some tokens with close logits). Only set for engines whose
+    // sampling MUST match host F32 reference; predictor leaves this null
+    // and continues on the F16 lane.
+    void *lm_head_w_f32_dev_     = nullptr;  // F32 [vocab, n_embd]
     int   lm_head_vocab_         = 0;
 
     // ---- Phase 2.6 FP8 LM-head lane ----------------------------------------
@@ -306,15 +424,74 @@ private:
     bool use_cuda_graphs_ = false;
     // Per-pos cache; one cudaGraphExec_t per pos slot. Lazy-populated:
     // first call at pos=p captures; subsequent calls replay.
+    // (Legacy Phase 2.5 path — used only when OMNX_TTS_DECODE_GRAPH_ONCE=0.)
     std::vector<cudaGraphExec_t> decode_graph_execs_;
+
+    // ---- P0 capture-once decode graph (April 2026) -------------------------
+    // Capture-once / replay-many path. Topology is identical across all
+    // positions for the 28-layer decoder; only per-pos pointer offsets
+    // (rope_cos_row, k_slot, v_slot) and the seq_len_total scalar change.
+    // We capture into a transient cudaGraph_t each call, then on the first
+    // call instantiate it; on subsequent calls call cudaGraphExecUpdate to
+    // patch the existing exec in-place (~µs vs ~ms for instantiate).
+    //
+    // Two execs because forward_decode and forward_decode_with_logits have
+    // slightly different captured bodies (the latter ends with the LM-head
+    // GEMM and an F16->F32 cast). Sharing is unsafe.
+    bool decode_graph_once_     = false;     // env-gated by OMNX_TTS_DECODE_GRAPH_ONCE
+    cudaGraphExec_t graph_once_decode_         = nullptr;  // forward_decode
+    cudaGraphExec_t graph_once_decode_logits_  = nullptr;  // forward_decode_with_logits
+
+    // ---- P1 (April 2026) device-resident pos --------------------------------
+    // When decode_graph_once_ is enabled, the captured graph reads `pos` from
+    // a device-side int* at kernel runtime (RoPE, attention, V-write all use
+    // the *_dev launchers). The host updates pos_host_ before each replay,
+    // and the captured H2D memcpy node copies it into pos_dev_ as the first
+    // node of the graph. This makes the graph topology truly static across
+    // positions: single instantiate, single cudaGraphLaunch per step, zero
+    // cudaGraphExecUpdate calls.
+    int *pos_dev_       = nullptr;   // device int [1]
+    int *pos_host_pin_  = nullptr;   // pinned host int [1]; capture-safe H2D src
+
+    // ---- P2 (April 2026) on-device sampling state --------------------------
+    // Embedding-table pointer (F32 [embed_vocab, n_embd_]) used by
+    // launch_embedding_lookup_f32. Owned by the engine; freed in dtor.
+    void *embed_table_f32_dev_ = nullptr;
+    int   embed_vocab_         = 0;
+
+    // Output token buffer used by the on-device sampler. Size grows on demand
+    // via ensure_sampler_scratch_; capacity tracked separately.
+    int  *next_token_dev_      = nullptr;
+    int   next_token_capacity_ = 0;
+
+    // Chain-mode captured graph: forward_decode body + LM-head GEMM, but
+    // WITHOUT the input H2D (input_stage_f32_dev_ is already populated by the
+    // prior step's embedding-lookup kernel). Captured lazily on first use.
+    cudaGraphExec_t graph_once_decode_chain_ = nullptr;
+
+    // ---- P3 (April 2026) predictor on-device state -------------------------
+    // Rep-history buffer for the predictor's per-group cross-frame repetition
+    // penalty. Layout: [n_groups, max_frames] row-major. Each frame g writes
+    // rep_history_dev_[g * rep_history_max_frames_ + frame_t] = sampled_id
+    // (zero-based, in [0, group_size)). Reads are
+    // rep_history_dev_[g, max(0, frame_t - recent_window) .. frame_t).
+    //
+    // Allocated lazily on first decode_predictor_frame_topk_ondev() call,
+    // grown via a fresh cudaMalloc + cudaFree if max_frames exceeds capacity.
+    int *rep_history_dev_         = nullptr;
+    int  rep_history_n_groups_    = 0;
+    int  rep_history_max_frames_  = 0;
 
     // ---- Internal helpers (defined in .cpp / sibling .cu files) ------------
     void alloc_dev_(void **ptr, size_t bytes);
     void build_rope_tables_();
     void build_causal_mask_();
 
-    // Phase 2.2 — per-token forward kernel sequence (eager).
+    // Phase 2.2 — per-token forward kernel sequence (eager). When use_dev_pos
+    // is true, routes RoPE / attention / V-write through the *_dev launchers
+    // that read pos from pos_dev_ instead of using host-side `pos`.
     void run_decode_ops_(int pos);
+    void run_decode_ops_dev_();   // P1: device-pos variant for capture-once
 
     // Phase 2.6 — calibrate one [out, in] F32 weight to per-channel symmetric
     // INT8 + F16 scale; allocates new device buffers.

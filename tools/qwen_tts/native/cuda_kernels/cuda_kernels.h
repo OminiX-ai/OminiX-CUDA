@@ -104,6 +104,78 @@ void launch_attn_decode_gqa_f16(const __half *q,
                                 cudaStream_t stream);
 
 // ============================================================================
+// P1 (April 2026) — device-resident-pos variants for capture-once decode graph.
+//
+// These mirror the host-pos launchers above but read `pos` from a device-side
+// const int* at kernel runtime. That makes the captured cudaGraph topology
+// truly static across positions: the same graph can replay every step with
+// only a tiny (4-byte) H2D memcpy of the new pos before launch. Without this,
+// rope_cos_row / k_slot / v_slot / seq_len_total are baked into kernel
+// argument slots at capture time and the graph has to be re-captured (or
+// patched via cudaGraphExecUpdate) every step, cancelling the launch-overhead
+// win.
+//
+// Used only when OMNX_TTS_DECODE_GRAPH_ONCE=1; legacy host-pos paths above
+// are unchanged.
+// ============================================================================
+
+// NEOX RoPE with device-resident pos. Same math as launch_rope_neox_f16, but
+// the cos/sin row offset is computed inside the kernel from *pos_dev. The
+// destination y is also offset internally by *pos_dev * y_stride iff
+// y_stride > 0 (used for the K-cache slot variant); pass y_stride=0 to write
+// to the unstrided q-output buffer.
+//
+//   x         : F16 [n_heads, head_dim]
+//   cos_base  : F16 [MAX_SEQ, head_dim]   (full table)
+//   sin_base  : F16 [MAX_SEQ, head_dim]   (full table)
+//   y_base    : F16 [n_heads, head_dim] when y_stride==0
+//             : F16 [MAX_SEQ, n_heads*head_dim] when y_stride>0
+//   pos_dev   : const int *               (device, size 1)
+//   y_stride  : int                       (elements per row when offsetting y;
+//                                          0 = no offset, write to y_base)
+void launch_rope_neox_f16_dev(const __half *x,
+                              const __half *cos_base,
+                              const __half *sin_base,
+                              __half *y_base,
+                              const int *pos_dev,
+                              int n_heads, int head_dim,
+                              int y_stride,
+                              cudaStream_t stream);
+
+// V-cache slot write. Replaces a host-pos cudaMemcpyAsync of v_dev_ into
+// (v_cache + pos*kv_dim). Tiny copy kernel that reads pos at runtime so the
+// destination offset isn't baked into a captured memcpy node.
+//
+//   src      : F16 [kv_dim]
+//   dst_base : F16 [MAX_SEQ, kv_dim]
+//   pos_dev  : const int *  (device, size 1)
+void launch_v_write_kv_dev(const __half *src, __half *dst_base,
+                           const int *pos_dev, int kv_dim,
+                           cudaStream_t stream);
+
+// Single-token GQA attention with device-resident pos. seq_len is read inside
+// the kernel as (*pos_dev) + 1. Shared-memory scores buffer is allocated at
+// MAX_SEQ * sizeof(float) at launch time (constant across positions, so the
+// captured graph node is static); only the first seq_len entries are used at
+// runtime.
+//
+//   q        : F16 [n_heads, head_dim]
+//   k_cache  : F16 [MAX_SEQ, n_kv, head_dim]
+//   v_cache  : F16 [MAX_SEQ, n_kv, head_dim]
+//   y        : F16 [n_heads, head_dim]
+//   pos_dev  : const int *  (device, size 1; seq_len = *pos_dev + 1)
+//   max_seq  : int          (upper bound for shmem allocation)
+void launch_attn_decode_gqa_f16_dev(const __half *q,
+                                    const __half *k_cache,
+                                    const __half *v_cache,
+                                    __half *y,
+                                    const int *pos_dev,
+                                    int max_seq,
+                                    int n_heads, int n_kv,
+                                    int head_dim, float inv_sqrt_d,
+                                    cudaStream_t stream);
+
+// ============================================================================
 // SpeechTokenizerDecoder F32 ops (Phase 2.7b).
 //
 // All shapes are row-major [T, C] with C fastest. See decoder_ops.cu for
@@ -197,5 +269,93 @@ void launch_channel_scale_f32(const float *x, const float *gamma, float *y,
 // y = a + b, flat [n] F32 (residual).
 void launch_add_f32(const float *a, const float *b, float *y, int n,
                      cudaStream_t stream);
+
+// ============================================================================
+// P2 (April 2026) — on-device sampling kernels.
+//
+// Eliminate the per-step D2H of logits + host sampling + H2D of next embedding
+// by sampling directly on device and looking up the next embedding row from a
+// device-resident table. Used inside the captured decode graph.
+// ============================================================================
+
+// In-place repetition penalty: for each id in `recent_tokens_dev`, divide
+// (or multiply if logit<=0) `logits[id + recent_offset]` by `penalty`,
+// clamped to the [lo, hi) range. Mirrors the host apply_repetition_penalty
+// in tts_server.cpp.
+//   logits             : F32 [vocab]
+//   recent_tokens_dev  : int [n_recent]   (device)
+//   recent_offset      : int              (added to each recent_tokens_dev[i]
+//                                          before clamp; e.g. lo for predictor)
+void launch_apply_repetition_penalty_f32(float *logits, int lo, int hi,
+                                          const int *recent_tokens_dev,
+                                          int n_recent, int recent_offset,
+                                          float penalty,
+                                          cudaStream_t stream);
+
+// Top-K sampler with temperature. Single-block design; reads `logits[lo..hi)`,
+// finds top-K by repeated max with exclusion (K small, default 50), softmaxes
+// over the top-K with the temperature divisor, then samples either greedy
+// (do_sample==0 || temperature<=0) or stochastic via xorshift64* PRNG seeded
+// by (seed XOR step_idx).
+//   logits         : F32 [vocab]
+//   lo, hi         : sub-range
+//   top_k          : 1..256; <=0 -> full
+//   temperature    : >0 stochastic divisor; <=0 forces greedy
+//   do_sample      : 0=greedy, 1=stochastic
+//   seed           : per-request RNG seed
+//   step_idx       : output slot AND RNG mix
+//   out_token_dev  : int [pending_slots]  (writes [step_idx])
+void launch_sample_top_k_f32(const float *logits,
+                              int lo, int hi,
+                              int top_k,
+                              float temperature,
+                              int do_sample,
+                              uint64_t seed,
+                              int step_idx,
+                              int *out_token_dev,
+                              cudaStream_t stream);
+
+// Atomic-style increment of a single int in device memory: *p += 1. Used by
+// the on-device decode loop to step `pos_dev_` between captured replays
+// without the captured-H2D-from-pinned-host race condition (the H2D node's
+// source pointer is fixed at capture time, but on multi-step replay the
+// caller would have to ensure pos_host_pin_ stays valid until the H2D
+// actually executes — not safe without per-step sync).
+void launch_increment_int(int *p_dev, cudaStream_t stream);
+
+// Set a single device int to `value`. Used by the predictor decode loop to
+// reset pos_dev_ to -1 at the start of each frame without an H2D-from-host
+// (the chain graph's first node will then increment pos_dev_ to 0 on the
+// first replay). Race-safe: the kernel runs on `stream` and reads no host
+// memory.
+void launch_set_int_value(int *p_dev, int value, cudaStream_t stream);
+
+// Record one slot of the per-group rep-history buffer. Writes
+// `slot_dev[0] = src_token_dev[src_index] - lo`. Tiny single-thread kernel
+// designed to chain after the sampler kernel inside the predictor's
+// decode loop, so the next frame's rep-penalty kernel sees up-to-date
+// history without any H2D round-trip.
+//   src_token_dev : int [N]   (sampler output buffer, absolute ids)
+//   src_index     : int       (which sampler slot to read)
+//   lo            : int       (group's low bound, subtracted to get
+//                              zero-based codec id in [0, group_size))
+//   slot_dev      : int *     (rep_history_dev_ + g * max_frames + frame_t)
+void launch_record_rep_history(const int *src_token_dev, int src_index,
+                                int lo, int *slot_dev,
+                                cudaStream_t stream);
+
+// Embedding lookup: out[0..hidden) = table[tok_dev[slot] * hidden + i].
+// Used to populate the next decode step's input embedding from a sampled token.
+//   tok_dev    : int [N]   (device)
+//   slot       : int       (which slot to read)
+//   table_dev  : F32 [vocab, hidden]   (row-major)
+//   out_dev    : F32 [hidden]
+void launch_embedding_lookup_f32(const int *tok_dev,
+                                  int slot,
+                                  const float *table_dev,
+                                  int vocab,
+                                  int hidden,
+                                  float *out_dev,
+                                  cudaStream_t stream);
 
 }  // namespace ominix_cuda
