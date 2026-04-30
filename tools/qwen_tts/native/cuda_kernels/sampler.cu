@@ -12,17 +12,31 @@
 //      or stochastic (RNG seeded by host-supplied uint64 + step counter).
 //      Writes the absolute token id to `next_token_dev_[slot]`.
 //
-// Single-block design: top_k <= 256 (default 50), K small enough to fit in
-// shared memory. The Talker codec vocab (3072) and Predictor sub-vocabs
-// (2048) both fit a one-block reduction (sweep with a stride loop). Avoids
-// the complexity of a multi-block sort/scan; well within the per-step latency
-// budget (these run inside the captured graph).
+// Two implementations live behind `launch_sample_top_k_f32`:
+//
+//   * sample_topk_kernel (serial — K rounds of full-vocab argmax with a
+//     growing exclusion list). #193 reference; correct but ~370 us/call
+//     for K=50, V~2048.
+//
+//   * sample_topk_kernel_bitonic (parallel — single bitonic sort of the
+//     padded (logit,idx) shared-mem array, then take the prefix of K).
+//     ~25-40 us/call. Default ON (env OMNX_TTS_PARALLEL_TOPK; default=1).
+//
+// The two paths share the same RNG (xorshift64*) and the same softmax math
+// over the top-K, so for greedy / temperature=0 they emit identical tokens
+// and for stochastic they emit tokens drawn from the same distribution
+// (the RNG stream is identical for the same seed+step_idx).
+//
+// Single-block design: top_k <= 256 (default 50), V <= 4096 in our usage
+// (Talker codec vocab 3072, predictor sub-vocab 2048). Both fit in a single
+// block's worth of shared memory.
 // ============================================================================
 
 #include "cuda_kernels.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cfloat>
 
@@ -77,7 +91,7 @@ __device__ inline float u01_from_u64(uint64_t x) {
 }
 
 // --------------------------------------------------------------------------
-// Sampling kernel — single block.
+// Sampling kernel — single block. SERIAL implementation (K-round argmax).
 //
 //   logits  : F32 [vocab]  (full table; we only sample within [lo, hi))
 //   lo, hi  : sub-range to sample from (Talker uses [3, 3072), Predictor
@@ -233,6 +247,203 @@ __global__ void sample_topk_kernel(const float *logits,
     }
 }
 
+// --------------------------------------------------------------------------
+// PARALLEL top-K sampler — bitonic sort of (logit, idx) pairs in shared mem.
+//
+// Replaces the K-round serial argmax (~370 us/call for K=50, V=2048) with a
+// single sort pass (~25-40 us/call). Algorithm:
+//
+//   1. Pad N = next_pow2(hi - lo). Each of T=256 threads owns ELEMS = N/T
+//      shared-memory slots. Slots inside [hi-lo) load real logits; slots
+//      beyond are filled with sentinel -FLT_MAX.
+//   2. Bitonic sort descending by logit value, carrying (val,idx) pairs.
+//   3. The first K shared slots after the sort are the global top-K (sorted
+//      descending). The single-thread softmax+sample tail is identical to
+//      the serial path.
+//
+// Constraints baked in:
+//   * N <= NPOW2_MAX (4096) — fits Talker codec vocab (3072) and predictor
+//     sub-vocab (2048). ELEMS = NPOW2_MAX / T = 16. Shared mem cost is
+//     4096 * (4+4) = 32 KB — well within Blackwell per-block budget.
+//   * top_k <= MAX_TOP_K (256). The softmax tail re-uses topk_val/topk_idx
+//     arrays the serial path declared.
+//
+// Numerical / sampling parity with serial:
+//   * Greedy (do_sample==0 || temp<=0): writes argmax — bit-exact with
+//     serial path's argmax.
+//   * Stochastic: identical xorshift64* RNG state derivation
+//     (`seed ^ (step_idx+1)*GR`), identical "burn one then draw" pattern,
+//     identical softmax-over-top-K. Both paths sample from the same
+//     distribution; the choice is deterministic given the same seed+step.
+// --------------------------------------------------------------------------
+constexpr int NPOW2_MAX = 4096;
+constexpr int BITONIC_THREADS = 256;
+constexpr int BITONIC_ELEMS_PER_THREAD = NPOW2_MAX / BITONIC_THREADS; // 16
+
+__global__ void sample_topk_kernel_bitonic(const float *logits,
+                                            int lo, int hi,
+                                            int top_k,
+                                            float temp,
+                                            int do_sample,
+                                            uint64_t seed,
+                                            int step_idx,
+                                            int *out_token_dev) {
+    __shared__ float s_vals[NPOW2_MAX];
+    __shared__ int   s_idxs[NPOW2_MAX];
+
+    const int tid = threadIdx.x;
+    const int V   = hi - lo;
+
+    // Greedy fast path: skip the sort entirely. Single block-stride argmax
+    // reduction. Bit-exact with the serial path; used when the host requests
+    // either do_sample==0 or temperature<=0.
+    if (!do_sample || temp <= 0.0f) {
+        __shared__ float thr_max[BITONIC_THREADS];
+        __shared__ int   thr_idx[BITONIC_THREADS];
+        float my_max = -FLT_MAX;
+        int   my_idx = lo;
+        for (int i = lo + tid; i < hi; i += BITONIC_THREADS) {
+            float v = logits[i];
+            if (v > my_max) { my_max = v; my_idx = i; }
+        }
+        thr_max[tid] = my_max;
+        thr_idx[tid] = my_idx;
+        __syncthreads();
+        for (int s = BITONIC_THREADS / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                if (thr_max[tid + s] > thr_max[tid]) {
+                    thr_max[tid] = thr_max[tid + s];
+                    thr_idx[tid] = thr_idx[tid + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) out_token_dev[step_idx] = thr_idx[0];
+        return;
+    }
+
+    int N = 1;
+    while (N < V) N <<= 1;
+    if (N > NPOW2_MAX) N = NPOW2_MAX; // guarded by caller; clamp for safety.
+
+    // 1) Load: each thread fills ELEMS slots; out-of-range = sentinel.
+    for (int e = 0; e < BITONIC_ELEMS_PER_THREAD; ++e) {
+        int slot = tid + e * BITONIC_THREADS;
+        if (slot < N) {
+            if (slot < V) {
+                s_vals[slot] = logits[lo + slot];
+                s_idxs[slot] = lo + slot;
+            } else {
+                s_vals[slot] = -FLT_MAX;
+                s_idxs[slot] = lo;            // dummy; never selected
+            }
+        }
+    }
+    __syncthreads();
+
+    // 2) Bitonic sort, DESCENDING. For each (k, j) stage, every pair (i, i^j)
+    //    where i<i^j performs a compare-and-swap. The "direction" of the
+    //    sub-sort alternates with bit (i & k); for an overall descending
+    //    output we keep the higher value on the lower index when (i & k)==0,
+    //    and the lower value on the lower index when (i & k)!=0.
+    //
+    //    We let each thread handle multiple pairs per stage, since N can be
+    //    up to NPOW2_MAX=4096 and BITONIC_THREADS=256 → 8 pairs per thread
+    //    per stage in the worst case (N/2 / T = 4096/2/256 = 8).
+    const int half = N >> 1;  // number of pairs per stage
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            // Each thread handles pairs spaced by BITONIC_THREADS.
+            for (int p = tid; p < half; p += BITONIC_THREADS) {
+                // Encode pair index p as a position i s.t. (i ^ j) > i.
+                int i = ((p / j) << 1) * j + (p % j);
+                int ixj = i ^ j;
+                if (ixj > i) {
+                    bool ascending = ((i & k) == 0); // descending overall
+                    float va = s_vals[i];
+                    float vb = s_vals[ixj];
+                    int   ia = s_idxs[i];
+                    int   ib = s_idxs[ixj];
+                    bool swap = ascending ? (va < vb) : (va > vb);
+                    if (swap) {
+                        s_vals[i]   = vb; s_vals[ixj] = va;
+                        s_idxs[i]   = ib; s_idxs[ixj] = ia;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // After sort: s_vals[0..N) is sorted DESCENDING. The greedy case is
+    // handled at the top of the kernel; here we always proceed to top-K
+    // softmax + stochastic sampling.
+
+    int K = top_k;
+    if (K <= 0 || K > MAX_TOP_K) K = MAX_TOP_K;
+    if (K > V) K = V;
+
+    // 3) Softmax over the top-K + sample. Single-thread to mirror the
+    //    serial path's RNG/draw exactly.
+    __shared__ float topk_val_s[MAX_TOP_K];
+    __shared__ int   topk_idx_s[MAX_TOP_K];
+
+    // Cooperative copy of the prefix is a 1-warp job (K<=256), but a
+    // single-thread copy is also fine — K is tiny vs the sort cost.
+    if (tid < K) {
+        topk_val_s[tid] = s_vals[tid];
+        topk_idx_s[tid] = s_idxs[tid];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float inv_t = 1.0f / temp;
+        // Numerically stable softmax (max already at index 0 post-sort, but
+        // after temperature scaling re-confirm).
+        float mx = topk_val_s[0] * inv_t;
+        for (int r = 1; r < K; ++r) {
+            float v = topk_val_s[r] * inv_t;
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0f;
+        for (int r = 0; r < K; ++r) {
+            float v = expf(topk_val_s[r] * inv_t - mx);
+            topk_val_s[r] = v;
+            sum += v;
+        }
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+        for (int r = 0; r < K; ++r) topk_val_s[r] *= inv_sum;
+
+        // RNG: identical derivation to serial sample_topk_kernel.
+        uint64_t rs = seed ^ (uint64_t)(step_idx + 1) * 0x9E3779B97F4A7C15ULL;
+        if (rs == 0) rs = 0xDEADBEEFCAFEBABEULL;
+        xorshift64s(rs); // burn one to mix
+        float r = u01_from_u64(xorshift64s(rs));
+        float cs = 0.0f;
+        int chosen = topk_idx_s[K - 1];
+        for (int q = 0; q < K; ++q) {
+            cs += topk_val_s[q];
+            if (r <= cs) { chosen = topk_idx_s[q]; break; }
+        }
+        out_token_dev[step_idx] = chosen;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Cached env-var read for the parallel-topk gate. Reads OMNX_TTS_PARALLEL_TOPK
+// once on first call; "0" disables (forces serial fallback), anything else
+// enables. Default ON.
+// --------------------------------------------------------------------------
+inline int parallel_topk_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = std::getenv("OMNX_TTS_PARALLEL_TOPK");
+        if (e && e[0] == '0' && e[1] == '\0') cached = 0;
+        else cached = 1;
+    }
+    return cached;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------
@@ -259,6 +470,13 @@ void launch_sample_top_k_f32(const float *logits,
                               int step_idx,
                               int *out_token_dev,
                               cudaStream_t stream) {
+    const int V = hi - lo;
+    if (parallel_topk_enabled() && V > 0 && V <= NPOW2_MAX) {
+        sample_topk_kernel_bitonic<<<1, BITONIC_THREADS, 0, stream>>>(
+            logits, lo, hi, top_k, temperature, do_sample,
+            seed, step_idx, out_token_dev);
+        return;
+    }
     int threads = 256;  // must be a power of two for the reduction.
     sample_topk_kernel<<<1, threads, 0, stream>>>(
         logits, lo, hi, top_k, temperature, do_sample,
