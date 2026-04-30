@@ -160,6 +160,61 @@ public:
                                 const OnDevSamplingConfig &cfg,
                                 int *out_tokens_host);
 
+    // ---- P3 (April 2026) on-device predictor frame decode ------------------
+    // Predictor variant of decode_loop_topk_ondev. The predictor pattern
+    // differs in three ways:
+    //   1) KV-cache resets at the start of every frame (15 group steps per
+    //      frame; pos_dev_ resets to -1 so the first chain-graph increment
+    //      yields *pos_dev_ == 0).
+    //   2) Each group step samples in a per-group sub-vocab range
+    //      [g*group_size, (g+1)*group_size). Caller passes group_size and
+    //      n_groups; the loop derives per-step lo/hi internally.
+    //   3) Repetition-penalty history is per-group, accumulated across PRIOR
+    //      frames (not the current frame). The engine maintains a device-
+    //      resident `[n_groups, max_frames]` rep-history buffer; the sampler
+    //      writes the zero-based id (sampled_abs - lo) into
+    //      rep_history_dev_[g, frame_t] at the end of each group step. The
+    //      caller passes frame_t (current frame index, monotonic across the
+    //      lifetime of the request) and recent_window — the kernel reads
+    //      rep_history_dev_[g, max(0, frame_t - recent_window) .. frame_t).
+    //
+    // Embedding lookup: the next group's input embedding is the embedding at
+    // ABSOLUTE token id `next_token_dev_[g]` (which is in [g*group_size,
+    // (g+1)*group_size)). The engine's embedding table must therefore be the
+    // predictor's full token_embd table (vocab = n_groups * group_size).
+    //
+    // Race-safe per P2 pattern:
+    //   - pos_dev_ is initialized to -1 by a 1-thread set kernel on stream_
+    //     (no H2D-from-pinned).
+    //   - Inside the captured chain graph (when enabled), the FIRST node is
+    //     launch_increment_int(pos_dev_).
+    //   - The host never writes to *pos_host_pin_ inside this method.
+    //
+    // Returns 0 on failure (env not initialised, missing uploads), or
+    // n_groups on success. On success, out_tokens_host[g] for g in [0,
+    // n_groups) holds the sampled absolute token id (caller subtracts
+    // g*group_size to get the zero-based codec id).
+    struct OnDevPredictorConfig {
+        int      n_groups            = 15;        // 1..MAX_PREDICTOR_GROUPS
+        int      group_size          = 2048;      // per-group sub-vocab width
+        int      top_k               = 50;
+        float    temperature         = 0.9f;
+        int      do_sample           = 1;
+        uint64_t seed                = 42;
+        float    repetition_penalty  = 1.0f;
+        int      recent_window       = 0;
+        int      max_frames          = 0;         // upper bound for rep-history
+                                                  // buffer alloc; if <= frame_t
+                                                  // engine grows on demand.
+    };
+
+    static constexpr int MAX_PREDICTOR_GROUPS = 16;
+
+    int decode_predictor_frame_topk_ondev(const float *first_input_emb_f32,
+                                           int frame_t,
+                                           const OnDevPredictorConfig &cfg,
+                                           int *out_tokens_host);
+
     // RoPE position-speed factor (EOS-steering parity with Ascend / MLX).
     void set_rope_speed_factor(float factor);
 
@@ -413,6 +468,19 @@ private:
     // WITHOUT the input H2D (input_stage_f32_dev_ is already populated by the
     // prior step's embedding-lookup kernel). Captured lazily on first use.
     cudaGraphExec_t graph_once_decode_chain_ = nullptr;
+
+    // ---- P3 (April 2026) predictor on-device state -------------------------
+    // Rep-history buffer for the predictor's per-group cross-frame repetition
+    // penalty. Layout: [n_groups, max_frames] row-major. Each frame g writes
+    // rep_history_dev_[g * rep_history_max_frames_ + frame_t] = sampled_id
+    // (zero-based, in [0, group_size)). Reads are
+    // rep_history_dev_[g, max(0, frame_t - recent_window) .. frame_t).
+    //
+    // Allocated lazily on first decode_predictor_frame_topk_ondev() call,
+    // grown via a fresh cudaMalloc + cudaFree if max_frames exceeds capacity.
+    int *rep_history_dev_         = nullptr;
+    int  rep_history_n_groups_    = 0;
+    int  rep_history_max_frames_  = 0;
 
     // ---- Internal helpers (defined in .cpp / sibling .cu files) ------------
     void alloc_dev_(void **ptr, size_t bytes);

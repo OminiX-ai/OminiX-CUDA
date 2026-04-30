@@ -239,6 +239,11 @@ TalkerCudaEngine::~TalkerCudaEngine() {
     if (next_token_dev_) { cudaFree(next_token_dev_); next_token_dev_ = nullptr; }
     next_token_capacity_ = 0;
 
+    // P3 predictor on-device rep-history buffer.
+    if (rep_history_dev_) { cudaFree(rep_history_dev_); rep_history_dev_ = nullptr; }
+    rep_history_n_groups_   = 0;
+    rep_history_max_frames_ = 0;
+
     // P1 device-resident pos buffer.
     if (pos_dev_) {
         cudaFree(pos_dev_);
@@ -2021,6 +2026,285 @@ int TalkerCudaEngine::decode_loop_topk_ondev(
         }
     }
     return produced;
+}
+
+// ============================================================================
+// P3 (April 2026) — predictor on-device frame decode.
+//
+// Drives the 15-group predictor inner loop entirely on the engine's CUDA
+// stream, eliminating the per-step D2H of logits + host repetition penalty +
+// host sampler + H2D of the next embedding (~15 host syncs per frame, T frames
+// per request → ~15*T extra host syncs the talker P2 path didn't address).
+//
+// Invariants:
+//   - upload_lm_head_weights() must have been called (F16 LM-head sufficient;
+//     predictor doesn't require F32 parity since each group's [lo, hi) range
+//     has no overlap, so F16-vs-F32 argmax flips are local to a single group
+//     and don't cascade across the 15 groups).
+//   - upload_embedding_table_f32() must have been called with the predictor's
+//     full token-embd table (vocab = n_groups * group_size).
+//   - pos_dev_ must be allocated (set by init_from_gguf).
+//
+// Race-safe pattern: pos_dev_ is set to -1 by a 1-thread set kernel on stream
+// at the start of the call. The chain graph (captured lazily on first frame)
+// has launch_increment_int(pos_dev_) as its first node; replays advance
+// pos_dev_ to 0, 1, 2, ..., n_groups-1 with no host writes in between.
+// ============================================================================
+int TalkerCudaEngine::decode_predictor_frame_topk_ondev(
+        const float *first_input_emb_f32,
+        int frame_t,
+        const OnDevPredictorConfig &cfg,
+        int *out_tokens_host) {
+    if (!ready_) {
+        fprintf(stderr,
+                "[talker_cuda] decode_predictor_frame_topk_ondev before init\n");
+        return 0;
+    }
+    if (lm_head_w_f16_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] decode_predictor_frame_topk_ondev: LM-head not "
+                "uploaded\n");
+        return 0;
+    }
+    if (embed_table_f32_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] decode_predictor_frame_topk_ondev: embedding "
+                "table not uploaded\n");
+        return 0;
+    }
+    if (pos_dev_ == nullptr) {
+        fprintf(stderr,
+                "[talker_cuda] decode_predictor_frame_topk_ondev: pos_dev_ "
+                "unavailable\n");
+        return 0;
+    }
+    int G = cfg.n_groups;
+    int W = cfg.group_size;
+    if (G <= 0 || G > MAX_PREDICTOR_GROUPS || W <= 0) {
+        fprintf(stderr,
+                "[talker_cuda] decode_predictor_frame_topk_ondev: bad cfg "
+                "n_groups=%d group_size=%d\n", G, W);
+        return 0;
+    }
+    if (frame_t < 0) frame_t = 0;
+    int max_frames = cfg.max_frames;
+    if (max_frames <= 0) max_frames = frame_t + 1;
+
+    cudaSetDevice(device_);
+
+    // ----- (a) Allocate / grow rep-history buffer ---------------------------
+    // Buffer is [G, max_frames] row-major. We grow on demand if frame_t
+    // exceeds the current capacity. No clearing needed: kernels read only
+    // [from .. frame_t).
+    if (cfg.repetition_penalty != 1.0f && cfg.recent_window > 0) {
+        int need_groups = G;
+        int need_frames = (frame_t >= max_frames) ? (frame_t + 1) : max_frames;
+        if (rep_history_dev_ == nullptr ||
+            need_groups > rep_history_n_groups_ ||
+            need_frames > rep_history_max_frames_) {
+            // Grow strategy: allocate at least max_frames slots, but if the
+            // caller passed a small max_frames and we keep getting frames
+            // beyond it, grow geometrically.
+            int new_frames = need_frames;
+            if (rep_history_max_frames_ > 0 &&
+                new_frames < 2 * rep_history_max_frames_) {
+                new_frames = 2 * rep_history_max_frames_;
+            }
+            if (new_frames < 1024) new_frames = 1024;  // typical request <= 256
+            int new_groups = (need_groups > rep_history_n_groups_)
+                                ? need_groups : rep_history_n_groups_;
+            if (new_groups < G) new_groups = G;
+
+            int *new_buf = nullptr;
+            cudaError_t cerr = cudaMalloc(
+                &new_buf, (size_t)new_groups * new_frames * sizeof(int));
+            if (cerr != cudaSuccess) {
+                fprintf(stderr,
+                        "[talker_cuda] rep_history_dev_ malloc failed: %s "
+                        "(groups=%d frames=%d)\n",
+                        cudaGetErrorString(cerr), new_groups, new_frames);
+                return 0;
+            }
+            // Copy old contents over (row-major; per-group strides change).
+            if (rep_history_dev_ != nullptr) {
+                for (int g = 0; g < rep_history_n_groups_ && g < new_groups; ++g) {
+                    cudaMemcpyAsync(
+                        new_buf + (size_t)g * new_frames,
+                        (int *)rep_history_dev_ + (size_t)g * rep_history_max_frames_,
+                        (size_t)rep_history_max_frames_ * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream_);
+                }
+                cudaStreamSynchronize(stream_);
+                cudaFree(rep_history_dev_);
+            }
+            rep_history_dev_         = new_buf;
+            rep_history_n_groups_    = new_groups;
+            rep_history_max_frames_  = new_frames;
+        }
+    }
+
+    // ----- (b) Ensure sampler scratch has G slots --------------------------
+    ensure_sampler_scratch_(G);
+
+    // ----- (c) Reset KV cache + pos_dev_ on stream -------------------------
+    // KV-cache len reset is a host bookkeeping change; the actual cache
+    // buffers are overwritten in place at offsets *pos_dev_ each step.
+    kv_cache_len_ = 0;
+    launch_set_int_value(pos_dev_, /*value=*/-1, stream_);
+
+    // ----- (d) Stage first input embedding (one H2D per frame) -------------
+    cudaMemcpyAsync(input_stage_f32_dev_, first_input_emb_f32,
+                     (size_t)n_embd_ * sizeof(float),
+                     cudaMemcpyHostToDevice, stream_);
+
+    // ----- (e) Per-group loop ----------------------------------------------
+    // Each iteration:
+    //   - F32->F16 cast of input_stage into cur_dev_ (eager; cur_dev_ is read
+    //     by the captured chain graph body).
+    //   - Chain graph: launch_increment_int(pos_dev_) → run_decode_ops_dev_().
+    //     Captured on first call; replayed on subsequent group steps and
+    //     subsequent frames.
+    //   - LM-head GEMM (F16 lane; eager).
+    //   - Optional rep-penalty over rep_history_dev_[g, from..frame_t).
+    //   - Top-K sampler writes next_token_dev_[g] (absolute id in [lo, hi)).
+    //   - Record rep-history slot rep_history_dev_[g, frame_t].
+    //   - Embedding lookup for next group's input_stage_f32_dev_.
+    static const bool g_no_chain_graph =
+        (std::getenv("OMNX_TTS_PREDICTOR_NO_CHAIN_GRAPH") &&
+         std::getenv("OMNX_TTS_PREDICTOR_NO_CHAIN_GRAPH")[0] == '1');
+
+    int from = frame_t - cfg.recent_window;
+    if (from < 0) from = 0;
+    int n_recent = frame_t - from;  // same for all groups in this frame
+
+    for (int g = 0; g < G; ++g) {
+        int lo = g * W;
+        int hi = lo + W;
+
+        // (e.1) Cast F32 input -> F16 cur_dev_.
+        launch_cast_f32_to_f16(
+            (const float *)input_stage_f32_dev_,
+            (__half *)cur_dev_, n_embd_, stream_);
+
+        // (e.2) Chain graph: increment pos_dev_, run decoder body.
+        if (!g_no_chain_graph && decode_graph_once_ && pos_host_pin_ != nullptr) {
+            if (graph_once_decode_chain_ == nullptr) {
+                cudaGraph_t graph = nullptr;
+                cudaError_t cerr = cudaStreamBeginCapture(
+                    stream_, cudaStreamCaptureModeThreadLocal);
+                if (cerr != cudaSuccess) {
+                    fprintf(stderr,
+                            "[talker_cuda] predictor ondev: BeginCapture "
+                            "failed: %s — falling back to eager\n",
+                            cudaGetErrorString(cerr));
+                    launch_increment_int(pos_dev_, stream_);
+                    run_decode_ops_dev_();
+                } else {
+                    launch_increment_int(pos_dev_, stream_);
+                    run_decode_ops_dev_();
+                    cerr = cudaStreamEndCapture(stream_, &graph);
+                    if (cerr == cudaSuccess && graph != nullptr) {
+                        cudaError_t serr = cudaGraphInstantiate(
+                            &graph_once_decode_chain_, graph, nullptr,
+                            nullptr, 0);
+                        cudaGraphDestroy(graph);
+                        if (serr != cudaSuccess) {
+                            graph_once_decode_chain_ = nullptr;
+                        }
+                    }
+                    if (graph_once_decode_chain_ != nullptr) {
+                        cudaGraphLaunch(graph_once_decode_chain_, stream_);
+                    } else {
+                        launch_increment_int(pos_dev_, stream_);
+                        run_decode_ops_dev_();
+                    }
+                }
+            } else {
+                cudaGraphLaunch(graph_once_decode_chain_, stream_);
+            }
+        } else {
+            // Eager path (no captured graph).
+            launch_increment_int(pos_dev_, stream_);
+            run_decode_ops_dev_();
+        }
+
+        // Update kv_cache_len_ bookkeeping (engine tracks this for any
+        // subsequent host-pos calls; pos_dev_ is the source of truth on
+        // device).
+        if (kv_cache_len_ < g + 1) kv_cache_len_ = g + 1;
+
+        // (e.3) LM-head GEMM (F16 lane).
+        launch_cast_f32_to_f16(
+            (const float *)output_stage_f32_dev_,
+            (__half *)lm_head_hidden_f16_dev_, n_embd_, stream_);
+        {
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                lm_head_vocab_, 1, n_embd_, &alpha,
+                lm_head_w_f16_dev_, CUDA_R_16F, n_embd_,
+                lm_head_hidden_f16_dev_, CUDA_R_16F, n_embd_,
+                &beta,
+                lm_head_logits_f32_dev_, CUDA_R_32F, lm_head_vocab_,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+
+        // (e.4) Optional repetition penalty over prior frames' tokens of
+        // group g. rep_history_dev_[g, from..frame_t) holds zero-based ids
+        // in [0, group_size); the kernel adds recent_offset=lo to map back
+        // into [lo, hi).
+        if (cfg.repetition_penalty != 1.0f && n_recent > 0 &&
+            rep_history_dev_ != nullptr) {
+            launch_apply_repetition_penalty_f32(
+                (float *)lm_head_logits_f32_dev_,
+                lo, hi,
+                rep_history_dev_ + (size_t)g * rep_history_max_frames_ + from,
+                n_recent,
+                /*recent_offset=*/lo,
+                cfg.repetition_penalty,
+                stream_);
+        }
+
+        // (e.5) Top-K sampler — writes next_token_dev_[g] (absolute id).
+        // Mix the seed with frame_t so different frames produce different
+        // RNG sequences.
+        uint64_t step_seed = cfg.seed ^
+                              ((uint64_t)frame_t * 0xC2B2AE3D27D4EB4FULL);
+        launch_sample_top_k_f32(
+            (const float *)lm_head_logits_f32_dev_,
+            lo, hi,
+            cfg.top_k, cfg.temperature, cfg.do_sample,
+            step_seed, /*step_idx=*/g,
+            next_token_dev_,
+            stream_);
+
+        // (e.6) Record rep-history slot for next-frame's rep-penalty read.
+        if (rep_history_dev_ != nullptr) {
+            launch_record_rep_history(
+                next_token_dev_, /*src_index=*/g, /*lo=*/lo,
+                rep_history_dev_ + (size_t)g * rep_history_max_frames_ + frame_t,
+                stream_);
+        }
+
+        // (e.7) Embedding lookup for next group's input. The predictor uses
+        // ABSOLUTE token id directly (next_token_dev_[g] is in [lo, hi),
+        // which maps into the predictor's token_embd table at the same
+        // offset). Skip on the last group.
+        if (g + 1 < G) {
+            launch_embedding_lookup_f32(
+                next_token_dev_, /*slot=*/g,
+                (const float *)embed_table_f32_dev_,
+                embed_vocab_, n_embd_,
+                (float *)input_stage_f32_dev_,
+                stream_);
+        }
+    }
+
+    // ----- (f) Single host sync + bulk D2H of all 15 sampled ids ----------
+    cudaStreamSynchronize(stream_);
+    cudaMemcpy(out_tokens_host, next_token_dev_,
+                (size_t)G * sizeof(int),
+                cudaMemcpyDeviceToHost);
+    return G;
 }
 
 }  // namespace ominix_cuda
