@@ -474,7 +474,10 @@ SynthResult synthesize_one(ServerCtx &S, const std::string &text,
     int cur_tok = first_tok;
     bool hit_eos = false;
 
-    const bool use_ondev_sample = (env_i("OMNX_TTS_ONDEV_SAMPLE", 0) != 0);
+    // Default ON: with the parallel-topk sampler kernel (#194) the on-device
+    // path beats the host-side one for both greedy and stochastic. Set
+    // OMNX_TTS_ONDEV_SAMPLE=0 to fall back to host sampling.
+    const bool use_ondev_sample = (env_i("OMNX_TTS_ONDEV_SAMPLE", 1) != 0);
 
     if (use_ondev_sample) {
         // P2: on-device sampling for the Talker loop. Skips the per-step
@@ -543,13 +546,22 @@ SynthResult synthesize_one(ServerCtx &S, const std::string &text,
     int T = (int)semantic_tokens.size();
     if (T <= 0) { R.err = "no codec tokens"; return R; }
 
+    if (env_i("OMNX_TTS_LOG_TOKENS", 0)) {
+        fprintf(stderr, "[tts_server] semantic_tokens(%d): first8=", T);
+        for (int i = 0; i < 8 && i < T; ++i) fprintf(stderr, " %d", semantic_tokens[i]);
+        fprintf(stderr, "\n");
+    }
+
     // Predictor — 15 acoustic groups per frame.
     std::vector<std::vector<int>> codes(16, std::vector<int>(T, 0));
     for (int t = 0; t < T; ++t) codes[0][t] = semantic_tokens[t] % 2048;
 
     std::vector<float> p_input_emb(S.p_n_embd), p_logits(S.p_vocab);
+    // Default ON: parallel-topk sampler kernel (#194) makes the on-device
+    // predictor loop a net wallclock win (~6.4s -> ~5.7s warm, stochastic).
+    // Set OMNX_TTS_PREDICTOR_ONDEV=0 to fall back to host-side per-group sampling.
     const bool use_predictor_ondev =
-        (env_i("OMNX_TTS_PREDICTOR_ONDEV", 0) != 0);
+        (env_i("OMNX_TTS_PREDICTOR_ONDEV", 1) != 0);
     if (use_predictor_ondev) {
         // P3 — on-device predictor frame loop. Eliminates the per-group D2H
         // of logits + host repetition penalty + host sampler + H2D of next
@@ -591,6 +603,12 @@ SynthResult synthesize_one(ServerCtx &S, const std::string &text,
                 int nxt_abs = frame_tokens[g];
                 int lo = g * 2048;
                 codes[g + 1][t] = nxt_abs - lo;
+            }
+            if (t == 0 && env_i("OMNX_TTS_LOG_TOKENS", 0)) {
+                fprintf(stderr, "[tts_server] predictor t=0 frame_tokens:");
+                for (int g = 0; g < n_predictor_steps && g < 8; ++g)
+                    fprintf(stderr, " %d", frame_tokens[g]);
+                fprintf(stderr, "\n");
             }
             if (n_predictor_steps < 15) {
                 for (int g = n_predictor_steps; g < 15; ++g) codes[g + 1][t] = 0;
